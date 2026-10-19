@@ -50,6 +50,8 @@ def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verifie
             [InlineKeyboardButton(text="💡 Полезное", callback_data="useful_menu")]
         ])
 
+    kb.append([InlineKeyboardButton(text="👤 Профиль", callback_data="profile_menu")])
+
     if has_unread_notification:
         kb.append([InlineKeyboardButton(text="🔔 Уведомление", callback_data="notification_open")])
     
@@ -317,7 +319,7 @@ def request_verification_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🚀 Начать — Выбрать группу", callback_data="start_verify_flow")]
     ])
 
-def select_group_kb() -> InlineKeyboardMarkup:
+def select_group_kb(back_callback: str = "main_menu", back_label: str = "🔙 Назад") -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton(text="ТТ-36", callback_data="grp_ТТ-36")],
         [InlineKeyboardButton(text="ТТ-37", callback_data="grp_ТТ-37"), InlineKeyboardButton(text="ТТ-38", callback_data="grp_ТТ-38")],
@@ -328,9 +330,21 @@ def select_group_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="С-37", callback_data="grp_С-37"), InlineKeyboardButton(text="С-38", callback_data="grp_С-38"), InlineKeyboardButton(text="С-39", callback_data="grp_С-39")],
         [InlineKeyboardButton(text="СР-38", callback_data="grp_СР-38")],
         [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+        [InlineKeyboardButton(text=back_label, callback_data=back_callback)]
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def confirm_group_selection_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, выбрать эту группу", callback_data="grp_confirm_yes")],
+        [InlineKeyboardButton(text="🔄 Нет, выбрать другую", callback_data="grp_confirm_no")],
+    ])
+
+def profile_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎓 Изменить группу", callback_data="profile_change_group")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
 
 def admin_user_verify_kb(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
