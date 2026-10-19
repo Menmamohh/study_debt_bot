@@ -58,6 +58,38 @@ class AsyncDatabase:
 
 adb = AsyncDatabase(db)
 
+
+async def cleanup_user_ui_messages(bot: Bot, user_id: int, keep_message_id: Optional[int] = None, extra_ids=()):
+    """Deletes all tracked duplicate menu messages except the one being shown."""
+    tracked_ids = set(await adb.get_user_ui_message_ids(user_id))
+    tracked_ids.update(int(message_id) for message_id in extra_ids if message_id)
+    for message_id in sorted(tracked_ids):
+        if message_id == keep_message_id:
+            continue
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=message_id)
+        except TelegramRetryAfter as error:
+            await asyncio.sleep(error.retry_after)
+            try:
+                await bot.delete_message(chat_id=user_id, message_id=message_id)
+            except Exception as retry_error:
+                logger.debug(
+                    "Could not remove duplicate UI message %s for user %s: %s",
+                    message_id,
+                    user_id,
+                    retry_error,
+                )
+                continue
+        except Exception as error:
+            logger.debug(
+                "Could not remove duplicate UI message %s for user %s: %s",
+                message_id,
+                user_id,
+                error,
+            )
+            continue
+        await adb.forget_ui_message_id(user_id, message_id)
+
 # Настройка логирования: stdout для Docker/systemd, ротируемый файл только для ручного запуска.
 log_handlers = [logging.StreamHandler(sys.stdout)]
 log_file = os.getenv("BOT_LOG_FILE")
@@ -208,12 +240,29 @@ async def safe_edit_message(
         except Exception:
             pass
 
+    if cb and msg and getattr(msg.chat, "type", None) == "private":
+        saved_id = await adb.get_ui_message_id(user_id)
+        if saved_id and saved_id != msg.message_id:
+            try:
+                sent = await bot_inst.send_message(
+                    chat_id=user_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                )
+                await adb.set_ui_message_id(user_id, sent.message_id)
+                await cleanup_user_ui_messages(bot_inst, user_id, keep_message_id=sent.message_id, extra_ids=(msg.message_id,))
+                return
+            except Exception as error:
+                logger.warning("Could not replace stale UI message for user %s: %s", user_id, error)
+
     # Если исходное сообщение содержало фото — редактируем подпись к нему
     if getattr(msg, "photo", None) and hasattr(msg, "edit_caption"):
         try:
             await msg.edit_caption(caption=text, parse_mode=parse_mode, reply_markup=reply_markup)
             if cb and getattr(msg.chat, "type", None) == "private":
                 await adb.set_ui_message_id(cb.from_user.id, msg.message_id)
+                await cleanup_user_ui_messages(bot_inst, cb.from_user.id, keep_message_id=msg.message_id)
             return
         except Exception:
             pass
@@ -224,6 +273,7 @@ async def safe_edit_message(
             await msg.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
             if cb and getattr(msg.chat, "type", None) == "private":
                 await adb.set_ui_message_id(cb.from_user.id, msg.message_id)
+                await cleanup_user_ui_messages(bot_inst, cb.from_user.id, keep_message_id=msg.message_id)
             return
         except Exception:
             pass
@@ -239,6 +289,8 @@ async def safe_edit_message(
         try:
             sent = await bot_inst.send_message(chat_id=user_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
             await adb.set_ui_message_id(user_id, sent.message_id)
+            if cb and getattr(msg.chat, "type", None) == "private":
+                await cleanup_user_ui_messages(bot_inst, user_id, keep_message_id=sent.message_id, extra_ids=(msg.message_id,))
             return
         except Exception as e:
             logger.warning(f"Could not send message in safe_edit_message for user {user_id}: {e}")
@@ -268,16 +320,34 @@ async def show_user_screen(
             await callback.answer()
         except Exception:
             pass
+        saved_id = await adb.get_ui_message_id(user_id)
+        if saved_id and saved_id != message.message_id:
+            sent = await callback.bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+            await adb.set_ui_message_id(user_id, sent.message_id)
+            await cleanup_user_ui_messages(
+                callback.bot,
+                user_id,
+                keep_message_id=sent.message_id,
+                extra_ids=(message.message_id,),
+            )
+            return
         try:
             if getattr(message, "photo", None):
                 await message.edit_caption(caption=text, parse_mode=parse_mode, reply_markup=reply_markup)
             else:
                 await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
             await adb.set_ui_message_id(user_id, message.message_id)
+            await cleanup_user_ui_messages(callback.bot, user_id, keep_message_id=message.message_id)
             return
         except Exception as error:
             if "message is not modified" in str(error).lower():
                 await adb.set_ui_message_id(user_id, message.message_id)
+                await cleanup_user_ui_messages(callback.bot, user_id, keep_message_id=message.message_id)
                 return
         try:
             await message.delete()
@@ -290,6 +360,12 @@ async def show_user_screen(
             reply_markup=reply_markup,
         )
         await adb.set_ui_message_id(user_id, sent.message_id)
+        await cleanup_user_ui_messages(
+            callback.bot,
+            user_id,
+            keep_message_id=sent.message_id,
+            extra_ids=(message.message_id,),
+        )
         return
 
     bot_inst = target.bot
@@ -306,11 +382,7 @@ async def show_user_screen(
     else:
         sent = await target.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
     await adb.set_ui_message_id(user_id, sent.message_id)
-    if saved_id and saved_id != sent.message_id:
-        try:
-            await bot_inst.delete_message(chat_id=message.chat.id, message_id=saved_id)
-        except Exception as error:
-            logger.debug("Could not remove previous UI message %s for user %s: %s", saved_id, user_id, error)
+    await cleanup_user_ui_messages(bot_inst, user_id, keep_message_id=sent.message_id)
 
 
 async def render_admin_verification_queue(bot: Bot, page: int = 0):
@@ -377,13 +449,13 @@ async def cleanup_legacy_user_menus(bot: Bot):
         message_id = entry["message_id"]
         try:
             await bot.delete_message(chat_id=user_id, message_id=message_id)
-            await adb.clear_ui_message_id(user_id)
+            await adb.forget_ui_message_id(user_id, message_id)
             deleted += 1
         except TelegramRetryAfter as error:
             await asyncio.sleep(error.retry_after)
             try:
                 await bot.delete_message(chat_id=user_id, message_id=message_id)
-                await adb.clear_ui_message_id(user_id)
+                await adb.forget_ui_message_id(user_id, message_id)
                 deleted += 1
             except Exception:
                 failed += 1
@@ -1352,16 +1424,7 @@ async def render_group_schedule_view(
         if target_chat.type != "private":
             return
         await adb.set_ui_message_id(user_id, screen_message.message_id)
-        if previous_ui_id and previous_ui_id != screen_message.message_id:
-            try:
-                await actual_bot.delete_message(chat_id=target_chat.id, message_id=previous_ui_id)
-            except Exception as error:
-                logger.debug(
-                    "Could not remove previous schedule screen %s for user %s: %s",
-                    previous_ui_id,
-                    user_id,
-                    error,
-                )
+        await cleanup_user_ui_messages(actual_bot, user_id, keep_message_id=screen_message.message_id)
     
     if isinstance(photo_id, list):
         if is_callback:

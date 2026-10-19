@@ -102,6 +102,18 @@ def init_db():
             )
         """)
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ui_message_history (
+                user_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, message_id)
+            )
+        """)
+        cursor.execute("""
+            INSERT OR IGNORE INTO ui_message_history (user_id, message_id)
+            SELECT user_id, message_id FROM ui_messages
+        """)
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS verification_ui_messages (
                 user_id INTEGER PRIMARY KEY,
                 message_id INTEGER NOT NULL,
@@ -139,7 +151,7 @@ def get_ui_message_id(user_id: int) -> Optional[int]:
         return int(row["message_id"]) if row else None
 
 def set_ui_message_id(user_id: int, message_id: int):
-    """Stores the current persistent private-chat menu message ID."""
+    """Stores the current private-chat menu and remembers it for duplicate cleanup."""
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO ui_messages (user_id, message_id, updated_at)
@@ -148,23 +160,56 @@ def set_ui_message_id(user_id: int, message_id: int):
                 message_id = excluded.message_id,
                 updated_at = CURRENT_TIMESTAMP
         """, (user_id, message_id))
+        conn.execute("""
+            INSERT OR IGNORE INTO ui_message_history (user_id, message_id)
+            VALUES (?, ?)
+        """, (user_id, message_id))
 
 def clear_ui_message_id(user_id: int):
-    """Forgets a deleted or otherwise unavailable menu message."""
+    """Forgets all tracked menu messages for a user."""
     with get_connection() as conn:
         conn.execute("DELETE FROM ui_messages WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM ui_message_history WHERE user_id = ?", (user_id,))
+
+def forget_ui_message_id(user_id: int, message_id: int):
+    """Forgets one deleted or otherwise unavailable menu message."""
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM ui_message_history WHERE user_id = ? AND message_id = ?",
+            (user_id, message_id),
+        )
+        conn.execute(
+            "DELETE FROM ui_messages WHERE user_id = ? AND message_id = ?",
+            (user_id, message_id),
+        )
+
+def get_user_ui_message_ids(user_id: int) -> List[int]:
+    """Returns every menu message the bot has tracked for a user's private chat."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT message_id FROM ui_message_history WHERE user_id = ?
+            UNION
+            SELECT message_id FROM ui_messages WHERE user_id = ?
+            ORDER BY message_id
+        """, (user_id, user_id)).fetchall()
+        return [int(row["message_id"]) for row in rows]
 
 def get_all_ui_messages() -> List[Dict[str, int]]:
-    """Returns the last tracked bot menu for each user for a one-time cleanup."""
+    """Returns all tracked bot menu messages for a one-time cleanup."""
     with get_connection() as conn:
-        rows = conn.execute("SELECT user_id, message_id FROM ui_messages ORDER BY user_id").fetchall()
+        rows = conn.execute("""
+            SELECT user_id, message_id FROM ui_message_history
+            UNION
+            SELECT user_id, message_id FROM ui_messages
+            ORDER BY user_id, message_id
+        """).fetchall()
         return [{"user_id": int(row["user_id"]), "message_id": int(row["message_id"])} for row in rows]
 
 def claim_initial_ui_cleanup() -> bool:
-    """Ensures the legacy-menu cleanup runs only once for this database."""
+    """Ensures each UI cleanup migration runs only once for this database."""
     with get_connection() as conn:
         cursor = conn.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES ('initial_ui_cleanup_done', '1')"
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('ui_message_history_cleanup_done', '1')"
         )
         return cursor.rowcount == 1
 

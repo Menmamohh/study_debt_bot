@@ -199,7 +199,25 @@ def sync_drive_schedule(force: bool = False) -> Dict:
         dest_path = os.path.join(DOWNLOADS_DIR, f"{file_id}_{safe_name}")
 
         existing = db.get_gdrive_file(file_id)
-        needs_download = force or not existing or not os.path.exists(existing.get("local_path", ""))
+        previous_timestamp = int((existing or {}).get("drive_timestamp") or 0)
+        current_timestamp = int(f.get("drive_timestamp") or 0)
+        previous_size = int((existing or {}).get("file_size") or 0)
+        current_size = int(f.get("file_size") or 0)
+        drive_file_changed = bool(
+            existing
+            and (
+                (previous_timestamp and current_timestamp and previous_timestamp != current_timestamp)
+                or (previous_size and current_size and previous_size != current_size)
+            )
+        )
+        existing_path = (existing or {}).get("local_path")
+        needs_download = (
+            force
+            or not existing
+            or not existing_path
+            or not os.path.exists(existing_path)
+            or drive_file_changed
+        )
 
         if needs_download:
             success = download_file(file_id, dest_path)
@@ -217,6 +235,11 @@ def sync_drive_schedule(force: bool = False) -> Dict:
                 )
                 new_downloaded += 1
                 updated_files.append(f)
+                if existing_path and existing_path != dest_path:
+                    try:
+                        os.remove(existing_path)
+                    except OSError as error:
+                        logger.debug("Could not remove superseded schedule file %s: %s", existing_path, error)
         else:
             # Обновляем метаданные если уже есть
             db.save_gdrive_file(
