@@ -25,9 +25,7 @@ def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verifie
             kb.append([
                 InlineKeyboardButton(text="🔐 Выбрать группу для доступа", callback_data="start_verify_flow")
             ])
-        kb.append([
-            InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")
-        ])
+        kb.append([InlineKeyboardButton(text="💡 Полезное", callback_data="useful_menu")])
         return InlineKeyboardMarkup(inline_keyboard=kb)
         
     has_study_features = (
@@ -43,12 +41,7 @@ def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verifie
             [
                 InlineKeyboardButton(text="📝 Трекер долгов и работ", callback_data="debts_hub")
             ],
-            [
-                InlineKeyboardButton(text="📖 База методичек и решений", callback_data="browse_materials_hub")
-            ],
-            [
-                InlineKeyboardButton(text="📤 Добавить методичку или решение", callback_data="quick_upload_material")
-            ]
+            [InlineKeyboardButton(text="💡 Полезное", callback_data="useful_menu")]
         ])
     else:
         kb.extend([
@@ -57,17 +50,14 @@ def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verifie
             ],
             [
                 InlineKeyboardButton(text="🔔 Расписание звонков", callback_data="sched_bells")
-            ]
+            ],
+            [InlineKeyboardButton(text="💡 Полезное", callback_data="useful_menu")]
         ])
     
     if is_admin_user and is_private_chat:
         badge = f" (⏳ {pending_count})" if pending_count > 0 else ""
         kb.append([
             InlineKeyboardButton(text=f"👑 Админ-панель{badge}", callback_data="admin_panel")
-        ])
-    if is_private_chat:
-        kb.append([
-            InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")
         ])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -82,9 +72,24 @@ def debts_hub_kb() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="➕ Добавить свой предмет", callback_data="add_subject_prompt")
         ],
+        [InlineKeyboardButton(text="📖 База методичек и решений", callback_data="browse_materials_hub")],
+        [InlineKeyboardButton(text="📤 Добавить методичку или решение", callback_data="quick_upload_material")],
         [
             InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")
         ]
+    ])
+
+def useful_hub_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
+        [InlineKeyboardButton(text="📄 Пример заявления", callback_data="useful_application")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+
+def useful_application_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 К разделу «Полезное»", callback_data="useful_menu")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
 
 def back_to_debts_hub_kb() -> InlineKeyboardMarkup:

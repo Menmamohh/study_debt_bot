@@ -133,6 +133,8 @@ def is_admin(user) -> bool:
 
 MAIN_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "helper_cat.png")
 SHARK_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "meme_shark.jpg")
+APPLICATION_EXAMPLE_PHOTO = os.path.join(os.path.dirname(__file__), "assets", "useful", "application_example.jpg")
+APPLICATION_TEMPLATE_PDF = os.path.join(os.path.dirname(__file__), "assets", "useful", "application_template.pdf")
 GENERAL_SCHEDULE_PHOTOS = (
     (
         os.path.join(os.path.dirname(__file__), "assets", "schedule", "replacement_monday_19-10-2026_page_1.jpeg"),
@@ -2046,6 +2048,56 @@ async def cb_legacy_schedule(callback: CallbackQuery, state: FSMContext):
 # =========================================================================
 # --- ТРЕКЕР ДОЛГОВ И УЧЕБНЫХ РАБОТ (ХАБ) ---
 # =========================================================================
+
+@dp.callback_query(F.data == "useful_menu")
+async def cb_useful_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text = "💡 <b>Полезное</b>\n\nВыбери нужный пункт:"
+    await show_user_screen(callback, text, reply_markup=kb.useful_hub_kb())
+
+
+@dp.callback_query(F.data == "useful_application")
+async def cb_useful_application(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+    user_id = callback.from_user.id
+    if not os.path.isfile(APPLICATION_EXAMPLE_PHOTO) or not os.path.isfile(APPLICATION_TEMPLATE_PDF):
+        await show_user_screen(
+            callback,
+            "⚠️ Образец заявления временно недоступен.",
+            reply_markup=kb.useful_hub_kb(),
+        )
+        return
+
+    try:
+        photo_message = await callback.bot.send_photo(
+            chat_id=user_id,
+            photo=FSInputFile(APPLICATION_EXAMPLE_PHOTO),
+            caption="📷 Фото исходного заявления для примера.",
+        )
+        file_message = await callback.bot.send_document(
+            chat_id=user_id,
+            document=FSInputFile(APPLICATION_TEMPLATE_PDF),
+            caption="📄 Чистый шаблон заявления для печати.",
+            reply_markup=kb.useful_application_kb(),
+        )
+    except Exception:
+        logger.exception("Could not send the application example to user %s", user_id)
+        await show_user_screen(
+            callback,
+            "⚠️ Не удалось отправить образец. Попробуй ещё раз.",
+            reply_markup=kb.useful_hub_kb(),
+        )
+        return
+
+    await adb.set_ui_message_id(user_id, photo_message.message_id)
+    await adb.set_ui_message_id(user_id, file_message.message_id)
+    await cleanup_user_ui_messages(
+        callback.bot,
+        user_id,
+        keep_message_ids=(photo_message.message_id, file_message.message_id),
+        extra_ids=(callback.message.message_id,),
+    )
 
 @dp.callback_query(F.data == "debts_hub")
 async def cb_debts_hub(callback: CallbackQuery, state: FSMContext):
