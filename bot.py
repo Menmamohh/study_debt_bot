@@ -885,7 +885,7 @@ async def cmd_verify(message: Message, state: FSMContext):
         return
     text = (
         "🎓 <b>Верификация в «Помощнике Пятнашки»:</b>\n\n"
-        "Выбери свою учебную группу из списка колледжа им. А.Е. Ларина или нажми «Другая группа» 👇"
+        "Выбери свою учебную группу из списка колледжа им. А.Е. Ларина 👇"
     )
     await show_user_screen(message, text, reply_markup=kb.select_group_kb())
 
@@ -1032,7 +1032,7 @@ async def cb_start_verify_flow(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     text = (
         "🎓 <b>Выбери свою учебную группу:</b>\n\n"
-        "Выбери группу из списка колледжа им. Ларина или нажми «Ввести другую группу» 👇"
+        "Выбери свою учебную группу из списка колледжа им. Ларина 👇"
     )
     await safe_edit_message(callback, text, reply_markup=kb.select_group_kb())
 
