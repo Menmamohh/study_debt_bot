@@ -12,7 +12,7 @@ from typing import List, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 import urllib.request
 import certifi
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 import database as db
 
@@ -439,24 +439,48 @@ def _ocr_schedule_group(path: str, modified_at: float, group_name: str) -> str:
     bottom = height if group_index + 1 == len(markers) else markers[group_index + 1][1]
     try:
         with Image.open(path) as image:
-            image = image.convert("RGB")
-            crop = image.crop((0, max(0, top), image.width, min(image.height, bottom)))
+            crop = image.convert("RGB").crop(
+                (0, max(0, top), image.width, min(image.height, bottom))
+            )
+            # Drive sheets are phone photos of tightly ruled tables. Enlarge and
+            # normalize the selected group's block before OCR so small Cyrillic
+            # print and faint grid text survive recognition.
+            crop = ImageOps.grayscale(crop)
+            crop = ImageOps.autocontrast(crop, cutoff=1)
+            crop = crop.resize((crop.width * 2, crop.height * 2), Image.Resampling.LANCZOS)
+            crop = ImageEnhance.Contrast(crop).enhance(1.35)
+            crop = crop.filter(ImageFilter.SHARPEN)
             buffer = io.BytesIO()
             crop.save(buffer, format="PNG")
-        result = subprocess.run(
-            ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", "6"],
-            input=buffer.getvalue(),
-            capture_output=True,
-            timeout=45,
-            check=False,
-        )
+        # Different layouts work better for the photographed multi-column tables.
+        # Select the OCR result with the strongest Tesseract confidence instead
+        # of relying on a single page segmentation guess.
+        candidates = []
+        for psm in (4, 6, 11):
+            result = subprocess.run(
+                ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", str(psm), "tsv"],
+                input=buffer.getvalue(),
+                capture_output=True,
+                timeout=45,
+                check=False,
+            )
+            if result.returncode != 0:
+                continue
+            words = [row for row in csv.DictReader(io.StringIO(result.stdout.decode("utf-8", errors="replace")), delimiter="\t")
+                     if row.get("level") == "5" and row.get("text", "").strip()]
+            if not words:
+                continue
+            text = " ".join(row["text"].strip() for row in words)
+            confidences = [float(row["conf"]) for row in words if row.get("conf", "-1") not in ("-1", "")]
+            confidence = sum(confidences) / len(confidences) if confidences else 0
+            candidates.append((confidence, text))
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         logger.warning("Could not OCR group %s in %s: %s", group_name, path, error)
         return ""
-    if result.returncode != 0:
-        logger.warning("Tesseract failed for group %s in %s: %s", group_name, path, result.stderr.strip())
+    if not candidates:
+        logger.warning("Tesseract could not read group %s in %s", group_name, path)
         return ""
-    return result.stdout.decode("utf-8", errors="replace").strip()
+    return max(candidates, key=lambda candidate: candidate[0])[1].strip()
 
 
 def get_active_schedule_text(group_name: str, target_date: Optional[datetime.date] = None) -> str:
