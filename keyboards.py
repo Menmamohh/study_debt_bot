@@ -349,7 +349,7 @@ def rejected_user_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
     ])
 
-def admin_panel_kb(pending_materials_count: int = 0, pending_users_count: int = 0) -> InlineKeyboardMarkup:
+def admin_panel_kb(pending_materials_count: int = 0, pending_users_count: int = 0, pending_feedback_count: int = 0) -> InlineKeyboardMarkup:
     kb = []
     if pending_users_count > 0:
         kb.append([
@@ -359,6 +359,13 @@ def admin_panel_kb(pending_materials_count: int = 0, pending_users_count: int = 
         kb.append([
             InlineKeyboardButton(text=f"📋 Заявки на материалы ({pending_materials_count})", callback_data="admin_review_queue")
         ])
+    if pending_feedback_count > 0:
+        kb.append([
+            InlineKeyboardButton(text=f"🐞 Отчёты об ошибках ({pending_feedback_count})", callback_data="adm_feedback_queue")
+        ])
+    kb.append([
+        InlineKeyboardButton(text="🧪 Режим тестирования групп", callback_data="adm_test_mode")
+    ])
     kb.append([
         InlineKeyboardButton(text="📅 Опубликовать расписание для всех", callback_data="adm_sched_publish_all")
     ])
@@ -376,6 +383,40 @@ def admin_panel_kb(pending_materials_count: int = 0, pending_users_count: int = 
         InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")
     ])
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def admin_test_groups_kb(groups: List[str]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=group, callback_data=f"adm_test_preview_{group}")] for group in groups]
+    rows.append([InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_test_preview_kb(group_name: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Посмотреть расписание", callback_data=f"sched_view_{group_name}")],
+        [InlineKeyboardButton(text="👥 Выбрать другую группу", callback_data="adm_test_mode")],
+        [InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")],
+    ])
+
+
+def admin_feedback_queue_kb(reports: List[Dict], page: int, total: int, page_size: int = 10) -> InlineKeyboardMarkup:
+    rows = []
+    for report in reports:
+        label = _short_label(f"🐞 {report.get('user_label') or report['user_id']}: {report.get('body_text') or 'вложение'}", 48)
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"adm_feedback_{report['id']}")])
+    controls = _page_controls("adm_feedback_queue", page, total, page_size)
+    if controls:
+        rows.append(controls)
+    rows.append([InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_feedback_item_kb(report_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📎 Открыть исходное сообщение", callback_data=f"adm_feedback_copy_{report_id}")],
+        [InlineKeyboardButton(text="✅ Закрыть отчёт", callback_data=f"adm_feedback_resolve_{report_id}")],
+        [InlineKeyboardButton(text="🔙 К отчётам", callback_data="adm_feedback_queue")],
+    ])
 
 
 def _page_controls(callback_prefix: str, page: int, total: int, page_size: int) -> List[InlineKeyboardButton]:
