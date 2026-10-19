@@ -3163,6 +3163,11 @@ async def gdrive_sync_background_loop(bot: Bot):
 async def main():
     global ADMIN_ID
     await adb.init_db()
+    logger.info(
+        "SQLite database: %s (verified users: %s)",
+        db.DB_PATH,
+        await adb.count_verified_users(),
+    )
     await adb.seed_default_group_schedule()
     if ADMIN_ID is None:
         ADMIN_ID = await adb.get_admin_id()
