@@ -133,6 +133,7 @@ def is_admin(user) -> bool:
 
 MAIN_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "helper_cat.png")
 SHARK_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "meme_shark.jpg")
+MAIN_MENU_PHOTO_PATH = os.path.join(os.path.dirname(__file__), "assets", "main_menu_meme.jpg")
 APPLICATION_EXAMPLE_PHOTO = os.path.join(os.path.dirname(__file__), "assets", "useful", "application_example.jpg")
 APPLICATION_TEMPLATE_PDF = os.path.join(os.path.dirname(__file__), "assets", "useful", "application_template.pdf")
 GENERAL_SCHEDULE_PHOTOS = (
@@ -399,6 +400,22 @@ async def show_user_screen(
             await callback.answer()
         except Exception:
             pass
+        if photo:
+            sent = await callback.bot.send_photo(
+                chat_id=user_id,
+                photo=FSInputFile(photo) if os.path.isfile(photo) else photo,
+                caption=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+            await adb.set_ui_message_id(user_id, sent.message_id)
+            await cleanup_user_ui_messages(
+                callback.bot,
+                user_id,
+                keep_message_id=sent.message_id,
+                extra_ids=(message.message_id,),
+            )
+            return
         saved_id = await adb.get_ui_message_id(user_id)
         if saved_id and saved_id != message.message_id:
             sent = await callback.bot.send_message(
@@ -1036,7 +1053,12 @@ async def cmd_start(message: Message, state: FSMContext):
         is_private_chat=message.chat.type == "private"
     )
     
-    await show_user_screen(message, text, reply_markup=markup)
+    await show_user_screen(
+        message,
+        text,
+        reply_markup=markup,
+        photo=MAIN_MENU_PHOTO_PATH if is_verified and os.path.isfile(MAIN_MENU_PHOTO_PATH) else None,
+    )
 
 # --- Команда /verify ---
 @dp.message(Command("verify", "registration", "group"))
@@ -1171,7 +1193,12 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
                 f"чтобы получить доступ к расписанию и учебным материалам 👇"
             )
 
-    await show_user_screen(callback, text, reply_markup=markup)
+    await show_user_screen(
+        callback,
+        text,
+        reply_markup=markup,
+        photo=MAIN_MENU_PHOTO_PATH if is_verified and os.path.isfile(MAIN_MENU_PHOTO_PATH) else None,
+    )
 
 # =========================================================================
 # --- ВЕРИФИКАЦИЯ СТУДЕНТОВ (ОБЯЗАТЕЛЬНЫЙ ВХОД) ---
