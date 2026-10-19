@@ -1368,7 +1368,21 @@ async def render_group_schedule_view(
         None, gdrive_sync.get_active_schedule_text, group_name, target_date
     )
     
-    if sched:
+    if drive_schedule_text and group_name != "ALL":
+        # OCR from the active Drive replacement sheet is the current source of truth.
+        # Do not append it to the cached/manual schedule, which can be stale or contain
+        # every group's timetable and would make the selected group appear twice.
+        upd_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        safe_group_name = html.escape(group_name)
+        text = (
+            f"📅 <b>Расписание {header_date} — Группа {safe_group_name}</b> 🎓\n"
+            f"{note_line}"
+            "📝 <b>Текст из актуального листа Google Диска</b>\n\n"
+            f"<pre>{html.escape(drive_schedule_text)}</pre>\n\n"
+            f"🕒 <i>Обновлено: {upd_time}</i>"
+        )
+        photo_id = gen_photo
+    elif sched:
         upd_time = sched.get("updated_at") or "недавно"
         title = html.escape(sched.get("title") or f"Актуальное расписание ({group_name})")
         body = html.escape(sched.get("schedule_text") or "") or "<i>(Информация о парах на фото ниже)</i>"
@@ -1416,12 +1430,6 @@ async def render_group_schedule_view(
             f"Как только расписание или лист замен появится — тебе сразу придёт оповещение! 📢"
         )
         photo_id = None
-
-    if drive_schedule_text:
-        text += (
-            "\n\n📝 <b>Текст из актуальных листов Google Диска</b>\n"
-            f"<pre>{html.escape(drive_schedule_text)}</pre>"
-        )
 
     if notice:
         text = f"{notice}\n\n{text}"
