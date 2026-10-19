@@ -4,7 +4,10 @@ WORKDIR /app
 
 # Установка часового пояса (Минск / Москва)
 ENV TZ=Europe/Minsk
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-rus \
+    && rm -rf /var/lib/apt/lists/*
 
 # Установка зависимостей
 COPY requirements.txt .
