@@ -667,6 +667,7 @@ class VerificationMiddleware(BaseMiddleware):
             private_callbacks = {
                 "main_menu", "debts_hub", "show_all_debts", "list_subjects",
                 "add_subject_prompt", "browse_materials_hub", "start_verify_flow", "feedback_start",
+                "useful_menu", "useful_application",
             }
             if callback_data in private_callbacks or callback_data.startswith(private_prefixes):
                 await event.answer("Открой личный чат с ботом для личных разделов.", show_alert=True)
@@ -676,7 +677,7 @@ class VerificationMiddleware(BaseMiddleware):
 
         if isinstance(event, CallbackQuery):
             callback_data = event.data or ""
-            if callback_data in {"main_menu", "start_verify_flow", "feedback_start"} or callback_data.startswith("grp_"):
+            if callback_data in {"main_menu", "start_verify_flow", "feedback_start", "useful_menu", "useful_application"} or callback_data.startswith("grp_"):
                 return await handler(event, data)
         elif isinstance(event, Message):
             if event.text:
