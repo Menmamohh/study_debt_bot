@@ -372,7 +372,7 @@ def _normalise_group_label(value: str) -> str:
     # Tesseract often reads Cyrillic group codes as visually identical Latin letters.
     value = value.upper().replace("Ё", "Е").translate(str.maketrans({
         "A": "А", "B": "В", "C": "С", "E": "Е", "H": "Н",
-        "K": "К", "M": "М", "O": "О", "P": "Р", "T": "Т",
+        "D": "Д", "K": "К", "M": "М", "O": "О", "P": "Р", "T": "Т",
         "X": "Х", "Y": "У",
     }))
     return re.sub(r"[^A-ZА-Я0-9]", "", value)
@@ -382,48 +382,45 @@ def _normalise_group_label(value: str) -> str:
 def _schedule_group_markers(path: str, modified_at: float) -> Tuple[int, int, Tuple[Tuple[str, int], ...]]:
     """Finds group labels and their vertical positions so table pages can be cropped per group."""
     try:
-        result = subprocess.run(
-            ["tesseract", path, "stdout", "-l", "rus+eng", "--psm", "11", "tsv"],
-            capture_output=True,
-            text=True,
-            timeout=45,
-            check=False,
-        )
-        if result.returncode != 0:
-            logger.warning("Could not locate group labels in %s: %s", path, result.stderr.strip())
-            return 0, 0, ()
-
-        line_words = {}
         image_width = image_height = 0
-        for row in csv.DictReader(io.StringIO(result.stdout), delimiter="\t"):
-            if row.get("level") == "1":
-                image_width = int(row.get("width") or 0)
-                image_height = int(row.get("height") or 0)
-            if row.get("level") != "5" or not row.get("text", "").strip():
-                continue
-            key = (row.get("page_num"), row.get("block_num"), row.get("par_num"), row.get("line_num"))
-            line_words.setdefault(key, []).append(row)
-
+        group_positions = {}
         normalized_groups = {group: _normalise_group_label(group) for group in db.COLLEGE_GROUPS}
-        markers = []
-        for words in line_words.values():
-            line = " ".join(word["text"] for word in words)
-            normalized_line = _normalise_group_label(line)
-            group = next((name for name in sorted(db.COLLEGE_GROUPS, key=len, reverse=True)
-                          if normalized_groups[name] in normalized_line), None)
-            if group:
-                top = min(int(word["top"]) for word in words)
-                bottom = max(int(word["top"]) + int(word["height"]) for word in words)
-                markers.append((group, (top + bottom) // 2))
+        for page_segmentation in ("11", "6"):
+            result = subprocess.run(
+                ["tesseract", path, "stdout", "-l", "rus+eng", "--psm", page_segmentation, "tsv"],
+                capture_output=True,
+                text=True,
+                timeout=45,
+                check=False,
+            )
+            if result.returncode != 0:
+                logger.warning("Could not locate group labels in %s (PSM %s): %s",
+                               path, page_segmentation, result.stderr.strip())
+                continue
 
-        # Keep one label per group, in visual order.
-        unique_markers = []
-        seen = set()
-        for group, center_y in sorted(markers, key=lambda marker: marker[1]):
-            if group not in seen:
-                seen.add(group)
-                unique_markers.append((group, center_y))
-        return image_width, image_height, tuple(unique_markers)
+            line_words = {}
+            for row in csv.DictReader(io.StringIO(result.stdout), delimiter="\t"):
+                if row.get("level") == "1":
+                    image_width = max(image_width, int(row.get("width") or 0))
+                    image_height = max(image_height, int(row.get("height") or 0))
+                if row.get("level") != "5" or not row.get("text", "").strip():
+                    continue
+                key = (row.get("page_num"), row.get("block_num"), row.get("par_num"), row.get("line_num"))
+                line_words.setdefault(key, []).append(row)
+
+            for words in line_words.values():
+                normalized_line = _normalise_group_label(" ".join(word["text"] for word in words))
+                group = next((name for name in sorted(db.COLLEGE_GROUPS, key=len, reverse=True)
+                              if normalized_groups[name] in normalized_line), None)
+                if group:
+                    top = min(int(word["top"]) for word in words)
+                    group_positions.setdefault(group, []).append(top)
+
+        # Merge both OCR layouts and use each label's upper edge as the group boundary.
+        markers = [(group, sorted(positions)[len(positions) // 2])
+                   for group, positions in group_positions.items()]
+        markers.sort(key=lambda marker: marker[1])
+        return image_width, image_height, tuple(markers)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         logger.warning("Could not locate schedule groups in %s: %s", path, error)
         return 0, 0, ()
@@ -438,9 +435,8 @@ def _ocr_schedule_group(path: str, modified_at: float, group_name: str) -> str:
     if group_index is None:
         return ""
 
-    center_y = markers[group_index][1]
-    top = 0 if group_index == 0 else (markers[group_index - 1][1] + center_y) // 2
-    bottom = height if group_index + 1 == len(markers) else (center_y + markers[group_index + 1][1]) // 2
+    top = markers[group_index][1]
+    bottom = height if group_index + 1 == len(markers) else markers[group_index + 1][1]
     try:
         with Image.open(path) as image:
             image = image.convert("RGB")
@@ -460,7 +456,7 @@ def _ocr_schedule_group(path: str, modified_at: float, group_name: str) -> str:
     if result.returncode != 0:
         logger.warning("Tesseract failed for group %s in %s: %s", group_name, path, result.stderr.strip())
         return ""
-    return result.stdout.strip()
+    return result.stdout.decode("utf-8", errors="replace").strip()
 
 
 def get_active_schedule_text(group_name: str, target_date: Optional[datetime.date] = None) -> str:
