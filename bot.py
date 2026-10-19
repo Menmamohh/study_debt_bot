@@ -59,12 +59,21 @@ class AsyncDatabase:
 adb = AsyncDatabase(db)
 
 
-async def cleanup_user_ui_messages(bot: Bot, user_id: int, keep_message_id: Optional[int] = None, extra_ids=()):
+async def cleanup_user_ui_messages(
+    bot: Bot,
+    user_id: int,
+    keep_message_id: Optional[int] = None,
+    extra_ids=(),
+    keep_message_ids=(),
+):
     """Deletes all tracked duplicate menu messages except the one being shown."""
     tracked_ids = set(await adb.get_user_ui_message_ids(user_id))
     tracked_ids.update(int(message_id) for message_id in extra_ids if message_id)
+    keep_ids = {int(message_id) for message_id in keep_message_ids if message_id}
+    if keep_message_id:
+        keep_ids.add(int(keep_message_id))
     for message_id in sorted(tracked_ids):
-        if message_id == keep_message_id:
+        if message_id in keep_ids:
             continue
         try:
             await bot.delete_message(chat_id=user_id, message_id=message_id)
@@ -1443,11 +1452,20 @@ async def render_group_schedule_view(
     if target_chat.type == "private" and not is_callback:
         previous_ui_id = await adb.get_ui_message_id(user_id)
 
-    async def track_schedule_screen(screen_message):
+    async def track_schedule_screen(screen_message, related_messages=()):
         if target_chat.type != "private":
             return
+        related_ids = []
+        for related_message in related_messages:
+            await adb.set_ui_message_id(user_id, related_message.message_id)
+            related_ids.append(related_message.message_id)
         await adb.set_ui_message_id(user_id, screen_message.message_id)
-        await cleanup_user_ui_messages(actual_bot, user_id, keep_message_id=screen_message.message_id)
+        await cleanup_user_ui_messages(
+            actual_bot,
+            user_id,
+            keep_message_id=screen_message.message_id,
+            keep_message_ids=related_ids,
+        )
     
     if isinstance(photo_id, list):
         if is_callback:
@@ -1455,7 +1473,7 @@ async def render_group_schedule_view(
                 await target.message.delete()
             except Exception:
                 pass
-        await actual_bot.send_media_group(
+        photo_messages = await actual_bot.send_media_group(
             chat_id=user_id,
             media=build_general_schedule_media(photo_id, target_date=target_date),
         )
@@ -1465,7 +1483,7 @@ async def render_group_schedule_view(
             parse_mode="HTML",
             reply_markup=markup,
         )
-        await track_schedule_screen(screen_message)
+        await track_schedule_screen(screen_message, related_messages=photo_messages)
     elif photo_id:
         if is_callback:
             try:
@@ -1481,7 +1499,9 @@ async def render_group_schedule_view(
             screen_message = await actual_bot.send_message(
                 chat_id=target_chat.id, text=text, parse_mode="HTML", reply_markup=markup
             )
-            await actual_bot.send_photo(chat_id=target_chat.id, photo=photo_id)
+            photo_message = await actual_bot.send_photo(chat_id=target_chat.id, photo=photo_id)
+            await track_schedule_screen(screen_message, related_messages=(photo_message,))
+            return
         await track_schedule_screen(screen_message)
     else:
         if is_callback:

@@ -439,8 +439,10 @@ def _ocr_schedule_group(path: str, modified_at: float, group_name: str) -> str:
     bottom = height if group_index + 1 == len(markers) else markers[group_index + 1][1]
     try:
         with Image.open(path) as image:
+            # Keep the group heading and the first table row in frame; OCR's
+            # detected baseline can otherwise cut the heading off completely.
             crop = image.convert("RGB").crop(
-                (0, max(0, top), image.width, min(image.height, bottom))
+                (0, max(0, top - 24), image.width, min(image.height, bottom))
             )
             # Drive sheets are phone photos of tightly ruled tables. Enlarge and
             # normalize the selected group's block before OCR so small Cyrillic
@@ -470,9 +472,17 @@ def _ocr_schedule_group(path: str, modified_at: float, group_name: str) -> str:
                      if row.get("level") == "5" and row.get("text", "").strip()]
             if not words:
                 continue
-            text = " ".join(row["text"].strip() for row in words)
             confidences = [float(row["conf"]) for row in words if row.get("conf", "-1") not in ("-1", "")]
             confidence = sum(confidences) / len(confidences) if confidences else 0
+            if confidence < 38:
+                continue
+            # Preserve table row breaks instead of flattening every cell into
+            # one sentence, which made OCR output difficult to read and check.
+            lines = {}
+            for row in words:
+                key = (row.get("block_num"), row.get("par_num"), row.get("line_num"))
+                lines.setdefault(key, []).append(row["text"].strip())
+            text = "\n".join(" ".join(line) for line in lines.values())
             candidates.append((confidence, text))
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         logger.warning("Could not OCR group %s in %s: %s", group_name, path, error)
@@ -492,7 +502,10 @@ def get_active_schedule_text(group_name: str, target_date: Optional[datetime.dat
     target_date_str = target_date.isoformat()
     sections = []
 
-    for doc_type, heading in (("replacement", "Замены"), ("consultations", "Консультации")):
+    # Consultation sheets have a different layout and often list several
+    # groups in columns. The vertical group-cropper cannot reliably assign
+    # those rows, so don't present their OCR as a group's class schedule.
+    for doc_type, heading in (("replacement", "Замены"),):
         files = db.get_latest_gdrive_schedule_files(doc_type=doc_type, min_date=target_date_str)
         for item in files:
             path = item.get("local_path")
