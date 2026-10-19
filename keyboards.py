@@ -325,7 +325,7 @@ def select_group_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="ВД-65", callback_data="grp_ВД-65"), InlineKeyboardButton(text="ВД-66", callback_data="grp_ВД-66"), InlineKeyboardButton(text="ВД-67", callback_data="grp_ВД-67")],
         [InlineKeyboardButton(text="ВД-68", callback_data="grp_ВД-68"), InlineKeyboardButton(text="ВД-69", callback_data="grp_ВД-69"), InlineKeyboardButton(text="ВД-70", callback_data="grp_ВД-70")],
         [InlineKeyboardButton(text="С-37", callback_data="grp_С-37"), InlineKeyboardButton(text="С-38", callback_data="grp_С-38"), InlineKeyboardButton(text="С-39", callback_data="grp_С-39")],
-        [InlineKeyboardButton(text="СР-38", callback_data="grp_СР-38"), InlineKeyboardButton(text="✏️ Другая группа", callback_data="grp_custom")],
+        [InlineKeyboardButton(text="СР-38", callback_data="grp_СР-38")],
         [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ]
