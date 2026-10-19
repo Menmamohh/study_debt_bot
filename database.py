@@ -1359,13 +1359,16 @@ def count_verified_users() -> int:
         return conn.execute("SELECT COUNT(*) FROM users WHERE status = 'approved'").fetchone()[0]
 
 def ensure_admin_user(admin_id: int, username: str = "Menmamoh"):
-    """Гарантирует, что админ @Menmamoh всегда имеет approved статус, без навязывания группы"""
+    """Гарантирует approved-доступ администратору и сохраняет ему группу расписания."""
     clean_uname = f"@{username.lstrip('@')}"
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT student_group FROM users WHERE user_id = ?", (admin_id,))
         row = cursor.fetchone()
-        existing_group = row["student_group"] if row and row["student_group"] else None
+        # Администратор исторически использует расписание ТТ-36. Если поле группы
+        # оказалось пустым после старой миграции, восстановим этот выбор; уже
+        # сохранённую группу администратора не меняем.
+        existing_group = row["student_group"] if row and row["student_group"] else "ТТ-36"
         cursor.execute("""
             INSERT OR REPLACE INTO users (user_id, username, tg_name, student_name, student_group, status, verified_at)
             VALUES (?, ?, 'Администратор', 'Администратор', ?, 'approved', CURRENT_TIMESTAMP)
