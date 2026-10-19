@@ -173,6 +173,8 @@ class Form(StatesGroup):
     waiting_for_group_schedule = State()
     waiting_for_custom_group = State()
     waiting_for_student_name = State()
+    waiting_for_feedback = State()
+    waiting_for_broadcast = State()
 
 async def check_user_access(user) -> tuple[bool, str]:
     if is_admin(user):
@@ -236,6 +238,100 @@ async def safe_edit_message(
         except Exception as e:
             logger.warning(f"Could not send message in safe_edit_message for user {user_id}: {e}")
 
+
+async def show_user_screen(
+    target,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    parse_mode: str = "HTML",
+    photo=None,
+):
+    """Edits the user's one persistent private-chat interface message when possible."""
+    callback = target if isinstance(target, CallbackQuery) else None
+    message = callback.message if callback else target
+    user = callback.from_user if callback else getattr(target, "from_user", None)
+    if not user or not message or getattr(message.chat, "type", None) != "private":
+        if callback:
+            await safe_edit_message(callback, text, reply_markup=reply_markup, parse_mode=parse_mode)
+        else:
+            await target.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return
+
+    user_id = user.id
+    if callback:
+        try:
+            await callback.answer()
+        except Exception:
+            pass
+        try:
+            if getattr(message, "photo", None):
+                await message.edit_caption(caption=text, parse_mode=parse_mode, reply_markup=reply_markup)
+            else:
+                await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+            await adb.set_ui_message_id(user_id, message.message_id)
+            return
+        except Exception as error:
+            if "message is not modified" in str(error).lower():
+                await adb.set_ui_message_id(user_id, message.message_id)
+                return
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        sent = await callback.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+        await adb.set_ui_message_id(user_id, sent.message_id)
+        return
+
+    bot_inst = target.bot
+    saved_id = await adb.get_ui_message_id(user_id)
+    if saved_id:
+        try:
+            # A menu message may have started as a photo, so try its caption first.
+            await bot_inst.edit_message_caption(
+                chat_id=message.chat.id,
+                message_id=saved_id,
+                caption=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+            return
+        except Exception as error:
+            if "message is not modified" in str(error).lower():
+                return
+            try:
+                await bot_inst.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=saved_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                )
+                return
+            except Exception as text_error:
+                if "message is not modified" in str(text_error).lower():
+                    return
+                try:
+                    await bot_inst.delete_message(chat_id=message.chat.id, message_id=saved_id)
+                except Exception:
+                    pass
+                await adb.clear_ui_message_id(user_id)
+
+    if photo:
+        sent = await target.answer_photo(
+            photo=photo,
+            caption=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+    else:
+        sent = await target.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    await adb.set_ui_message_id(user_id, sent.message_id)
+
 async def prompt_verification_required(target, user, err_reason: str = ""):
     """Отправляет экран с кнопкой выбора группы тем, кто ещё не подтверждён"""
     user_rec = await adb.get_user(user.id)
@@ -249,6 +345,7 @@ async def prompt_verification_required(target, user, err_reason: str = ""):
         )
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Сменить группу", callback_data="start_verify_flow")],
+            [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
         ])
     elif user_rec and user_rec.get("status") == "rejected":
@@ -271,7 +368,7 @@ async def prompt_verification_required(target, user, err_reason: str = ""):
     if isinstance(target, CallbackQuery):
         await safe_edit_message(target, text, reply_markup=markup)
     else:
-        await target.answer(text, parse_mode="HTML", reply_markup=markup)
+        await show_user_screen(target, text, reply_markup=markup)
 
 
 async def get_user_primary_group(user_id: int) -> Optional[str]:
@@ -282,7 +379,7 @@ async def get_user_primary_group(user_id: int) -> Optional[str]:
     return None
 
 async def user_has_study_features(user, user_record: Optional[Dict] = None) -> bool:
-    """Проверяет, открыт ли для группы пользователя трекер долгов и база методичек (ТТ-36 и группы ХК, либо админ)."""
+    """Проверяет, открыт ли для группы пользователя трекер долгов и база методичек."""
     if is_admin(user):
         return True
     if not user:
@@ -293,7 +390,7 @@ async def user_has_study_features(user, user_record: Optional[Dict] = None) -> b
     return await adb.group_has_subjects_support(grp)
 
 async def is_tt36_student(user) -> bool:
-    """Алиас для проверки доступа к учебным разделам (ТТ-36, группы ХК, админ)."""
+    """Алиас для проверки доступа к учебным разделам."""
     return await user_has_study_features(user)
 
 async def reject_non_tt36(callback: CallbackQuery):
@@ -301,7 +398,7 @@ async def reject_non_tt36(callback: CallbackQuery):
     grp = await get_user_primary_group(callback.from_user.id) or "не указана"
     text = (
         f"ℹ️ <b>Раздел предметов и методичек</b>\n\n"
-        f"Учебные предметы, работы и методички в данный момент настроены для групп <b>ТТ-36</b> и <b>ХК</b>.\n\n"
+        f"Учебные предметы, работы и методички в данный момент настроены для групп <b>ТТ-36</b>, <b>ХК</b> и <b>ВД</b>.\n\n"
         f"Для твоей группы (<code>{html.escape(grp)}</code>) доступно актуальное расписание пар и звонков колледжа! 📅"
     )
     markup = InlineKeyboardMarkup(inline_keyboard=[
@@ -343,7 +440,7 @@ class VerificationMiddleware(BaseMiddleware):
             )
             private_callbacks = {
                 "main_menu", "debts_hub", "show_all_debts", "list_subjects",
-                "add_subject_prompt", "browse_materials_hub", "start_verify_flow",
+                "add_subject_prompt", "browse_materials_hub", "start_verify_flow", "feedback_start",
             }
             if callback_data in private_callbacks or callback_data.startswith(private_prefixes):
                 await event.answer("Открой личный чат с ботом для личных разделов.", show_alert=True)
@@ -353,7 +450,7 @@ class VerificationMiddleware(BaseMiddleware):
 
         if isinstance(event, CallbackQuery):
             callback_data = event.data or ""
-            if callback_data in {"main_menu", "start_verify_flow"} or callback_data.startswith("grp_"):
+            if callback_data in {"main_menu", "start_verify_flow", "feedback_start"} or callback_data.startswith("grp_"):
                 return await handler(event, data)
         elif isinstance(event, Message):
             if event.text:
@@ -362,7 +459,10 @@ class VerificationMiddleware(BaseMiddleware):
                 if command in {"/start", "/verify", "/registration", "/group", "/my_id", "/id"} or clean in {"начать", "🚀 начать", "старт", "start", "меню"}:
                     return await handler(event, data)
             state = data.get("state")
-            if state and await state.get_state() == Form.waiting_for_custom_group.state:
+            if state and await state.get_state() in {
+                Form.waiting_for_custom_group.state,
+                Form.waiting_for_feedback.state,
+            }:
                 return await handler(event, data)
 
         await prompt_verification_required(event, user)
@@ -378,10 +478,10 @@ dp.callback_query.middleware(verification_middleware)
 async def cmd_my_id(message: Message):
     user_id = message.from_user.id
     is_adm = " (администратор 👑)" if is_admin(message.from_user) else ""
-    await message.answer(
+    await show_user_screen(message,
         f"🆔 Твой Telegram ID: <code>{user_id}</code>\n"
         f"👤 Твой Username: @{html.escape(message.from_user.username or 'отсутствует')}{is_adm}",
-        parse_mode="HTML"
+        reply_markup=kb.back_to_menu_kb()
     )
 
 # --- Панель администратора (@Menmamoh) ---
@@ -429,13 +529,7 @@ async def show_admin_panel(message_or_callback, user, bot: Bot, is_callback: boo
             + "\n".join(status_lines) + "\n\n"
             f"Выбери раздел для управления 👇"
         )
-    if is_callback:
-        try:
-            await message_or_callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
-        except Exception:
-            await message_or_callback.message.answer(text, parse_mode="HTML", reply_markup=markup)
-    else:
-        await message_or_callback.answer(text, parse_mode="HTML", reply_markup=markup)
+    await show_user_screen(message_or_callback, text, reply_markup=markup)
         
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message, bot: Bot):
@@ -450,6 +544,124 @@ async def cb_admin_panel(callback: CallbackQuery, bot: Bot):
         await callback.answer("Открой личный чат с ботом, чтобы пользоваться админ-панелью.", show_alert=True)
         return
     await show_admin_panel(callback, callback.from_user, bot, is_callback=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "adm_broadcast_start")
+async def cb_admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user):
+        await callback.answer("Доступ только для администратора.", show_alert=True)
+        return
+    if callback.message.chat.type != "private":
+        await callback.answer("Открой личный чат с ботом для отправки объявления.", show_alert=True)
+        return
+    await state.set_state(Form.waiting_for_broadcast)
+    text = (
+        "📢 <b>Новое объявление</b>\n\n"
+        "Отправь текст или фотографию с подписью. Перед рассылкой покажу предпросмотр и попрошу подтвердить отправку.\n\n"
+        "Объявление получат все подтверждённые пользователи бота. Для отмены нажми «Главное меню»."
+    )
+    await show_user_screen(callback, text, reply_markup=kb.back_to_menu_kb())
+
+
+@dp.message(Form.waiting_for_broadcast)
+async def process_broadcast_draft(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        await state.clear()
+        return
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    if not (message.text or message.photo):
+        await show_user_screen(message, "⚠️ Отправь текст объявления или фотографию с подписью.", reply_markup=kb.back_to_menu_kb())
+        return
+
+    await state.update_data(
+        announcement_chat_id=message.chat.id,
+        announcement_message_id=message.message_id,
+        announcement_is_photo=bool(message.photo),
+        announcement_text=message.caption or message.text or "",
+    )
+    safe_text = html.escape(message.caption or message.text or "")
+    preview = "📢 <b>Предпросмотр объявления</b>\n\n"
+    if message.photo:
+        preview += "🖼️ <i>К объявлению приложена фотография.</i>\n"
+    preview += safe_text or "<i>Без текста</i>"
+    preview += "\n\nОтправить всем подтверждённым пользователям?"
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить всем", callback_data="adm_broadcast_send")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="adm_broadcast_cancel")],
+    ])
+    await show_user_screen(message, preview, reply_markup=markup)
+
+
+@dp.callback_query(F.data == "adm_broadcast_cancel")
+async def cb_admin_broadcast_cancel(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if not is_admin(callback.from_user):
+        await callback.answer("Доступ только для администратора.", show_alert=True)
+        return
+    await state.clear()
+    await show_admin_panel(callback, callback.from_user, bot, is_callback=True)
+    await callback.answer("Рассылка отменена.")
+
+
+@dp.callback_query(F.data == "adm_broadcast_send")
+async def cb_admin_broadcast_send(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if not is_admin(callback.from_user):
+        await callback.answer("Доступ только для администратора.", show_alert=True)
+        return
+    if callback.message.chat.type != "private":
+        await callback.answer("Открой личный чат с ботом.", show_alert=True)
+        return
+    draft = await state.get_data()
+    source_chat_id = draft.get("announcement_chat_id")
+    source_message_id = draft.get("announcement_message_id")
+    if not source_chat_id or not source_message_id:
+        await state.clear()
+        await callback.answer("Черновик не найден. Создай объявление заново.", show_alert=True)
+        await show_admin_panel(callback, callback.from_user, bot, is_callback=True)
+        return
+
+    await state.clear()
+    await callback.message.edit_text("📢 <b>Отправляю объявление…</b>", parse_mode="HTML", reply_markup=None)
+    sent_count = 0
+    failed_count = 0
+    users = await adb.get_verified_users()
+    for recipient in users:
+        user_id = recipient["user_id"]
+        if user_id == callback.from_user.id:
+            continue
+        try:
+            await bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=source_chat_id,
+                message_id=source_message_id,
+            )
+            sent_count += 1
+        except TelegramRetryAfter as error:
+            await asyncio.sleep(error.retry_after)
+            try:
+                await bot.copy_message(chat_id=user_id, from_chat_id=source_chat_id, message_id=source_message_id)
+                sent_count += 1
+            except Exception:
+                failed_count += 1
+                logger.exception("Could not deliver announcement to user %s", user_id)
+        except Exception:
+            failed_count += 1
+            logger.exception("Could not deliver announcement to user %s", user_id)
+        await asyncio.sleep(0.05)
+
+    report = (
+        "✅ <b>Рассылка завершена</b>\n\n"
+        f"Доставлено: <b>{sent_count}</b>\n"
+        f"Не удалось отправить: <b>{failed_count}</b>"
+    )
+    await callback.message.edit_text(
+        report,
+        parse_mode="HTML",
+        reply_markup=kb.admin_panel_kb(await adb.count_pending_materials(), await adb.count_pending_users()),
+    )
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_review_queue")
@@ -503,8 +715,6 @@ async def cmd_start(message: Message, state: FSMContext):
         
         # Проверяем статус верификации студента
         user_record = await adb.get_user(user_id)
-        photo_file = MAIN_IMAGE_PATH if os.path.exists(MAIN_IMAGE_PATH) else SHARK_IMAGE_PATH
-        
         if not user_record:
             welcome_text = (
                 f"☝️🤓 <b>ПОМОЩНИК ПЯТНАШКИ</b> 🎓\n"
@@ -513,23 +723,11 @@ async def cmd_start(message: Message, state: FSMContext):
                 f"🔒 <b>Выбери свою учебную группу:</b>\n"
                 f"Нажми на группу из списка колледжа ниже, чтобы получить доступ к расписанию и шпорам 👇"
             )
-            # Убираем залипшую снизу reply-кнопку, если она осталась у пользователя
-            if message.chat.type == "private":
-                try:
-                    rm_msg = await message.answer("🔄", reply_markup=ReplyKeyboardRemove())
-                    await rm_msg.delete()
-                except Exception:
-                    pass
-
-            if os.path.exists(photo_file):
-                await message.answer_photo(
-                    photo=FSInputFile(photo_file),
-                    caption=welcome_text,
-                    parse_mode="HTML",
-                    reply_markup=kb.select_group_kb()
-                )
-            else:
-                await message.answer(welcome_text, parse_mode="HTML", reply_markup=kb.select_group_kb())
+            await show_user_screen(
+                message,
+                welcome_text,
+                reply_markup=kb.select_group_kb(),
+            )
             return
             
         status = user_record.get("status")
@@ -544,19 +742,14 @@ async def cmd_start(message: Message, state: FSMContext):
                 f"Как только доступ подтвердят — тебе сразу прилетит оповещение!» 🔔"
             )
             pending_kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Сменить группу", callback_data="start_verify_flow")]
+                [InlineKeyboardButton(text="🔄 Сменить группу", callback_data="start_verify_flow")],
+                [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
             ])
-            if message.chat.type == "private":
-                try:
-                    rm_msg = await message.answer("🔄", reply_markup=ReplyKeyboardRemove())
-                    await rm_msg.delete()
-                except Exception:
-                    pass
-
-            if os.path.exists(photo_file):
-                await message.answer_photo(photo=FSInputFile(photo_file), caption=text, parse_mode="HTML", reply_markup=pending_kb)
-            else:
-                await message.answer(text, parse_mode="HTML", reply_markup=pending_kb)
+            await show_user_screen(
+                message,
+                text,
+                reply_markup=pending_kb,
+            )
             return
             
         if status == "rejected":
@@ -565,13 +758,7 @@ async def cmd_start(message: Message, state: FSMContext):
                 f"⛔ <b>Твой доступ в бота был отклонён администрацией.</b>\n\n"
                 f"Если произошла ошибка или ты ошибся группой, подай заявку повторно 👇"
             )
-            if message.chat.type == "private":
-                try:
-                    rm_msg = await message.answer("🔄", reply_markup=ReplyKeyboardRemove())
-                    await rm_msg.delete()
-                except Exception:
-                    pass
-            await message.answer(text, parse_mode="HTML", reply_markup=kb.rejected_user_kb())
+            await show_user_screen(message, text, reply_markup=kb.rejected_user_kb())
             return
             
     # Проверяем группу и статус пользователя
@@ -582,7 +769,7 @@ async def cmd_start(message: Message, state: FSMContext):
     pending_count = (await adb.count_pending_materials() + await adb.count_pending_users()) if is_adm else 0
     has_study = await user_has_study_features(message.from_user, user_record)
 
-    # Автоматически загружаем предметы семестра для групп с поддержкой предметов (ТТ-36, ХК-*)
+    # Автоматически загружаем предметы семестра для поддерживаемых групп.
     if has_study:
         await adb.seed_default_subjects(user_id, student_group=student_group)
     
@@ -610,7 +797,7 @@ async def cmd_start(message: Message, state: FSMContext):
             f"«Вообще-то, пары сами себя не отсидят!» 🐾\n\n"
             f"📅 <b>Расписание:</b> актуальные пары и замены для группы <b>{safe_group}</b>\n"
             f"🔔 <b>Звонки:</b> точное время уроков и перемен колледжа\n\n"
-            f"💡 <i>(Предметы и методички сейчас настроены для групп ТТ-36 и ХК)</i>\n\n"
+            f"💡 <i>(Предметы и методички сейчас настроены для групп ТТ-36, ХК и ВД)</i>\n\n"
             f"Куда направляемся? Выбирай раздел в меню ниже 👇"
         )
     markup = kb.main_menu_kb(
@@ -621,20 +808,7 @@ async def cmd_start(message: Message, state: FSMContext):
         is_private_chat=message.chat.type == "private"
     )
     
-    photo_file = MAIN_IMAGE_PATH if os.path.exists(MAIN_IMAGE_PATH) else SHARK_IMAGE_PATH
-    if os.path.exists(photo_file):
-        try:
-            await message.answer_photo(
-                photo=FSInputFile(photo_file),
-                caption=text,
-                parse_mode="HTML",
-                reply_markup=markup
-            )
-            return
-        except Exception as e:
-            logger.warning(f"Could not send start photo: {e}")
-            
-    await message.answer(text, parse_mode="HTML", reply_markup=markup)
+    await show_user_screen(message, text, reply_markup=markup)
 
 # --- Команда /verify ---
 @dp.message(Command("verify", "registration", "group"))
@@ -647,13 +821,61 @@ async def cmd_verify(message: Message, state: FSMContext):
         "🎓 <b>Верификация в «Помощнике Пятнашки»:</b>\n\n"
         "Выбери свою учебную группу из списка колледжа им. А.Е. Ларина или нажми «Другая группа» 👇"
     )
-    await message.answer(text, parse_mode="HTML", reply_markup=kb.select_group_kb())
+    await show_user_screen(message, text, reply_markup=kb.select_group_kb())
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Действие отменено.")
     await cmd_start(message, state)
+
+
+@dp.callback_query(F.data == "feedback_start")
+async def cb_feedback_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.waiting_for_feedback)
+    text = (
+        "🐞 <b>Сообщить об ошибке</b>\n\n"
+        "Опиши, что пошло не так и что ты ожидал увидеть. Можно приложить скриншот.\n\n"
+        "Отправь сообщение сюда — его получит администратор. Для отмены нажми «Главное меню»."
+    )
+    await show_user_screen(callback, text, reply_markup=kb.back_to_menu_kb())
+
+
+@dp.message(Form.waiting_for_feedback)
+async def process_feedback(message: Message, state: FSMContext, bot: Bot):
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    if not (message.text or message.caption or message.photo or message.document):
+        await show_user_screen(message, "⚠️ Пришли текст ошибки или приложи скриншот.", reply_markup=kb.back_to_menu_kb())
+        return
+
+    admin_id = await adb.get_admin_id() or ADMIN_ID
+    if not admin_id:
+        await state.clear()
+        await show_user_screen(message, "⚠️ Не удалось отправить сообщение: администратор не настроен.", reply_markup=kb.back_to_menu_kb())
+        return
+
+    user = message.from_user
+    user_label = f"@{user.username}" if user.username else (user.full_name or "Студент")
+    header = (
+        "🐞 <b>Сообщение об ошибке</b>\n"
+        f"👤 {html.escape(user_label)} · ID <code>{user.id}</code>"
+    )
+    try:
+        await bot.send_message(chat_id=admin_id, text=header, parse_mode="HTML")
+        await message.copy_to(chat_id=admin_id)
+    except Exception:
+        logger.exception("Could not forward feedback from user %s", user.id)
+        await show_user_screen(message, "⚠️ Не удалось отправить сообщение. Попробуй ещё раз чуть позже.", reply_markup=kb.back_to_menu_kb())
+        return
+
+    await state.clear()
+    await show_user_screen(
+        message,
+        "✅ Спасибо! Сообщение об ошибке отправлено администратору.",
+        reply_markup=kb.back_to_menu_kb(),
+    )
 
 # --- Главное меню ---
 @dp.callback_query(F.data == "main_menu")
@@ -697,7 +919,7 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
                 f"«Вообще-то, расписание само себя не проверит!» 🐾\n\n"
                 f"📅 <b>Расписание:</b> актуальные пары и замены для группы <b>{student_group}</b>\n"
                 f"🔔 <b>Звонки:</b> точное время уроков и перемен колледжа\n\n"
-                f"💡 <i>(Предметы и методички сейчас настроены для групп ТТ-36 и ХК)</i>\n\n"
+                f"💡 <i>(Предметы и методички сейчас настроены для групп ТТ-36, ХК и ВД)</i>\n\n"
                 f"Выбери нужный раздел:"
             )
     else:
@@ -824,10 +1046,10 @@ async def process_custom_group(message: Message, state: FSMContext):
         
     grp = (message.text or "").strip()
     if not grp:
-        await message.answer("⚠️ Название группы не может быть пустым. Попробуй ещё раз:")
+        await show_user_screen(message, "⚠️ Название группы не может быть пустым. Попробуй ещё раз:", reply_markup=kb.back_to_menu_kb())
         return
     if len(grp.encode("utf-8")) > 40:
-        await message.answer("⚠️ Название группы слишком длинное. Введи не более 40 байт UTF-8:")
+        await show_user_screen(message, "⚠️ Название группы слишком длинное. Введи не более 40 байт UTF-8:", reply_markup=kb.back_to_menu_kb())
         return
         
     user_id = message.from_user.id
@@ -850,7 +1072,10 @@ async def process_custom_group(message: Message, state: FSMContext):
         f"Администратор проверит твою заявку. "
         f"Как только доступ подтвердят, ты сразу получишь оповещение в этом чате! 🔔"
     )
-    await message.answer(user_confirm_text, parse_mode="HTML")
+    await show_user_screen(message, user_confirm_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Сменить группу", callback_data="start_verify_flow")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ]))
     
     admin_id = await adb.get_admin_id()
     if admin_id:
@@ -1015,7 +1240,14 @@ async def cb_admin_users_list(callback: CallbackQuery):
 # --- АКТУАЛЬНОЕ ОПЕРАТИВНОЕ РАСПИСАНИЕ ПО ГРУППАМ (ПЯТНАШКА) ---
 # =========================================================================
 
-async def render_group_schedule_view(target, user, group_name: str, is_callback: bool = False, bot: Optional[Bot] = None):
+async def render_group_schedule_view(
+    target,
+    user,
+    group_name: str,
+    is_callback: bool = False,
+    bot: Optional[Bot] = None,
+    notice: Optional[str] = None,
+):
     """Отображает самое актуальное расписание для указанной группы с учётом правила отсечки (17:00 / суббота)"""
     user_id = user.id
     target_chat = target.message.chat if is_callback else target.chat
@@ -1097,6 +1329,9 @@ async def render_group_schedule_view(target, user, group_name: str, is_callback:
             f"Как только расписание или лист замен появится — тебе сразу придёт оповещение! 📢"
         )
         photo_id = None
+
+    if notice:
+        text = f"{notice}\n\n{text}"
         
     actual_bot = bot or getattr(target, "bot", None)
     
@@ -1110,33 +1345,30 @@ async def render_group_schedule_view(target, user, group_name: str, is_callback:
             chat_id=user_id,
             media=build_general_schedule_media(photo_id, target_date=target_date),
         )
-        await actual_bot.send_message(
+        screen_message = await actual_bot.send_message(
             chat_id=user_id,
             text=text,
             parse_mode="HTML",
             reply_markup=markup,
         )
+        if target_chat.type == "private":
+            await adb.set_ui_message_id(user_id, screen_message.message_id)
     elif photo_id:
         if is_callback:
             try:
                 await target.message.delete()
             except Exception:
                 pass
-            await actual_bot.send_photo(chat_id=user_id, photo=photo_id, caption=text, parse_mode="HTML", reply_markup=markup)
+            screen_message = await actual_bot.send_photo(chat_id=user_id, photo=photo_id, caption=text, parse_mode="HTML", reply_markup=markup)
         else:
-            await target.answer_photo(photo=photo_id, caption=text, parse_mode="HTML", reply_markup=markup)
+            screen_message = await target.answer_photo(photo=photo_id, caption=text, parse_mode="HTML", reply_markup=markup)
+        if target_chat.type == "private":
+            await adb.set_ui_message_id(user_id, screen_message.message_id)
     else:
         if is_callback:
-            try:
-                await target.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
-            except Exception:
-                try:
-                    await target.message.delete()
-                except Exception:
-                    pass
-                await actual_bot.send_message(chat_id=user_id, text=text, parse_mode="HTML", reply_markup=markup)
+            await show_user_screen(target, text, reply_markup=markup)
         else:
-            await target.answer(text, parse_mode="HTML", reply_markup=markup)
+            await show_user_screen(target, text, reply_markup=markup)
 
 @dp.callback_query(F.data == "schedule_menu")
 async def cb_schedule_menu(callback: CallbackQuery, state: FSMContext):
@@ -1183,9 +1415,9 @@ async def cmd_schedule(message: Message, state: FSMContext):
         return
     group_name = await get_user_primary_group(message.from_user.id)
     if not group_name:
-        await message.answer(
+        await show_user_screen(
+            message,
             "🎓 <b>Сначала выбери учебную группу:</b>",
-            parse_mode="HTML",
             reply_markup=kb.schedule_choose_group_kb(),
         )
         return
@@ -1267,7 +1499,7 @@ async def cmd_bells(message: Message):
     back_row.append(InlineKeyboardButton(text="👥 Выбрать группу", callback_data="sched_choose_group"))
     back_row.append(InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"))
     markup = InlineKeyboardMarkup(inline_keyboard=[back_row])
-    await message.answer(db.BELLS_SCHEDULE_TEXT, parse_mode="HTML", reply_markup=markup)
+    await show_user_screen(message, db.BELLS_SCHEDULE_TEXT, reply_markup=markup)
 
 @dp.callback_query(F.data == "sched_view_gen_photo")
 async def cb_schedule_view_gen_photo(callback: CallbackQuery):
@@ -1408,7 +1640,7 @@ async def process_group_schedule_input(message: Message, state: FSMContext, bot:
     target_group = data.get("target_group")
     if target_group not in {*db.COLLEGE_GROUPS, "ALL"}:
         await state.clear()
-        await message.answer("⚠️ Сеанс редактирования расписания завершён. Открой редактирование заново.")
+        await show_user_screen(message, "⚠️ Сеанс редактирования расписания завершён. Открой редактирование заново.", reply_markup=kb.back_to_menu_kb())
         return
     
     photo_file_id = message.photo[-1].file_id if message.photo else None
@@ -1416,7 +1648,7 @@ async def process_group_schedule_input(message: Message, state: FSMContext, bot:
     raw_text = raw_text.strip()
     
     if not photo_file_id and not raw_text:
-        await message.answer("⚠️ Отправь фотографию расписания или текстовое сообщение:")
+        await show_user_screen(message, "⚠️ Отправь фотографию расписания или текстовое сообщение:", reply_markup=kb.back_to_menu_kb())
         return
         
     title = f"Замена / Расписание ({target_group})"
@@ -1508,10 +1740,8 @@ async def process_group_schedule_input(message: Message, state: FSMContext, bot:
     )
     published_scope = "всех групп" if target_group == "ALL" else f"группы {safe_target_group}"
     confirm_text = f"✅ <b>Расписание для {published_scope} успешно обновлено!</b>\n{info_str}"
-    await message.answer(confirm_text, parse_mode="HTML")
-    
     # Отображаем обновленный экран расписания
-    await render_group_schedule_view(message, message.from_user, target_group, is_callback=False, bot=bot)
+    await render_group_schedule_view(message, message.from_user, target_group, is_callback=False, bot=bot, notice=confirm_text)
 
 @dp.callback_query(F.data.startswith("adm_sched_clear_"))
 async def cb_admin_sched_clear(callback: CallbackQuery):
@@ -2215,18 +2445,18 @@ async def process_quick_task_title(message: Message, state: FSMContext, bot: Bot
         raw_title = message.text.strip()
         
     if not raw_title:
-        await message.answer("⚠️ Отправь название текстом или прикрепи фотографию/файл с подписью.")
+        await show_user_screen(message, "⚠️ Отправь название текстом или прикрепи фотографию/файл с подписью.", reply_markup=kb.back_to_menu_kb())
         return
     subject = await adb.get_subject_by_id(user_id, subject_id) if subject_id else None
     if not subject:
         await state.clear()
-        await message.answer("⚠️ Предмет не найден или уже удалён. Начни загрузку заново.")
+        await show_user_screen(message, "⚠️ Предмет не найден или уже удалён. Начни загрузку заново.", reply_markup=kb.back_to_menu_kb())
         return
 
     task_id = await adb.add_task(user_id, subject_id, raw_title)
     if task_id is None:
         await state.clear()
-        await message.answer("⚠️ Не удалось создать работу. Проверь предмет и попробуй ещё раз.")
+        await show_user_screen(message, "⚠️ Не удалось создать работу. Проверь предмет и попробуй ещё раз.", reply_markup=kb.back_to_menu_kb())
         return
     safe_sub = html.escape(subject["name"])
     safe_title = html.escape(raw_title)
@@ -2245,7 +2475,7 @@ async def process_quick_task_title(message: Message, state: FSMContext, bot: Bot
             f"• <b>📖 Методичка</b> — задание / указания.\n"
             f"• <b>💡 Решение</b> — готовая работа / расчетка / шпора."
         )
-        await message.answer(text, parse_mode="HTML", reply_markup=kb.choose_material_type_kb(task_id, subject_id))
+        await show_user_screen(message, text, reply_markup=kb.choose_material_type_kb(task_id, subject_id))
         return
         
     # Если прислали просто название текстом:
@@ -2257,7 +2487,7 @@ async def process_quick_task_title(message: Message, state: FSMContext, bot: Bot
         f"• <b>💡 Решение</b> — готовая работа, правильный вариант, расчетка, шпаргалка или код.\n\n"
         f"<i>Все материалы проходят верификацию перед публикацией.</i>"
     )
-    await message.answer(text, parse_mode="HTML", reply_markup=kb.choose_material_type_kb(task_id, subject_id))
+    await show_user_screen(message, text, reply_markup=kb.choose_material_type_kb(task_id, subject_id))
 
 # --- Начать процесс предложения материала из карточки работы ---
 @dp.callback_query(F.data.startswith("upload_mat_"))
@@ -2392,7 +2622,7 @@ async def process_material_title(message: Message, state: FSMContext, bot: Bot):
         await process_material_file(message, state, bot)
         return
     if not message.text or not message.text.strip():
-        await message.answer("⚠️ Отправь название текстом или прикрепи фотографию/файл.")
+        await show_user_screen(message, "⚠️ Отправь название текстом или прикрепи фотографию/файл.", reply_markup=kb.back_to_menu_kb())
         return
 
     title = message.text.strip()
@@ -2404,7 +2634,7 @@ async def process_material_title(message: Message, state: FSMContext, bot: Bot):
         f"📸 Теперь <b>скинь фотографию</b> (или файл) 📷 👇\n\n"
         f"<i>(или отправь /cancel для отмены)</i>"
     )
-    await message.answer(text, parse_mode="HTML", reply_markup=kb.back_to_menu_kb())
+    await show_user_screen(message, text, reply_markup=kb.back_to_menu_kb())
 
 @dp.message(Form.waiting_for_material_file)
 async def process_material_file(message: Message, state: FSMContext, bot: Bot):
@@ -2423,7 +2653,7 @@ async def process_material_file(message: Message, state: FSMContext, bot: Bot):
     task_info = await adb.get_task_info_for_subject(user_id, subject_id, task_id) if subject_id else None
     if not task_info:
         await state.clear()
-        await message.answer("⚠️ Работа больше недоступна. Начни загрузку материала заново.")
+        await show_user_screen(message, "⚠️ Работа больше недоступна. Начни загрузку материала заново.", reply_markup=kb.back_to_menu_kb())
         return
 
     user_name = message.from_user.username or message.from_user.full_name or f"User_{user_id}"
@@ -2462,11 +2692,11 @@ async def process_material_file(message: Message, state: FSMContext, bot: Bot):
             # Сохраняем введенный текст как название, просим скинуть фото и даем кнопку сохранить только текстом
             await state.update_data(mat_title=text_val)
             safe_entered_title = html.escape(text_val)
-            await message.answer(
+            await show_user_screen(
+                message,
                 f"✍️ Название <b>«{safe_entered_title}»</b> принято!\n\n"
                 f"📸 Теперь просто <b>прикрепи фотографию</b> (или файл) к этому названию 📷 👇\n\n"
                 f"<i>(Или нажми кнопку ниже, если хочешь отправить материал только текстом без фото)</i>",
-                parse_mode="HTML",
                 reply_markup=kb.text_only_or_cancel_kb(task_id, subject_id)
             )
             return
@@ -2474,7 +2704,7 @@ async def process_material_file(message: Message, state: FSMContext, bot: Bot):
             file_type = "text"
             content_text = text_val
     else:
-        await message.answer("⚠️ Пожалуйста, просто скинь фотографию, документ или текст.")
+        await show_user_screen(message, "⚠️ Пожалуйста, просто скинь фотографию, документ или текст.", reply_markup=kb.back_to_menu_kb())
         return
         
     # Сохраняем в базу со статусом 'pending'
@@ -2490,7 +2720,7 @@ async def process_material_file(message: Message, state: FSMContext, bot: Bot):
     )
     if mat_id is None:
         await state.clear()
-        await message.answer("⚠️ Не удалось сохранить материал: работа не найдена.")
+        await show_user_screen(message, "⚠️ Не удалось сохранить материал: работа не найдена.", reply_markup=kb.back_to_menu_kb())
         return
     await state.clear()
     
@@ -2499,12 +2729,12 @@ async def process_material_file(message: Message, state: FSMContext, bot: Bot):
     safe_task = html.escape(task_info["title"]) if task_info else ""
     
     # 1. Сообщение пользователю с обратной связью от Менмы
-    await message.answer(
+    await show_user_screen(
+        message,
         "🚀 <b>Материал успешно отправлен!</b>\n\n"
         "💬 <b>Сообщение от Менмы:</b>\n"
         "<i>«Щас проверю 😎🤙»</i>\n\n"
         "⏳ Твой файл передан на верификацию к @Menmamoh. Как только он нажмёт «Одобрить», материал сразу появится в базе знаний бота у всех студентов!",
-        parse_mode="HTML",
         reply_markup=kb.material_sent_success_kb(subject_id)
     )
     
@@ -2717,7 +2947,7 @@ async def cb_photo_unsolicited(message: Message, state: FSMContext):
         "К какому предмету относится это решение или методичка?\n"
         "Выбери предмет ниже 👇"
     )
-    await message.answer(text, parse_mode="HTML", reply_markup=kb.quick_subjects_select_kb(subjects))
+    await show_user_screen(message, text, reply_markup=kb.quick_subjects_select_kb(subjects))
 
 # =========================================================================
 # --- БАЗОВЫЕ ОПЕРАЦИИ С ПРЕДМЕТАМИ И ЗАДАЧАМИ ---
@@ -2749,7 +2979,7 @@ async def process_subject_name(message: Message, state: FSMContext):
     user_id = message.from_user.id
     name = (message.text or message.caption or "").strip()
     if not name:
-        await message.answer("⚠️ Название предмета не может быть пустым. Попробуй ещё раз:")
+        await show_user_screen(message, "⚠️ Название предмета не может быть пустым. Попробуй ещё раз:", reply_markup=kb.back_to_menu_kb())
         return
     
     sub_id = await adb.add_subject(user_id, name)
@@ -2762,7 +2992,7 @@ async def process_subject_name(message: Message, state: FSMContext):
         text = f"⚠️ Предмет <b>«{safe_name}»</b> уже есть в твоем списке!"
         
     subjects = await adb.get_subjects_with_counts(user_id)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb.subjects_list_kb(subjects))
+    await show_user_screen(message, text, reply_markup=kb.subjects_list_kb(subjects))
 
 # --- Добавление работы в предмет (FSM) ---
 @dp.callback_query(F.data.startswith("add_task_prompt_"))
@@ -2804,12 +3034,12 @@ async def process_task_title(message: Message, state: FSMContext):
     subject = await adb.get_subject_by_id(user_id, subject_id) if subject_id else None
     if not subject:
         await state.clear()
-        await message.answer("⚠️ Предмет не найден или уже удалён. Начни добавление работы заново.")
+        await show_user_screen(message, "⚠️ Предмет не найден или уже удалён. Начни добавление работы заново.", reply_markup=kb.back_to_menu_kb())
         return
     
     raw_text = (message.text or message.caption or "").strip()
     if not raw_text:
-        await message.answer("⚠️ Отправь название работы текстом. Можно указать несколько строк.")
+        await show_user_screen(message, "⚠️ Отправь название работы текстом. Можно указать несколько строк.", reply_markup=kb.back_to_menu_kb())
         return
     lines = [line.strip() for line in raw_text.replace(",", "\n").split("\n") if line.strip()]
     added_count = await adb.add_tasks(user_id, subject_id, lines)
@@ -2831,7 +3061,8 @@ async def process_task_title(message: Message, state: FSMContext):
         f"• Нажатие <b>слева</b> переключает статус сдачи\n"
         f"• Кнопка <b>справа 📚</b> открывает проверенные методички и решения"
     )
-    await message.answer(
+    await show_user_screen(
+        message,
         text, parse_mode="HTML",
         reply_markup=kb.subject_tasks_kb(subject_id, tasks, mat_counts, 0, total_tasks, page_size)
     )

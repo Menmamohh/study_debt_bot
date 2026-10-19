@@ -24,11 +24,14 @@ def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verifie
         kb.append([
             InlineKeyboardButton(text="🔐 Выбрать группу для доступа", callback_data="start_verify_flow")
         ])
+        kb.append([
+            InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")
+        ])
         return InlineKeyboardMarkup(inline_keyboard=kb)
         
     has_study_features = (
         is_admin_user or 
-        (bool(student_group) and (student_group == "ТТ-36" or student_group.strip().upper().startswith("ХК")))
+        (bool(student_group) and (student_group == "ТТ-36" or student_group.strip().upper().startswith(("ХК", "ВД"))))
     )
 
     if has_study_features:
@@ -66,6 +69,10 @@ def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verifie
         badge = f" (⏳ {pending_count})" if pending_count > 0 else ""
         kb.append([
             InlineKeyboardButton(text=f"👑 Админ-панель{badge}", callback_data="admin_panel")
+        ])
+    if is_private_chat:
+        kb.append([
+            InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")
         ])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -324,6 +331,7 @@ def select_group_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="ВД-68", callback_data="grp_ВД-68"), InlineKeyboardButton(text="ВД-69", callback_data="grp_ВД-69"), InlineKeyboardButton(text="ВД-70", callback_data="grp_ВД-70")],
         [InlineKeyboardButton(text="С-37", callback_data="grp_С-37"), InlineKeyboardButton(text="С-38", callback_data="grp_С-38"), InlineKeyboardButton(text="С-39", callback_data="grp_С-39")],
         [InlineKeyboardButton(text="СР-38", callback_data="grp_СР-38"), InlineKeyboardButton(text="✏️ Другая группа", callback_data="grp_custom")],
+        [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
@@ -338,7 +346,8 @@ def admin_user_verify_kb(user_id: int) -> InlineKeyboardMarkup:
 
 def rejected_user_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Выбрать группу заново", callback_data="start_verify_flow")]
+        [InlineKeyboardButton(text="🔄 Выбрать группу заново", callback_data="start_verify_flow")],
+        [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
     ])
 
 def admin_panel_kb(pending_materials_count: int = 0, pending_users_count: int = 0) -> InlineKeyboardMarkup:
@@ -353,6 +362,9 @@ def admin_panel_kb(pending_materials_count: int = 0, pending_users_count: int = 
         ])
     kb.append([
         InlineKeyboardButton(text="📅 Опубликовать расписание для всех", callback_data="adm_sched_publish_all")
+    ])
+    kb.append([
+        InlineKeyboardButton(text="📢 Отправить объявление всем", callback_data="adm_broadcast_start")
     ])
     kb.append([
         InlineKeyboardButton(text="👥 Список верифицированных студентов", callback_data="adm_users_list")

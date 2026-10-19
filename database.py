@@ -95,6 +95,13 @@ def init_db():
             )
         """)
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ui_messages (
+                user_id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS gdrive_schedule_files (
                 file_id TEXT PRIMARY KEY,
                 filename TEXT NOT NULL,
@@ -117,6 +124,28 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_users_status_name ON users(status, student_name);
         """)
         conn.commit()
+
+def get_ui_message_id(user_id: int) -> Optional[int]:
+    """Returns the ID of the user's persistent private-chat menu message."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT message_id FROM ui_messages WHERE user_id = ?", (user_id,)).fetchone()
+        return int(row["message_id"]) if row else None
+
+def set_ui_message_id(user_id: int, message_id: int):
+    """Stores the current persistent private-chat menu message ID."""
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO ui_messages (user_id, message_id, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                message_id = excluded.message_id,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, message_id))
+
+def clear_ui_message_id(user_id: int):
+    """Forgets a deleted or otherwise unavailable menu message."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM ui_messages WHERE user_id = ?", (user_id,))
 
 DEFAULT_SUBJECTS_BY_GROUP = {
     "ТТ-36": [
@@ -143,6 +172,23 @@ DEFAULT_SUBJECTS_BY_GROUP = {
         "Технология изделий из керамики",
         "Материаловедение",
         "Прикладная информатика"
+    ],
+    "ВД": [
+        "Методика экологического образования",
+        "Природоведение (2 курс)",
+        "Психология",
+        "Педагогика",
+        "Информационные технологии",
+        "Методика развития речи",
+        "Белорусский язык (проф. лексика) (3 курс)",
+        "Современный белорусский язык (2 курс)",
+        "Мировая детская литература",
+        "Формирование элементарных математических основ",
+        "Изобразительная деятельность",
+        "История белорусской государственности (3 курс)",
+        "ФИЗО",
+        "Методика музыкального образования и воспитания детей",
+        "Технология инклюзивного образования"
     ]
 }
 
@@ -159,7 +205,7 @@ def group_has_subjects_support(group_name: Optional[str]) -> bool:
     if not group_name:
         return False
     grp = group_name.strip().upper()
-    return grp == "ТТ-36" or grp.startswith("ХК")
+    return grp == "ТТ-36" or grp.startswith(("ХК", "ВД"))
 
 def get_default_subjects_for_group(group_name: Optional[str]) -> List[str]:
     """Возвращает список предметов семестра по умолчанию для конкретной группы"""
@@ -170,6 +216,8 @@ def get_default_subjects_for_group(group_name: Optional[str]) -> List[str]:
         return DEFAULT_SUBJECTS_BY_GROUP["ТТ-36"]
     if grp.startswith("ХК"):
         return DEFAULT_SUBJECTS_BY_GROUP["ХК"]
+    if grp.startswith("ВД"):
+        return DEFAULT_SUBJECTS_BY_GROUP["ВД"]
     return []
 
 COLLEGE_GROUPS = [
@@ -194,7 +242,7 @@ COLLEGE_GROUPS = [
 ]
 
 def seed_default_subjects(user_id: int, student_group: Optional[str] = None):
-    """Инициализирует предметы пользователя по умолчанию в зависимости от его группы (ТТ-36, группы ХК)"""
+    """Инициализирует предметы пользователя по умолчанию в зависимости от его группы."""
     if student_group is None:
         user = get_user(user_id)
         student_group = user.get("student_group") if user else None
