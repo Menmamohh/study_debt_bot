@@ -750,18 +750,25 @@ async def show_admin_panel(message_or_callback, user, bot: Bot, is_callback: boo
     await adb.set_admin_id(user.id)
     await adb.ensure_admin_user(user.id, user.username or ADMIN_USERNAME)
     
-    pending_mat_count, pending_users_count = await asyncio.gather(
+    pending_mat_count, pending_users_count, pending_feedback_count = await asyncio.gather(
         adb.count_pending_materials(),
         adb.count_pending_users(),
+        adb.count_open_feedback_reports(),
     )
     
-    markup = kb.admin_panel_kb(pending_materials_count=pending_mat_count, pending_users_count=pending_users_count)
+    markup = kb.admin_panel_kb(
+        pending_materials_count=pending_mat_count,
+        pending_users_count=pending_users_count,
+        pending_feedback_count=pending_feedback_count,
+    )
     
     status_lines = []
     if pending_users_count > 0:
         status_lines.append(f"👥 <b>Заявок на вход (верификация):</b> <b>{pending_users_count}</b> шт.")
     if pending_mat_count > 0:
         status_lines.append(f"📋 <b>Материалов на проверке:</b> <b>{pending_mat_count}</b> шт.")
+    if pending_feedback_count > 0:
+        status_lines.append(f"🐞 <b>Новых отчётов об ошибках:</b> <b>{pending_feedback_count}</b> шт.")
         
     if not status_lines:
         text = (
@@ -790,6 +797,132 @@ async def cb_admin_panel(callback: CallbackQuery, bot: Bot):
         await callback.answer("Открой личный чат с ботом, чтобы пользоваться админ-панелью.", show_alert=True)
         return
     await show_admin_panel(callback, callback.from_user, bot, is_callback=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "adm_test_mode")
+async def cb_admin_test_mode(callback: CallbackQuery):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Режим доступен только администратору в личном чате.", show_alert=True)
+        return
+    text = (
+        "🧪 <b>Тестовый просмотр групп</b>\n\n"
+        "Выбери группу, чтобы посмотреть её предметы, число опубликованных материалов и расписание. "
+        "Личные долги и прогресс студентов не отображаются и не изменяются."
+    )
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.admin_test_groups_kb(db.COLLEGE_GROUPS))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_test_preview_"))
+async def cb_admin_test_preview(callback: CallbackQuery):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Режим доступен только администратору в личном чате.", show_alert=True)
+        return
+    group_name = callback.data.removeprefix("adm_test_preview_")
+    if group_name not in db.COLLEGE_GROUPS:
+        await callback.answer("Неизвестная группа.", show_alert=True)
+        return
+    names, counts = await asyncio.gather(
+        adb.get_preview_subject_names_for_group(group_name),
+        adb.get_global_material_counts_by_subject(),
+    )
+    lines = [f"🧪 <b>Тестовый просмотр: {html.escape(group_name)}</b>", ""]
+    if not await adb.group_has_subjects_support(group_name):
+        lines.append("ℹ️ Для этой группы трекер предметов пока не настроен.")
+    if names:
+        lines.append("📚 <b>Предметы и опубликованные материалы:</b>")
+        lines.extend(
+            f"• {html.escape(name)} — {int(counts.get(name.strip().lower(), 0))} шт."
+            for name in names
+        )
+    else:
+        lines.append("📚 Для этой группы пока нет настроенных предметов.")
+    lines.append("\nЭто только просмотр: данные студентов не меняются.")
+    await callback.message.edit_text(
+        "\n".join(lines), parse_mode="HTML", reply_markup=kb.admin_test_preview_kb(group_name)
+    )
+    await callback.answer()
+
+
+async def _show_feedback_queue(callback: CallbackQuery, page: int = 0):
+    total = await adb.count_open_feedback_reports()
+    reports = await adb.get_open_feedback_reports(ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
+    if not reports:
+        text = "🐞 <b>Новых отчётов об ошибках нет.</b>"
+        markup = kb.admin_panel_kb(
+            await adb.count_pending_materials(), await adb.count_pending_users(), total
+        )
+    else:
+        text = f"🐞 <b>Отчёты об ошибках: {total}</b> · страница {page + 1}\n\nВыбери отчёт для просмотра."
+        markup = kb.admin_feedback_queue_kb(reports, page, total, ADMIN_PAGE_SIZE)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+@dp.callback_query(F.data == "adm_feedback_queue")
+@dp.callback_query(F.data.startswith("adm_feedback_queue_"))
+async def cb_admin_feedback_queue(callback: CallbackQuery):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Очередь доступна только администратору в личном чате.", show_alert=True)
+        return
+    page = int(callback.data.rsplit("_", 1)[1]) if callback.data != "adm_feedback_queue" else 0
+    await _show_feedback_queue(callback, page)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_feedback_copy_"))
+async def cb_admin_feedback_copy(callback: CallbackQuery, bot: Bot):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Доступ только администратору.", show_alert=True)
+        return
+    try:
+        report_id = int(callback.data.rsplit("_", 1)[1])
+        report = await adb.get_feedback_report(report_id)
+        if not report:
+            await callback.answer("Отчёт не найден.", show_alert=True)
+            return
+        await bot.copy_message(
+            chat_id=callback.from_user.id,
+            from_chat_id=report["source_chat_id"],
+            message_id=report["source_message_id"],
+        )
+        await callback.answer("Исходное сообщение отправлено ниже.")
+    except Exception:
+        logger.exception("Could not copy feedback report")
+        await callback.answer("Не удалось открыть исходное сообщение.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("adm_feedback_resolve_"))
+async def cb_admin_feedback_resolve(callback: CallbackQuery):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Доступ только администратору.", show_alert=True)
+        return
+    report_id = int(callback.data.rsplit("_", 1)[1])
+    await adb.resolve_feedback_report(report_id)
+    await _show_feedback_queue(callback)
+    await callback.answer("Отчёт закрыт.")
+
+
+@dp.callback_query(F.data.regexp(r"^adm_feedback_\d+$"))
+async def cb_admin_feedback_detail(callback: CallbackQuery):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Доступ только администратору.", show_alert=True)
+        return
+    report_id = int(callback.data.rsplit("_", 1)[1])
+    report = await adb.get_feedback_report(report_id)
+    if not report or report.get("resolved_at"):
+        await callback.answer("Открытый отчёт не найден.", show_alert=True)
+        return
+    body = html.escape((report.get("body_text") or "Вложение без текста")[:3000])
+    label = html.escape(report.get("user_label") or str(report["user_id"]))
+    group = html.escape(report.get("student_group") or "не выбрана")
+    text = (
+        f"🐞 <b>Отчёт об ошибке №{report_id}</b>\n\n"
+        f"👤 {label} · ID <code>{report['user_id']}</code>\n"
+        f"🎓 Группа: <b>{group}</b>\n"
+        f"🕒 {html.escape(str(report.get('created_at') or ''))}\n\n{body}"
+    )
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.admin_feedback_item_kb(report_id))
     await callback.answer()
 
 
@@ -883,7 +1016,9 @@ async def cb_admin_broadcast_send(callback: CallbackQuery, state: FSMContext, bo
     await callback.message.edit_text(
         report,
         parse_mode="HTML",
-        reply_markup=kb.admin_panel_kb(await adb.count_pending_materials(), await adb.count_pending_users()),
+        reply_markup=kb.admin_panel_kb(
+            await adb.count_pending_materials(), await adb.count_pending_users(), await adb.count_open_feedback_reports()
+        ),
     )
     await callback.answer()
 
@@ -901,7 +1036,9 @@ async def cb_admin_review_queue(callback: CallbackQuery, bot: Bot):
     materials = await adb.get_pending_materials(ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
     if not materials:
         text = "👑 <b>Панель администратора</b>\n\n📋 Очередь материалов пуста."
-        markup = kb.admin_panel_kb(await adb.count_pending_materials(), await adb.count_pending_users())
+        markup = kb.admin_panel_kb(
+            await adb.count_pending_materials(), await adb.count_pending_users(), await adb.count_open_feedback_reports()
+        )
     else:
         lines = [f"📋 <b>Материалы на проверке: {total}</b> · страница {page + 1}", ""]
         for index, material in enumerate(materials, page * ADMIN_PAGE_SIZE + 1):
@@ -1085,30 +1222,35 @@ async def process_feedback(message: Message, state: FSMContext, bot: Bot):
         await show_user_screen(message, "⚠️ Пришли текст ошибки или приложи скриншот.", reply_markup=kb.back_to_menu_kb())
         return
 
-    admin_id = await adb.get_admin_id() or ADMIN_ID
-    if not admin_id:
+    if not (await adb.get_admin_id() or ADMIN_ID):
         await state.clear()
         await show_user_screen(message, "⚠️ Не удалось отправить сообщение: администратор не настроен.", reply_markup=kb.back_to_menu_kb())
         return
 
     user = message.from_user
     user_label = f"@{user.username}" if user.username else (user.full_name or "Студент")
-    header = (
-        "🐞 <b>Сообщение об ошибке</b>\n"
-        f"👤 {html.escape(user_label)} · ID <code>{user.id}</code>"
-    )
+    user_record = await adb.get_user(user.id)
+    body_text = message.text or message.caption or ""
+    if not body_text:
+        body_text = "Пользователь приложил вложение. Нажми кнопку, чтобы открыть исходное сообщение."
     try:
-        await bot.send_message(chat_id=admin_id, text=header, parse_mode="HTML")
-        await message.copy_to(chat_id=admin_id)
+        await adb.save_feedback_report(
+            user_id=user.id,
+            user_label=user_label,
+            student_group=(user_record or {}).get("student_group"),
+            source_chat_id=message.chat.id,
+            source_message_id=message.message_id,
+            body_text=body_text,
+        )
     except Exception:
-        logger.exception("Could not forward feedback from user %s", user.id)
-        await show_user_screen(message, "⚠️ Не удалось отправить сообщение. Попробуй ещё раз чуть позже.", reply_markup=kb.back_to_menu_kb())
+        logger.exception("Could not save feedback from user %s", user.id)
+        await show_user_screen(message, "⚠️ Не удалось сохранить сообщение. Попробуй ещё раз чуть позже.", reply_markup=kb.back_to_menu_kb())
         return
 
     await state.clear()
     await show_user_screen(
         message,
-        "✅ Спасибо! Сообщение об ошибке отправлено администратору.",
+        "✅ Спасибо! Отчёт сохранён и появится у администратора в отдельном разделе.",
         reply_markup=kb.back_to_menu_kb(),
     )
 
@@ -2527,7 +2669,12 @@ async def cb_admin_sub_mats(callback: CallbackQuery):
     
     if not materials:
         text = f"В предмете <b>«{safe_name}»</b> сейчас нет опубликованных материалов."
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.admin_panel_kb())
+        await callback.message.edit_text(
+            text, parse_mode="HTML",
+            reply_markup=kb.admin_panel_kb(
+                await adb.count_pending_materials(), await adb.count_pending_users(), await adb.count_open_feedback_reports()
+            ),
+        )
         await callback.answer()
         return
         
