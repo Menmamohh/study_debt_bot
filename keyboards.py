@@ -116,7 +116,7 @@ def schedule_view_kb(
     kb = [
         [
             InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sched_view_{group_name}"),
-            InlineKeyboardButton(text="👥 Другая группа", callback_data="sched_choose_group")
+            
         ]
     ]
     if not is_user_own_group and user_own_group and user_own_group != group_name and user_own_group != "ALL":
