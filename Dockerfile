@@ -15,13 +15,9 @@ COPY bot.py database.py keyboards.py ./
 COPY helper_cat.png ./
 COPY assets ./assets
 
-RUN useradd --system --uid 10001 --create-home bot \
-    && mkdir -p /app/data /app/assets/schedule/downloads \
-    && chown -R bot:bot /app/data /app/assets/schedule
+RUN mkdir -p /app/data /app/assets/schedule/downloads
 
 ENV DB_PATH=/app/data/debts.db \
     PYTHONDONTWRITEBYTECODE=1
-USER bot
-
 # Запуск бота
 CMD ["python", "bot.py"]
