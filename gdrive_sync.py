@@ -5,11 +5,14 @@ import ssl
 import logging
 import datetime
 import functools
+import csv
+import io
 import subprocess
 from typing import List, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 import urllib.request
 import certifi
+from PIL import Image
 
 import database as db
 
@@ -366,41 +369,107 @@ def _ocr_schedule_image(path: str, modified_at: float) -> str:
 
 
 def _normalise_group_label(value: str) -> str:
-    return re.sub(r"[^A-ZА-Я0-9]", "", value.upper().replace("Ё", "Е"))
+    # Tesseract often reads Cyrillic group codes as visually identical Latin letters.
+    value = value.upper().replace("Ё", "Е").translate(str.maketrans({
+        "A": "А", "B": "В", "C": "С", "E": "Е", "H": "Н",
+        "K": "К", "M": "М", "O": "О", "P": "Р", "T": "Т",
+        "X": "Х", "Y": "У",
+    }))
+    return re.sub(r"[^A-ZА-Я0-9]", "", value)
 
 
-def _text_for_group(ocr_text: str, group_name: str) -> str:
-    """Selects a group section from a table OCR result, falling back to the whole sheet."""
-    if not ocr_text.strip() or group_name == "ALL":
-        return ocr_text.strip()
+@functools.lru_cache(maxsize=32)
+def _schedule_group_markers(path: str, modified_at: float) -> Tuple[int, int, Tuple[Tuple[str, int], ...]]:
+    """Finds group labels and their vertical positions so table pages can be cropped per group."""
+    try:
+        result = subprocess.run(
+            ["tesseract", path, "stdout", "-l", "rus+eng", "--psm", "11", "tsv"],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.warning("Could not locate group labels in %s: %s", path, result.stderr.strip())
+            return 0, 0, ()
 
-    groups = sorted(db.COLLEGE_GROUPS, key=len, reverse=True)
-    normalized_groups = {group: _normalise_group_label(group) for group in groups}
-    lines = ocr_text.splitlines()
-    markers = []
-    for index, line in enumerate(lines):
-        normalized_line = _normalise_group_label(line)
-        matched = next((group for group in groups if normalized_groups[group] in normalized_line), None)
-        if matched:
-            markers.append((index, matched))
+        line_words = {}
+        image_width = image_height = 0
+        for row in csv.DictReader(io.StringIO(result.stdout), delimiter="\t"):
+            if row.get("level") == "1":
+                image_width = int(row.get("width") or 0)
+                image_height = int(row.get("height") or 0)
+            if row.get("level") != "5" or not row.get("text", "").strip():
+                continue
+            key = (row.get("page_num"), row.get("block_num"), row.get("par_num"), row.get("line_num"))
+            line_words.setdefault(key, []).append(row)
 
-    if not markers:
-        # Some Drive scans are laid out in columns and OCR may lose the group labels.
-        # Keep the recognized text available instead of silently showing stale data.
-        return ocr_text.strip()
+        normalized_groups = {group: _normalise_group_label(group) for group in db.COLLEGE_GROUPS}
+        markers = []
+        for words in line_words.values():
+            line = " ".join(word["text"] for word in words)
+            normalized_line = _normalise_group_label(line)
+            group = next((name for name in sorted(db.COLLEGE_GROUPS, key=len, reverse=True)
+                          if normalized_groups[name] in normalized_line), None)
+            if group:
+                top = min(int(word["top"]) for word in words)
+                bottom = max(int(word["top"]) + int(word["height"]) for word in words)
+                markers.append((group, (top + bottom) // 2))
 
-    start = next((i for i, (line_index, group) in enumerate(markers) if group == group_name), None)
-    if start is None:
+        # Keep one label per group, in visual order.
+        unique_markers = []
+        seen = set()
+        for group, center_y in sorted(markers, key=lambda marker: marker[1]):
+            if group not in seen:
+                seen.add(group)
+                unique_markers.append((group, center_y))
+        return image_width, image_height, tuple(unique_markers)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        logger.warning("Could not locate schedule groups in %s: %s", path, error)
+        return 0, 0, ()
+
+
+@functools.lru_cache(maxsize=128)
+def _ocr_schedule_group(path: str, modified_at: float, group_name: str) -> str:
+    width, height, markers = _schedule_group_markers(path, modified_at)
+    if not width or not height or not markers:
         return ""
-    line_start = markers[start][0]
-    line_end = markers[start + 1][0] if start + 1 < len(markers) else len(lines)
-    return "\n".join(line.strip() for line in lines[line_start:line_end] if line.strip()).strip()
+    group_index = next((index for index, marker in enumerate(markers) if marker[0] == group_name), None)
+    if group_index is None:
+        return ""
+
+    center_y = markers[group_index][1]
+    top = 0 if group_index == 0 else (markers[group_index - 1][1] + center_y) // 2
+    bottom = height if group_index + 1 == len(markers) else (center_y + markers[group_index + 1][1]) // 2
+    try:
+        with Image.open(path) as image:
+            image = image.convert("RGB")
+            crop = image.crop((0, max(0, top), image.width, min(image.height, bottom)))
+            buffer = io.BytesIO()
+            crop.save(buffer, format="PNG")
+        result = subprocess.run(
+            ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", "6"],
+            input=buffer.getvalue(),
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        logger.warning("Could not OCR group %s in %s: %s", group_name, path, error)
+        return ""
+    if result.returncode != 0:
+        logger.warning("Tesseract failed for group %s in %s: %s", group_name, path, result.stderr.strip())
+        return ""
+    return result.stdout.strip()
 
 
 def get_active_schedule_text(group_name: str, target_date: Optional[datetime.date] = None) -> str:
-    """OCRs the active Drive replacement and consultation sheets for the text schedule view."""
+    """OCRs only the selected group's block from active Drive replacement/consultation sheets."""
     if target_date is None:
         target_date, _, _ = get_target_study_date()
+    if group_name == "ALL":
+        return ""
     target_date_str = target_date.isoformat()
     sections = []
 
@@ -411,10 +480,10 @@ def get_active_schedule_text(group_name: str, target_date: Optional[datetime.dat
             if not path or not os.path.isfile(path):
                 continue
             try:
-                ocr_text = _ocr_schedule_image(path, os.path.getmtime(path))
+                modified_at = os.path.getmtime(path)
+                selected_text = _ocr_schedule_group(path, modified_at, group_name)
             except OSError:
                 continue
-            selected_text = _text_for_group(ocr_text, group_name)
             if selected_text:
                 date_str = item.get("schedule_date") or target_date_str
                 try:
