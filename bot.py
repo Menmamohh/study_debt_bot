@@ -421,6 +421,7 @@ async def render_admin_verification_queue(bot: Bot, page: int = 0, recreate: boo
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Обновить очередь", callback_data="adm_users_queue")],
             [InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_panel")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
         ])
 
     saved_id = await adb.get_verification_ui_message_id(admin_id)
@@ -1920,7 +1921,8 @@ async def cb_admin_gdrive_sync(callback: CallbackQuery, bot: Bot):
     await callback.answer("⏳ Синхронизация с Google Диском...", show_alert=False)
     status_msg = await callback.message.answer(
         "🔄 <i>Подключаюсь к Google Диску колледжа и проверяю свежие замены...</i>", 
-        parse_mode="HTML"
+        parse_mode="HTML",
+        reply_markup=kb.back_to_menu_kb(),
     )
     # Treat the sync progress/report as the user's current screen too. Otherwise
     # it survives menu cleanup and remains as a permanent extra message below it.
@@ -1938,7 +1940,8 @@ async def cb_admin_gdrive_sync(callback: CallbackQuery, bot: Bot):
     if not res.get("ok"):
         await status_msg.edit_text(
             f"⚠️ <b>Ошибка при синхронизации с Google Диском:</b>\n{res.get('error')}",
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=kb.back_to_menu_kb(),
         )
         return
 
@@ -1960,7 +1963,7 @@ async def cb_admin_gdrive_sync(callback: CallbackQuery, bot: Bot):
         f"📋 <b>Актуальные документы:</b>\n" + ("\n".join(lines) if lines else "<i>(файлы не найдены)</i>") + "\n\n"
         f"💡 <i>Свежие листы замен теперь доступны всем студентам во вкладке «📅 Расписание»!</i>"
     )
-    await status_msg.edit_text(report, parse_mode="HTML")
+    await status_msg.edit_text(report, parse_mode="HTML", reply_markup=kb.back_to_menu_kb())
 
 
 # Совместимость со старыми кнопками

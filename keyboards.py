@@ -396,6 +396,7 @@ def admin_user_queue_page_kb(users: List[Dict], page: int, total: int, page_size
     if controls:
         rows.append(controls)
     rows.append([InlineKeyboardButton(text="🔙 В админ-панель", callback_data="admin_panel")])
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
