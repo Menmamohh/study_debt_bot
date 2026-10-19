@@ -394,7 +394,7 @@ async def show_user_screen(
     await cleanup_user_ui_messages(bot_inst, user_id, keep_message_id=sent.message_id)
 
 
-async def render_admin_verification_queue(bot: Bot, page: int = 0):
+async def render_admin_verification_queue(bot: Bot, page: int = 0, recreate: bool = False):
     """Creates or refreshes one dedicated admin message for verification requests."""
     admin_id = await adb.get_admin_id() or ADMIN_ID
     if not admin_id:
@@ -424,6 +424,15 @@ async def render_admin_verification_queue(bot: Bot, page: int = 0):
         ])
 
     saved_id = await adb.get_verification_ui_message_id(admin_id)
+    if saved_id and recreate:
+        # When the admin explicitly opens/refreshes the queue, move it to the
+        # bottom of the chat instead of editing an old message far above.
+        try:
+            await bot.delete_message(chat_id=admin_id, message_id=saved_id)
+        except Exception:
+            pass
+        await adb.clear_verification_ui_message_id(admin_id)
+        saved_id = None
     if saved_id:
         try:
             await bot.edit_message_text(
@@ -1301,8 +1310,8 @@ async def cb_admin_users_queue(callback: CallbackQuery, bot: Bot):
         return
         
     page = int(callback.data.rsplit("_", 1)[1]) if callback.data != "adm_users_queue" else 0
-    await render_admin_verification_queue(bot, page)
-    await callback.answer("Открыл отдельную очередь верификации.")
+    await callback.answer("Обновляю очередь внизу чата…")
+    await render_admin_verification_queue(bot, page, recreate=True)
 
 @dp.callback_query((F.data == "adm_users_list") | F.data.startswith("adm_users_list_"))
 async def cb_admin_users_list(callback: CallbackQuery):
