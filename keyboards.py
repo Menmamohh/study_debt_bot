@@ -47,9 +47,6 @@ def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verifie
             [
                 InlineKeyboardButton(text="📅 Расписание занятий", callback_data="schedule_menu")
             ],
-            [
-                InlineKeyboardButton(text="🔔 Расписание звонков", callback_data="sched_bells")
-            ],
             [InlineKeyboardButton(text="💡 Полезное", callback_data="useful_menu")]
         ])
 
