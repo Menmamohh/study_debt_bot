@@ -9,7 +9,7 @@ def subject_callback_token(subject_name: str) -> str:
 def _short_label(value: str, max_length: int = 48) -> str:
     return value if len(value) <= max_length else value[:max_length - 1] + "…"
 
-def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verified: bool = True, student_group: Optional[str] = None, is_private_chat: bool = True) -> InlineKeyboardMarkup:
+def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verified: bool = True, student_group: Optional[str] = None, is_private_chat: bool = True, verification_pending: bool = False) -> InlineKeyboardMarkup:
     kb = []
 
     # Личный трекер, профиль и админ-раздел доступны только в личном чате.
@@ -21,9 +21,10 @@ def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verifie
     
     # Кнопка верификации для тех, кто зашёл раньше или ещё не подтверждён
     if not is_verified and not is_admin_user:
-        kb.append([
-            InlineKeyboardButton(text="🔐 Выбрать группу для доступа", callback_data="start_verify_flow")
-        ])
+        if not verification_pending:
+            kb.append([
+                InlineKeyboardButton(text="🔐 Выбрать группу для доступа", callback_data="start_verify_flow")
+            ])
         kb.append([
             InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")
         ])
@@ -59,12 +60,6 @@ def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verifie
             ]
         ])
     
-    # Для верифицированных студентов
-    if is_verified and not is_admin_user and student_group:
-        kb.append([
-            InlineKeyboardButton(text=f"🎓 Группа: {student_group} (изменить/профиль)", callback_data="start_verify_flow")
-        ])
-        
     if is_admin_user and is_private_chat:
         badge = f" (⏳ {pending_count})" if pending_count > 0 else ""
         kb.append([

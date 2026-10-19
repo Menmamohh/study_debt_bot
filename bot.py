@@ -212,6 +212,8 @@ async def safe_edit_message(
     if getattr(msg, "photo", None) and hasattr(msg, "edit_caption"):
         try:
             await msg.edit_caption(caption=text, parse_mode=parse_mode, reply_markup=reply_markup)
+            if cb and getattr(msg.chat, "type", None) == "private":
+                await adb.set_ui_message_id(cb.from_user.id, msg.message_id)
             return
         except Exception:
             pass
@@ -220,6 +222,8 @@ async def safe_edit_message(
     if hasattr(msg, "edit_text"):
         try:
             await msg.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+            if cb and getattr(msg.chat, "type", None) == "private":
+                await adb.set_ui_message_id(cb.from_user.id, msg.message_id)
             return
         except Exception:
             pass
@@ -233,7 +237,8 @@ async def safe_edit_message(
 
     if bot_inst and hasattr(bot_inst, "send_message") and user_id:
         try:
-            await bot_inst.send_message(chat_id=user_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+            sent = await bot_inst.send_message(chat_id=user_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+            await adb.set_ui_message_id(user_id, sent.message_id)
             return
         except Exception as e:
             logger.warning(f"Could not send message in safe_edit_message for user {user_id}: {e}")
@@ -289,38 +294,8 @@ async def show_user_screen(
 
     bot_inst = target.bot
     saved_id = await adb.get_ui_message_id(user_id)
-    if saved_id:
-        try:
-            # A menu message may have started as a photo, so try its caption first.
-            await bot_inst.edit_message_caption(
-                chat_id=message.chat.id,
-                message_id=saved_id,
-                caption=text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
-            )
-            return
-        except Exception as error:
-            if "message is not modified" in str(error).lower():
-                return
-            try:
-                await bot_inst.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=saved_id,
-                    text=text,
-                    parse_mode=parse_mode,
-                    reply_markup=reply_markup,
-                )
-                return
-            except Exception as text_error:
-                if "message is not modified" in str(text_error).lower():
-                    return
-                try:
-                    await bot_inst.delete_message(chat_id=message.chat.id, message_id=saved_id)
-                except Exception:
-                    pass
-                await adb.clear_ui_message_id(user_id)
-
+    # A message or command from the user starts a fresh screen. Send it first,
+    # then remove the previous bot menu so it never remains above the new one.
     if photo:
         sent = await target.answer_photo(
             photo=photo,
@@ -331,6 +306,93 @@ async def show_user_screen(
     else:
         sent = await target.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
     await adb.set_ui_message_id(user_id, sent.message_id)
+    if saved_id and saved_id != sent.message_id:
+        try:
+            await bot_inst.delete_message(chat_id=message.chat.id, message_id=saved_id)
+        except Exception as error:
+            logger.debug("Could not remove previous UI message %s for user %s: %s", saved_id, user_id, error)
+
+
+async def render_admin_verification_queue(bot: Bot, page: int = 0):
+    """Creates or refreshes one dedicated admin message for verification requests."""
+    admin_id = await adb.get_admin_id() or ADMIN_ID
+    if not admin_id:
+        return
+
+    page = max(0, page)
+    total = await adb.count_pending_users()
+    pending_users = await adb.get_pending_users(ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
+    if not pending_users and page > 0:
+        page = max(0, (total - 1) // ADMIN_PAGE_SIZE)
+        pending_users = await adb.get_pending_users(ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
+
+    if pending_users:
+        lines = [f"👥 <b>Очередь верификации: {total}</b> · страница {page + 1}", ""]
+        for index, user in enumerate(pending_users, page * ADMIN_PAGE_SIZE + 1):
+            name = html.escape(user.get("student_name") or user.get("tg_name") or "Студент")
+            group = html.escape(user.get("student_group") or "")
+            username = html.escape(user.get("username") or f"ID_{user['user_id']}")
+            lines.append(f"{index}. <b>{name}</b> · {group} · {username}")
+        text = "\n".join(lines)
+        markup = kb.admin_user_queue_page_kb(pending_users, page, total, ADMIN_PAGE_SIZE)
+    else:
+        text = "👥 <b>Очередь верификации пуста.</b>\nНовые заявки появятся здесь."
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить очередь", callback_data="adm_users_queue")],
+            [InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_panel")],
+        ])
+
+    saved_id = await adb.get_verification_ui_message_id(admin_id)
+    if saved_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=admin_id,
+                message_id=saved_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+            return
+        except Exception as error:
+            if "message is not modified" in str(error).lower():
+                return
+            await adb.clear_verification_ui_message_id(admin_id)
+
+    try:
+        sent = await bot.send_message(admin_id, text, parse_mode="HTML", reply_markup=markup)
+        await adb.set_verification_ui_message_id(admin_id, sent.message_id)
+    except Exception:
+        logger.exception("Could not show verification queue to admin %s", admin_id)
+
+async def cleanup_legacy_user_menus(bot: Bot):
+    """Deletes last tracked legacy menu per user without touching verification data."""
+    if not await adb.claim_initial_ui_cleanup():
+        return
+
+    messages = await adb.get_all_ui_messages()
+    deleted = 0
+    failed = 0
+    for entry in messages:
+        user_id = entry["user_id"]
+        message_id = entry["message_id"]
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=message_id)
+            await adb.clear_ui_message_id(user_id)
+            deleted += 1
+        except TelegramRetryAfter as error:
+            await asyncio.sleep(error.retry_after)
+            try:
+                await bot.delete_message(chat_id=user_id, message_id=message_id)
+                await adb.clear_ui_message_id(user_id)
+                deleted += 1
+            except Exception:
+                failed += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    logger.info("Legacy menu cleanup finished: deleted=%s, unavailable=%s", deleted, failed)
+
 
 async def prompt_verification_required(target, user, err_reason: str = ""):
     """Отправляет экран с кнопкой выбора группы тем, кто ещё не подтверждён"""
@@ -344,7 +406,6 @@ async def prompt_verification_required(target, user, err_reason: str = ""):
             f"Как только доступ одобрят, ты получишь сообщение и сможешь пользоваться ботом!"
         )
         markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Сменить группу", callback_data="start_verify_flow")],
             [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
         ])
@@ -742,8 +803,8 @@ async def cmd_start(message: Message, state: FSMContext):
                 f"Как только доступ подтвердят — тебе сразу прилетит оповещение!» 🔔"
             )
             pending_kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Сменить группу", callback_data="start_verify_flow")],
                 [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
             ])
             await show_user_screen(
                 message,
@@ -765,6 +826,7 @@ async def cmd_start(message: Message, state: FSMContext):
     is_adm = is_admin(message.from_user)
     user_record = await adb.get_user(user_id)
     is_verified = is_adm or bool(user_record and user_record.get("status") == "approved")
+    verification_pending = bool(user_record and user_record.get("status") == "pending")
     student_group = user_record.get("student_group") if user_record else None
     pending_count = (await adb.count_pending_materials() + await adb.count_pending_users()) if is_adm else 0
     has_study = await user_has_study_features(message.from_user, user_record)
@@ -816,6 +878,10 @@ async def cmd_verify(message: Message, state: FSMContext):
     await state.clear()
     if message.chat.type != "private":
         await message.answer("Для регистрации открой личный чат с ботом и отправь /verify.")
+        return
+    existing = await adb.get_user(message.from_user.id)
+    if existing and existing.get("status") in {"approved", "pending"}:
+        await cmd_start(message, state)
         return
     text = (
         "🎓 <b>Верификация в «Помощнике Пятнашки»:</b>\n\n"
@@ -888,6 +954,7 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
     is_adm = is_admin(callback.from_user)
     user_record = await adb.get_user(user_id)
     is_verified = is_adm or bool(user_record and user_record.get("status") == "approved")
+    verification_pending = bool(user_record and user_record.get("status") == "pending")
     student_group = user_record.get("student_group") if user_record else None
     pending_count = (await adb.count_pending_materials() + await adb.count_pending_users()) if is_adm else 0
     
@@ -896,7 +963,8 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
         pending_count=pending_count,
         is_verified=is_verified,
         student_group=student_group,
-        is_private_chat=callback.message.chat.type == "private"
+        is_private_chat=callback.message.chat.type == "private",
+        verification_pending=verification_pending,
     )
     
     group_str = f" [<code>{student_group}</code>]" if student_group else ""
@@ -923,40 +991,21 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
                 f"Выбери нужный раздел:"
             )
     else:
-        text = (
-            f"☝️🤓 <b>ПОМОЩНИК ПЯТНАШКИ</b> 🎓\n\n"
-            f"⚠️ <b>Твой аккаунт ещё не подтверждён!</b>\n\n"
-            f"Нажми кнопку <b>«🔐 Выбрать группу для доступа»</b> ниже, "
-            f"чтобы получить доступ к расписанию и учебным материалам 👇"
-        )
-        
-    photo_file = MAIN_IMAGE_PATH if os.path.exists(MAIN_IMAGE_PATH) else SHARK_IMAGE_PATH
-    
-    if callback.message.photo:
-        try:
-            await callback.message.edit_caption(caption=text, parse_mode="HTML", reply_markup=markup)
-            await callback.answer()
-            return
-        except Exception:
-            pass
-    else:
-        try:
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
-            await callback.answer()
-            return
-        except Exception:
-            pass
+        if verification_pending:
+            text = (
+                "⏳ <b>Твоя заявка на проверке</b>\n\n"
+                f"🎓 Группа: <code>{html.escape(student_group or '')}</code>\n\n"
+                "Дождись решения администратора. Повторно проходить верификацию не нужно."
+            )
+        else:
+            text = (
+                f"☝️🤓 <b>ПОМОЩНИК ПЯТНАШКИ</b> 🎓\n\n"
+                f"⚠️ <b>Твой аккаунт ещё не подтверждён!</b>\n\n"
+                f"Нажми кнопку <b>«🔐 Выбрать группу для доступа»</b> ниже, "
+                f"чтобы получить доступ к расписанию и учебным материалам 👇"
+            )
 
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-        
-    if os.path.exists(photo_file):
-        await callback.bot.send_photo(chat_id=user_id, photo=FSInputFile(photo_file), caption=text, parse_mode="HTML", reply_markup=markup)
-    else:
-        await callback.bot.send_message(chat_id=user_id, text=text, parse_mode="HTML", reply_markup=markup)
-    await callback.answer()
+    await show_user_screen(callback, text, reply_markup=markup)
 
 # =========================================================================
 # --- ВЕРИФИКАЦИЯ СТУДЕНТОВ (ОБЯЗАТЕЛЬНЫЙ ВХОД) ---
@@ -964,6 +1013,22 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "start_verify_flow")
 async def cb_start_verify_flow(callback: CallbackQuery, state: FSMContext):
+    existing = await adb.get_user(callback.from_user.id)
+    if existing and existing.get("status") == "approved":
+        await callback.answer("Верификация уже пройдена. Выбирай группу в разделе расписания.", show_alert=True)
+        return
+    if existing and existing.get("status") == "pending":
+        text = (
+            "⏳ <b>Заявка уже на проверке</b>\n\n"
+            f"🎓 Группа: <code>{html.escape(existing.get('student_group') or '')}</code>\n\n"
+            "Дождись решения администратора. Повторная заявка не нужна."
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+        ])
+        await show_user_screen(callback, text, reply_markup=markup)
+        return
     await state.clear()
     text = (
         "🎓 <b>Выбери свою учебную группу:</b>\n\n"
@@ -973,6 +1038,13 @@ async def cb_start_verify_flow(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("grp_"))
 async def cb_select_group(callback: CallbackQuery, state: FSMContext):
+    existing = await adb.get_user(callback.from_user.id)
+    if existing and existing.get("status") == "approved":
+        await callback.answer("Верификация уже пройдена. Выбирай группу в разделе расписания.", show_alert=True)
+        return
+    if existing and existing.get("status") == "pending":
+        await callback.answer("Заявка уже на проверке. Повторно выбирать группу не нужно.", show_alert=True)
+        return
     data = callback.data[len("grp_"):]
     if data == "custom":
         await state.set_state(Form.waiting_for_custom_group)
@@ -997,13 +1069,16 @@ async def cb_select_group(callback: CallbackQuery, state: FSMContext):
     student_group = data
     
     # Сохраняем заявку на верификацию без запроса личных имён
-    await adb.add_user_request(
+    request_created = await adb.add_user_request(
         user_id=user_id,
         username=tg_uname,
         tg_name=tg_name,
         student_name=tg_name,
         student_group=student_group
     )
+    if not request_created:
+        await callback.answer("Заявка уже создана или доступ уже подтверждён.", show_alert=True)
+        return
     await state.clear()
     
     user_confirm_text = (
@@ -1013,29 +1088,12 @@ async def cb_select_group(callback: CallbackQuery, state: FSMContext):
         f"Как только доступ подтвердят, ты сразу получишь оповещение в этом чате! 🔔"
     )
     confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Сменить группу", callback_data="start_verify_flow")]
+        [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
     await safe_edit_message(callback, user_confirm_text, reply_markup=confirm_kb)
     
-    # Уведомляем администратора (только админ видит профиль и ID)
-    admin_id = await adb.get_admin_id()
-    if admin_id:
-        uname_str = f"@{tg_uname}" if tg_uname else "без username"
-        adm_alert = (
-            f"🔔 <b>НОВАЯ ЗАЯВКА НА ВЕРИФИКАЦИЮ:</b>\n\n"
-            f"🎓 <b>Группа:</b> {html.escape(student_group)}\n"
-            f"👤 <b>Пользователь:</b> {html.escape(tg_name)}\n"
-            f"📱 <b>Профиль:</b> {uname_str} (ID: <code>{user_id}</code>)\n"
-        )
-        try:
-            await callback.bot.send_message(
-                chat_id=admin_id,
-                text=adm_alert,
-                parse_mode="HTML",
-                reply_markup=kb.admin_user_verify_kb(user_id)
-            )
-        except Exception as e:
-            logger.warning(f"Could not alert admin about user verification: {e}")
+    await render_admin_verification_queue(callback.bot)
 
 @dp.message(Form.waiting_for_custom_group)
 async def process_custom_group(message: Message, state: FSMContext):
@@ -1057,13 +1115,17 @@ async def process_custom_group(message: Message, state: FSMContext):
     tg_name = message.from_user.full_name or "Студент"
     student_group = grp
     
-    await adb.add_user_request(
+    request_created = await adb.add_user_request(
         user_id=user_id,
         username=tg_uname,
         tg_name=tg_name,
         student_name=tg_name,
         student_group=student_group
     )
+    if not request_created:
+        await state.clear()
+        await cmd_start(message, state)
+        return
     await state.clear()
     
     user_confirm_text = (
@@ -1073,28 +1135,10 @@ async def process_custom_group(message: Message, state: FSMContext):
         f"Как только доступ подтвердят, ты сразу получишь оповещение в этом чате! 🔔"
     )
     await show_user_screen(message, user_confirm_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Сменить группу", callback_data="start_verify_flow")],
+        [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ]))
-    
-    admin_id = await adb.get_admin_id()
-    if admin_id:
-        uname_str = f"@{tg_uname}" if tg_uname else "без username"
-        adm_alert = (
-            f"🔔 <b>НОВАЯ ЗАЯВКА НА ВЕРИФИКАЦИЮ:</b>\n\n"
-            f"🎓 <b>Группа:</b> {html.escape(student_group)}\n"
-            f"👤 <b>Пользователь:</b> {html.escape(tg_name)}\n"
-            f"📱 <b>Профиль:</b> {uname_str} (ID: <code>{user_id}</code>)\n"
-        )
-        try:
-            await message.bot.send_message(
-                chat_id=admin_id,
-                text=adm_alert,
-                parse_mode="HTML",
-                reply_markup=kb.admin_user_verify_kb(user_id)
-            )
-        except Exception as e:
-            logger.warning(f"Could not alert admin about user verification: {e}")
+    await render_admin_verification_queue(message.bot)
 
 @dp.message(Form.waiting_for_student_name)
 async def process_student_name_legacy(message: Message, state: FSMContext):
@@ -1114,17 +1158,10 @@ async def cb_admin_approve_user(callback: CallbackQuery, bot: Bot):
         return
         
     await adb.set_user_status(target_id, "approved")
+    await render_admin_verification_queue(bot)
     s_grp = html.escape(user_record.get("student_group") or "")
     u_display = html.escape(user_record.get("student_name") or user_record.get("tg_name") or "Пользователь")
     
-    try:
-        await callback.message.edit_text(
-            f"✅ <b>Доступ одобрен:</b> {u_display} ({s_grp})\n"
-            f"Пользователь добавлен в список верифицированных и получил уведомление.",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
     await callback.answer("Одобрено!")
     
     try:
@@ -1158,15 +1195,9 @@ async def cb_admin_reject_user(callback: CallbackQuery, bot: Bot):
         await callback.answer("Пользователь уже не найден.", show_alert=True)
         return
     await adb.set_user_status(target_id, "rejected")
+    await render_admin_verification_queue(bot)
     
     u_display = html.escape(user_record.get("student_name") or user_record.get("tg_name") or "Пользователь") if user_record else "Пользователь"
-    try:
-        await callback.message.edit_text(
-            f"❌ <b>Доступ отклонен для:</b> {u_display}.",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
     await callback.answer("Отклонено!")
     
     try:
@@ -1185,29 +1216,8 @@ async def cb_admin_users_queue(callback: CallbackQuery, bot: Bot):
         return
         
     page = int(callback.data.rsplit("_", 1)[1]) if callback.data != "adm_users_queue" else 0
-    total = await adb.count_pending_users()
-    pending_users = await adb.get_pending_users(ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
-    if not pending_users:
-        await callback.message.edit_text(
-            "👥 <b>Очередь верификации пуста!</b>\nВсе заявки студентов проверены.",
-            parse_mode="HTML",
-            reply_markup=kb.admin_panel_kb(await adb.count_pending_materials(), 0)
-        )
-        await callback.answer()
-        return
-        
-    lines = [f"👥 <b>Студенты на проверке: {total}</b> · страница {page + 1}", ""]
-    for index, u in enumerate(pending_users, page * ADMIN_PAGE_SIZE + 1):
-        s_name = html.escape(u.get("student_name") or "")
-        s_grp = html.escape(u.get("student_group") or "")
-        uname = html.escape(u.get("username") or f"ID_{u['user_id']}")
-        lines.append(f"{index}. <b>{s_name}</b> · {s_grp} · {uname} · <code>{u['user_id']}</code>")
-    await callback.message.edit_text(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=kb.admin_user_queue_page_kb(pending_users, page, total, ADMIN_PAGE_SIZE),
-    )
-    await callback.answer()
+    await render_admin_verification_queue(bot, page)
+    await callback.answer("Открыл отдельную очередь верификации.")
 
 @dp.callback_query((F.data == "adm_users_list") | F.data.startswith("adm_users_list_"))
 async def cb_admin_users_list(callback: CallbackQuery):
@@ -3153,6 +3163,7 @@ async def main():
         
     bot = Bot(token=token)
     try:
+        await cleanup_legacy_user_menus(bot)
         from aiogram.types import BotCommand
         await bot.set_my_commands([
             BotCommand(command="start", description="🚀 Начать / Главное меню"),

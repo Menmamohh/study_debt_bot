@@ -102,6 +102,13 @@ def init_db():
             )
         """)
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS verification_ui_messages (
+                user_id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS gdrive_schedule_files (
                 file_id TEXT PRIMARY KEY,
                 filename TEXT NOT NULL,
@@ -146,6 +153,44 @@ def clear_ui_message_id(user_id: int):
     """Forgets a deleted or otherwise unavailable menu message."""
     with get_connection() as conn:
         conn.execute("DELETE FROM ui_messages WHERE user_id = ?", (user_id,))
+
+def get_all_ui_messages() -> List[Dict[str, int]]:
+    """Returns the last tracked bot menu for each user for a one-time cleanup."""
+    with get_connection() as conn:
+        rows = conn.execute("SELECT user_id, message_id FROM ui_messages ORDER BY user_id").fetchall()
+        return [{"user_id": int(row["user_id"]), "message_id": int(row["message_id"])} for row in rows]
+
+def claim_initial_ui_cleanup() -> bool:
+    """Ensures the legacy-menu cleanup runs only once for this database."""
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('initial_ui_cleanup_done', '1')"
+        )
+        return cursor.rowcount == 1
+
+def get_verification_ui_message_id(user_id: int) -> Optional[int]:
+    """Returns the ID of the dedicated admin verification queue message."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT message_id FROM verification_ui_messages WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return int(row["message_id"]) if row else None
+
+def set_verification_ui_message_id(user_id: int, message_id: int):
+    """Stores the ID of the dedicated admin verification queue message."""
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO verification_ui_messages (user_id, message_id, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                message_id = excluded.message_id,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, message_id))
+
+def clear_verification_ui_message_id(user_id: int):
+    """Forgets a deleted or unavailable admin verification queue message."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM verification_ui_messages WHERE user_id = ?", (user_id,))
 
 DEFAULT_SUBJECTS_BY_GROUP = {
     "ТТ-36": [
@@ -1208,15 +1253,24 @@ def is_user_verified(user_id: int) -> bool:
     return user is not None and user.get("status") == "approved"
 
 def add_user_request(user_id: int, username: Optional[str], tg_name: str, student_name: str, student_group: str):
-    """Добавляет заявку студента на верификацию"""
+    """Creates a verification request once, or lets a rejected user reapply."""
     clean_uname = f"@{username.lstrip('@')}" if username else None
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO users (user_id, username, tg_name, student_name, student_group, status, created_at)
+            INSERT INTO users (user_id, username, tg_name, student_name, student_group, status, created_at)
             VALUES (?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                tg_name = excluded.tg_name,
+                student_name = excluded.student_name,
+                student_group = excluded.student_group,
+                status = 'pending',
+                created_at = CURRENT_TIMESTAMP
+            WHERE users.status = 'rejected'
         """, (user_id, clean_uname, tg_name, student_name, student_group))
         conn.commit()
+        return cursor.rowcount == 1
 
 def set_user_status(user_id: int, status: str):
     """Меняет статус пользователя ('approved', 'rejected')"""
