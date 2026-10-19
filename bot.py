@@ -509,6 +509,10 @@ async def get_user_primary_group(user_id: int) -> Optional[str]:
     user_rec = await adb.get_user(user_id)
     if user_rec and user_rec.get("student_group"):
         return user_rec["student_group"]
+    # Preserve the administrator's established default schedule even if an older
+    # database snapshot has an approved admin row with an empty group field.
+    if ADMIN_ID and user_id == ADMIN_ID:
+        return "ТТ-36"
     return None
 
 async def user_has_study_features(user, user_record: Optional[Dict] = None) -> bool:
@@ -1545,10 +1549,10 @@ async def cb_schedule_view(callback: CallbackQuery, state: FSMContext):
     if not access_ok:
         await prompt_verification_required(callback, callback.from_user, err_msg)
         return
-        
+    # OCR can take longer than Telegram's callback-query deadline.
+    await callback.answer()
     group_name = callback.data.replace("sched_view_", "")
     await render_group_schedule_view(callback, callback.from_user, group_name, is_callback=True)
-    await callback.answer()
 
 @dp.callback_query(F.data == "sched_choose_group")
 async def cb_schedule_choose_group(callback: CallbackQuery, state: FSMContext):
