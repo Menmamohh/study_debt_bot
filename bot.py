@@ -190,7 +190,15 @@ def get_general_schedule_photo(gen_sched: Optional[Dict], target_date: Optional[
     if len(available_drive_paths) >= 2:
         return available_drive_paths
     if available_drive_paths:
-        return available_drive_paths[0]
+        path = available_drive_paths[0]
+        drive_file = db.get_gdrive_file_by_local_path(path)
+        if drive_file:
+            cached_file_id = db.get_cached_telegram_schedule_file(
+                drive_file["file_id"], drive_file.get("drive_timestamp") or 0
+            )
+            if cached_file_id:
+                return cached_file_id
+        return path
     if gen_sched and gen_sched.get("photo_file_id"):
         return gen_sched["photo_file_id"]
     fallback_paths = [
@@ -231,14 +239,36 @@ def build_general_schedule_media(photo_paths: List[str], target_date: Optional[d
     """Готовит исходные фото общего листа для отправки альбомом."""
     photos_pool = get_current_general_schedule_photos(target_date=target_date)
     captions_by_path = {path: caption for path, caption, _ in photos_pool}
-    return [
-        InputMediaPhoto(
-            media=FSInputFile(path),
+    media = []
+    for path in photo_paths:
+        drive_file = db.get_gdrive_file_by_local_path(path)
+        telegram_file_id = (
+            db.get_cached_telegram_schedule_file(
+                drive_file["file_id"], drive_file.get("drive_timestamp") or 0
+            )
+            if drive_file else None
+        )
+        media.append(InputMediaPhoto(
+            media=telegram_file_id or FSInputFile(path),
             caption=captions_by_path.get(path),
             parse_mode="HTML",
+        ))
+    return media
+
+
+async def cache_general_schedule_media(photo_paths: List[str], sent_messages):
+    """Stores Telegram file IDs so shared Drive images are uploaded only once."""
+    for path, sent in zip(photo_paths, sent_messages):
+        if not getattr(sent, "photo", None):
+            continue
+        drive_file = await adb.get_gdrive_file_by_local_path(path)
+        if not drive_file:
+            continue
+        await adb.save_cached_telegram_schedule_file(
+            drive_file["file_id"],
+            sent.photo[-1].file_id,
+            drive_file.get("drive_timestamp") or 0,
         )
-        for path in photo_paths
-    ]
 
 
 # Состояния FSM
@@ -1525,6 +1555,7 @@ async def render_group_schedule_view(
             chat_id=user_id,
             media=build_general_schedule_media(photo_id, target_date=target_date),
         )
+        await cache_general_schedule_media(photo_id, photo_messages)
         screen_message = await actual_bot.send_message(
             chat_id=user_id,
             text=text,
@@ -1539,10 +1570,13 @@ async def render_group_schedule_view(
             except Exception:
                 pass
         if len(text) <= 900:
+            photo_source = FSInputFile(photo_id) if os.path.isfile(photo_id) else photo_id
             if is_callback:
-                screen_message = await actual_bot.send_photo(chat_id=user_id, photo=photo_id, caption=text, parse_mode="HTML", reply_markup=markup)
+                screen_message = await actual_bot.send_photo(chat_id=user_id, photo=photo_source, caption=text, parse_mode="HTML", reply_markup=markup)
             else:
-                screen_message = await target.answer_photo(photo=photo_id, caption=text, parse_mode="HTML", reply_markup=markup)
+                screen_message = await target.answer_photo(photo=photo_source, caption=text, parse_mode="HTML", reply_markup=markup)
+            if os.path.isfile(photo_id):
+                await cache_general_schedule_media([photo_id], [screen_message])
         else:
             screen_message = await actual_bot.send_message(
                 chat_id=target_chat.id, text=text, parse_mode="HTML", reply_markup=markup

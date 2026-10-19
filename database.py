@@ -133,6 +133,14 @@ def init_db():
                 downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS gdrive_telegram_file_cache (
+                drive_file_id TEXT PRIMARY KEY,
+                telegram_file_id TEXT NOT NULL,
+                drive_timestamp INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         cursor.executescript("""
             CREATE INDEX IF NOT EXISTS idx_subjects_user ON subjects(user_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_user_subject ON tasks(user_id, subject_id);
@@ -1420,6 +1428,36 @@ def get_gdrive_file(file_id: str) -> Optional[Dict]:
         cursor.execute("SELECT * FROM gdrive_schedule_files WHERE file_id = ?", (file_id,))
         row = cursor.fetchone()
         return dict(row) if row else None
+
+def get_gdrive_file_by_local_path(local_path: str) -> Optional[Dict]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM gdrive_schedule_files WHERE local_path = ? LIMIT 1", (local_path,)
+        ).fetchone()
+        return dict(row) if row else None
+
+def get_cached_telegram_schedule_file(drive_file_id: str, drive_timestamp: int) -> Optional[str]:
+    with get_connection() as conn:
+        row = conn.execute(
+            """SELECT telegram_file_id FROM gdrive_telegram_file_cache
+               WHERE drive_file_id = ? AND drive_timestamp = ?""",
+            (drive_file_id, int(drive_timestamp or 0)),
+        ).fetchone()
+        return row["telegram_file_id"] if row else None
+
+def save_cached_telegram_schedule_file(drive_file_id: str, telegram_file_id: str, drive_timestamp: int):
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO gdrive_telegram_file_cache
+               (drive_file_id, telegram_file_id, drive_timestamp, updated_at)
+               VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(drive_file_id) DO UPDATE SET
+                   telegram_file_id = excluded.telegram_file_id,
+                   drive_timestamp = excluded.drive_timestamp,
+                   updated_at = CURRENT_TIMESTAMP""",
+            (drive_file_id, telegram_file_id, int(drive_timestamp or 0)),
+        )
+        conn.commit()
 
 def get_all_gdrive_files() -> List[Dict]:
     """Возвращает все сохранённые файлы из Google Диска"""
