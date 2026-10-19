@@ -451,7 +451,6 @@ def _ocr_schedule_group(path: str, modified_at: float, group_name: str) -> str:
             ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", "6"],
             input=buffer.getvalue(),
             capture_output=True,
-            text=True,
             timeout=45,
             check=False,
         )
