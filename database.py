@@ -158,6 +158,19 @@ def init_db():
                 FOREIGN KEY (announcement_id) REFERENCES announcements(id) ON DELETE CASCADE
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS feedback_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                user_label TEXT,
+                student_group TEXT,
+                source_chat_id INTEGER NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                body_text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                resolved_at TIMESTAMP
+            )
+        """)
         cursor.executescript("""
             CREATE INDEX IF NOT EXISTS idx_subjects_user ON subjects(user_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_user_subject ON tasks(user_id, subject_id);
@@ -935,6 +948,60 @@ def set_admin_id(admin_id: int):
         cursor = conn.cursor()
         cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_id', ?)", (str(admin_id),))
         conn.commit()
+
+def save_feedback_report(user_id: int, user_label: str, student_group: Optional[str],
+                         source_chat_id: int, source_message_id: int, body_text: str) -> int:
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "INSERT INTO feedback_reports (user_id, user_label, student_group, source_chat_id, source_message_id, body_text) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, user_label, student_group, source_chat_id, source_message_id, body_text),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+def count_open_feedback_reports() -> int:
+    with get_connection() as conn:
+        row = conn.execute("SELECT COUNT(*) AS count FROM feedback_reports WHERE resolved_at IS NULL").fetchone()
+        return int(row["count"] if row else 0)
+
+def get_open_feedback_reports(limit: int = 10, offset: int = 0) -> List[Dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM feedback_reports WHERE resolved_at IS NULL ORDER BY id DESC LIMIT ? OFFSET ?",
+            (max(1, int(limit)), max(0, int(offset))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+def get_feedback_report(report_id: int) -> Optional[Dict]:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM feedback_reports WHERE id = ?", (report_id,)).fetchone()
+        return dict(row) if row else None
+
+def resolve_feedback_report(report_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE feedback_reports SET resolved_at = CURRENT_TIMESTAMP WHERE id = ? AND resolved_at IS NULL",
+            (report_id,),
+        )
+        conn.commit()
+
+def get_preview_subject_names_for_group(group_name: str) -> List[str]:
+    """Returns group subject names without exposing students' personal task records."""
+    names = get_default_subjects_for_group(group_name)
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT s.name FROM subjects s JOIN users u ON u.user_id = s.user_id "
+            "WHERE u.status = 'approved' AND u.student_group = ? ORDER BY s.name COLLATE NOCASE",
+            (group_name,),
+        ).fetchall()
+    seen = {name.strip().lower() for name in names}
+    for row in rows:
+        name = (row["name"] or "").strip()
+        if name and name.lower() not in seen:
+            names.append(name)
+            seen.add(name.lower())
+    return names
 
 def publish_announcement(source_chat_id: int, source_message_id: int) -> int:
     """Persists an admin broadcast as the current in-menu notification."""
