@@ -398,7 +398,7 @@ def _schedule_group_markers(path: str, modified_at: float) -> Tuple[int, int, Tu
         group_positions = {}
         normalized_groups = {group: _normalise_group_label(group) for group in db.COLLEGE_GROUPS}
         result = subprocess.run(
-            ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", "11", "tsv"],
+            ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", "6", "tsv"],
             input=image_buffer.getvalue(),
             capture_output=True,
             timeout=8,
