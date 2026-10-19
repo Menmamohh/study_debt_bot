@@ -1515,8 +1515,8 @@ async def cb_schedule_menu(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
         
-    await render_group_schedule_view(callback, callback.from_user, group_name, is_callback=True)
     await callback.answer()
+    await render_group_schedule_view(callback, callback.from_user, group_name, is_callback=True)
 
 @dp.message(Command("schedule"))
 async def cmd_schedule(message: Message, state: FSMContext):
