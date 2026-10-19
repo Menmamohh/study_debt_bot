@@ -810,7 +810,7 @@ async def cb_admin_test_mode(callback: CallbackQuery):
         "Выбери группу, чтобы посмотреть её предметы, число опубликованных материалов и расписание. "
         "Личные долги и прогресс студентов не отображаются и не изменяются."
     )
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.admin_test_groups_kb(db.COLLEGE_GROUPS))
+    await show_user_screen(callback, text, reply_markup=kb.admin_test_groups_kb(db.COLLEGE_GROUPS))
     await callback.answer()
 
 
@@ -839,8 +839,8 @@ async def cb_admin_test_preview(callback: CallbackQuery):
     else:
         lines.append("📚 Для этой группы пока нет настроенных предметов.")
     lines.append("\nЭто только просмотр: данные студентов не меняются.")
-    await callback.message.edit_text(
-        "\n".join(lines), parse_mode="HTML", reply_markup=kb.admin_test_preview_kb(group_name)
+    await show_user_screen(
+        callback, "\n".join(lines), reply_markup=kb.admin_test_preview_kb(group_name)
     )
     await callback.answer()
 
@@ -856,7 +856,7 @@ async def _show_feedback_queue(callback: CallbackQuery, page: int = 0):
     else:
         text = f"🐞 <b>Отчёты об ошибках: {total}</b> · страница {page + 1}\n\nВыбери отчёт для просмотра."
         markup = kb.admin_feedback_queue_kb(reports, page, total, ADMIN_PAGE_SIZE)
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    await show_user_screen(callback, text, reply_markup=markup)
 
 
 @dp.callback_query(F.data == "adm_feedback_queue")
@@ -922,7 +922,7 @@ async def cb_admin_feedback_detail(callback: CallbackQuery):
         f"🎓 Группа: <b>{group}</b>\n"
         f"🕒 {html.escape(str(report.get('created_at') or ''))}\n\n{body}"
     )
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.admin_feedback_item_kb(report_id))
+    await show_user_screen(callback, text, reply_markup=kb.admin_feedback_item_kb(report_id))
     await callback.answer()
 
 
