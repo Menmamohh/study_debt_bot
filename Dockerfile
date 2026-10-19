@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Только файлы, необходимые в рантайме.
 COPY bot.py database.py keyboards.py ./
-COPY helper_cat.png meme_shark.jpg ./
+COPY helper_cat.png ./
 COPY assets ./assets
 
 RUN useradd --system --uid 10001 --create-home bot \
