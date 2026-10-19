@@ -4,6 +4,8 @@ import json
 import ssl
 import logging
 import datetime
+import functools
+import subprocess
 from typing import List, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 import urllib.request
@@ -341,4 +343,86 @@ def get_active_gdrive_schedule_photos(target_date: Optional[datetime.date] = Non
         result.append((path, caption, valid_until))
 
     return result
+
+
+@functools.lru_cache(maxsize=64)
+def _ocr_schedule_image(path: str, modified_at: float) -> str:
+    """Reads the text from a synced schedule image; mtime invalidates the cache after updates."""
+    try:
+        result = subprocess.run(
+            ["tesseract", path, "stdout", "-l", "rus+eng", "--psm", "6"],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        logger.warning("Could not OCR schedule image %s: %s", path, error)
+        return ""
+    if result.returncode != 0:
+        logger.warning("Tesseract failed for %s: %s", path, result.stderr.strip())
+        return ""
+    return result.stdout.strip()
+
+
+def _normalise_group_label(value: str) -> str:
+    return re.sub(r"[^A-ZА-Я0-9]", "", value.upper().replace("Ё", "Е"))
+
+
+def _text_for_group(ocr_text: str, group_name: str) -> str:
+    """Selects a group section from a table OCR result, falling back to the whole sheet."""
+    if not ocr_text.strip() or group_name == "ALL":
+        return ocr_text.strip()
+
+    groups = sorted(db.COLLEGE_GROUPS, key=len, reverse=True)
+    normalized_groups = {group: _normalise_group_label(group) for group in groups}
+    lines = ocr_text.splitlines()
+    markers = []
+    for index, line in enumerate(lines):
+        normalized_line = _normalise_group_label(line)
+        matched = next((group for group in groups if normalized_groups[group] in normalized_line), None)
+        if matched:
+            markers.append((index, matched))
+
+    if not markers:
+        # Some Drive scans are laid out in columns and OCR may lose the group labels.
+        # Keep the recognized text available instead of silently showing stale data.
+        return ocr_text.strip()
+
+    start = next((i for i, (line_index, group) in enumerate(markers) if group == group_name), None)
+    if start is None:
+        return ""
+    line_start = markers[start][0]
+    line_end = markers[start + 1][0] if start + 1 < len(markers) else len(lines)
+    return "\n".join(line.strip() for line in lines[line_start:line_end] if line.strip()).strip()
+
+
+def get_active_schedule_text(group_name: str, target_date: Optional[datetime.date] = None) -> str:
+    """OCRs the active Drive replacement and consultation sheets for the text schedule view."""
+    if target_date is None:
+        target_date, _, _ = get_target_study_date()
+    target_date_str = target_date.isoformat()
+    sections = []
+
+    for doc_type, heading in (("replacement", "Замены"), ("consultations", "Консультации")):
+        files = db.get_latest_gdrive_schedule_files(doc_type=doc_type, min_date=target_date_str)
+        for item in files:
+            path = item.get("local_path")
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                ocr_text = _ocr_schedule_image(path, os.path.getmtime(path))
+            except OSError:
+                continue
+            selected_text = _text_for_group(ocr_text, group_name)
+            if selected_text:
+                date_str = item.get("schedule_date") or target_date_str
+                try:
+                    date = datetime.date.fromisoformat(date_str).strftime("%d.%m.%Y")
+                except ValueError:
+                    date = date_str
+                sections.append(f"📢 {heading} на {date}:\n{selected_text}")
+
+    # Keep one Telegram text message well below its 4096-character limit.
+    return "\n\n".join(sections)[:3000]
 
