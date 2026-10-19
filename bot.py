@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 43470)
-Total output lines: 3505
-
 import asyncio
 import datetime
 import functools
@@ -1033,7 +1030,1473 @@ async def cmd_start(message: Message, state: FSMContext):
         pending_count=pending_count,
         is_verified=is_verified,
         student_group=student_group,
-        is_p…18470 tokens truncated…тся список предметов для быстрого удаления устаревших файлов."
+        is_private_chat=message.chat.type == "private",
+        has_unread_notification=has_unread_notification,
+    )
+    
+    await show_user_screen(
+        message,
+        text,
+        reply_markup=markup,
+        photo=MAIN_MENU_PHOTO_PATH if is_verified and os.path.isfile(MAIN_MENU_PHOTO_PATH) else None,
+    )
+
+# --- Команда /verify ---
+@dp.message(Command("verify", "registration", "group"))
+async def cmd_verify(message: Message, state: FSMContext):
+    await state.clear()
+    if message.chat.type != "private":
+        await message.answer("Для регистрации открой личный чат с ботом и отправь /verify.")
+        return
+    existing = await adb.get_user(message.from_user.id)
+    if existing and existing.get("status") in {"approved", "pending"}:
+        await cmd_start(message, state)
+        return
+    text = (
+        "🎓 <b>Верификация в «Помощнике Пятнашки»:</b>\n\n"
+        "Выбери свою учебную группу из списка колледжа им. А.Е. Ларина 👇"
+    )
+    await show_user_screen(message, text, reply_markup=kb.select_group_kb())
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await cmd_start(message, state)
+
+
+@dp.callback_query(F.data == "feedback_start")
+async def cb_feedback_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.waiting_for_feedback)
+    text = (
+        "🐞 <b>Сообщить об ошибке</b>\n\n"
+        "Опиши, что пошло не так и что ты ожидал увидеть. Можно приложить скриншот.\n\n"
+        "Отправь сообщение сюда — его получит администратор. Для отмены нажми «Главное меню»."
+    )
+    await show_user_screen(callback, text, reply_markup=kb.back_to_menu_kb())
+
+
+@dp.message(Form.waiting_for_feedback)
+async def process_feedback(message: Message, state: FSMContext, bot: Bot):
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    if not (message.text or message.caption or message.photo or message.document):
+        await show_user_screen(message, "⚠️ Пришли текст ошибки или приложи скриншот.", reply_markup=kb.back_to_menu_kb())
+        return
+
+    admin_id = await adb.get_admin_id() or ADMIN_ID
+    if not admin_id:
+        await state.clear()
+        await show_user_screen(message, "⚠️ Не удалось отправить сообщение: администратор не настроен.", reply_markup=kb.back_to_menu_kb())
+        return
+
+    user = message.from_user
+    user_label = f"@{user.username}" if user.username else (user.full_name or "Студент")
+    header = (
+        "🐞 <b>Сообщение об ошибке</b>\n"
+        f"👤 {html.escape(user_label)} · ID <code>{user.id}</code>"
+    )
+    try:
+        await bot.send_message(chat_id=admin_id, text=header, parse_mode="HTML")
+        await message.copy_to(chat_id=admin_id)
+    except Exception:
+        logger.exception("Could not forward feedback from user %s", user.id)
+        await show_user_screen(message, "⚠️ Не удалось отправить сообщение. Попробуй ещё раз чуть позже.", reply_markup=kb.back_to_menu_kb())
+        return
+
+    await state.clear()
+    await show_user_screen(
+        message,
+        "✅ Спасибо! Сообщение об ошибке отправлено администратору.",
+        reply_markup=kb.back_to_menu_kb(),
+    )
+
+# --- Главное меню ---
+@dp.callback_query(F.data == "main_menu")
+async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if callback.message.chat.type != "private":
+        await callback.answer("Личное меню доступно только в личном чате с ботом.", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    is_adm = is_admin(callback.from_user)
+    user_record = await adb.get_user(user_id)
+    is_verified = is_adm or bool(user_record and user_record.get("status") == "approved")
+    verification_pending = bool(user_record and user_record.get("status") == "pending")
+    student_group = user_record.get("student_group") if user_record else None
+    pending_count = (await adb.count_pending_materials() + await adb.count_pending_users()) if is_adm else 0
+    has_unread_notification = bool(await adb.get_unread_announcement(user_id)) if is_verified else False
+    
+    markup = kb.main_menu_kb(
+        is_admin_user=is_adm,
+        pending_count=pending_count,
+        is_verified=is_verified,
+        student_group=student_group,
+        is_private_chat=callback.message.chat.type == "private",
+        verification_pending=verification_pending,
+        has_unread_notification=has_unread_notification,
+    )
+    
+    group_str = f" [<code>{student_group}</code>]" if student_group else ""
+    has_study = await user_has_study_features(callback.from_user, user_record)
+    if is_verified:
+        if has_study:
+            summary = await adb.get_all_debts_summary(user_id)
+            grp_label = f" ({student_group})" if student_group else ""
+            text = (
+                f"☝️🤓 <b>ПОМОЩНИК ПЯТНАШКИ</b> 🎓{group_str}\n"
+                f"<i>УО «БГК им. А.Е. Ларина»</i>\n\n"
+                f"«Вообще-то, пора закрывать долги и проверять расписание!» 🐾\n\n"
+                f"📊 <b>Твои долги{grp_label}:</b> <b>{summary['total'] - summary['pending']}</b> из {summary['total']} сдано (<code>{summary['percent']}%</code>)\n\n"
+                f"Выбери нужный раздел:"
+            )
+        else:
+            text = (
+                f"☝️🤓 <b>ПОМОЩНИК ПЯТНАШКИ</b> 🎓{group_str}\n"
+                f"<i>УО «БГК им. А.Е. Ларина»</i>\n\n"
+                f"«Вообще-то, расписание само себя не проверит!» 🐾\n\n"
+                f"📅 <b>Расписание:</b> актуальные пары и замены для группы <b>{student_group}</b>\n"
+                f"🔔 <b>Звонки:</b> точное время уроков и перемен колледжа\n\n"
+                f"💡 <i>(Предметы и методички сейчас настроены для групп ТТ-36, ХК и ВД)</i>\n\n"
+                f"Выбери нужный раздел:"
+            )
+    else:
+        if verification_pending:
+            text = (
+                "⏳ <b>Твоя заявка на проверке</b>\n\n"
+                f"🎓 Группа: <code>{html.escape(student_group or '')}</code>\n\n"
+                "Дождись решения администратора. Повторно проходить верификацию не нужно."
+            )
+        else:
+            text = (
+                f"☝️🤓 <b>ПОМОЩНИК ПЯТНАШКИ</b> 🎓\n\n"
+                f"⚠️ <b>Твой аккаунт ещё не подтверждён!</b>\n\n"
+                f"Нажми кнопку <b>«🔐 Выбрать группу для доступа»</b> ниже, "
+                f"чтобы получить доступ к расписанию и учебным материалам 👇"
+            )
+
+    await show_user_screen(
+        callback,
+        text,
+        reply_markup=markup,
+        photo=MAIN_MENU_PHOTO_PATH if is_verified and os.path.isfile(MAIN_MENU_PHOTO_PATH) else None,
+    )
+
+# =========================================================================
+# --- ВЕРИФИКАЦИЯ СТУДЕНТОВ (ОБЯЗАТЕЛЬНЫЙ ВХОД) ---
+# =========================================================================
+
+@dp.callback_query(F.data == "start_verify_flow")
+async def cb_start_verify_flow(callback: CallbackQuery, state: FSMContext):
+    existing = await adb.get_user(callback.from_user.id)
+    if existing and existing.get("status") == "approved":
+        await callback.answer("Верификация уже пройдена. Выбирай группу в разделе расписания.", show_alert=True)
+        return
+    if existing and existing.get("status") == "pending":
+        text = (
+            "⏳ <b>Заявка уже на проверке</b>\n\n"
+            f"🎓 Группа: <code>{html.escape(existing.get('student_group') or '')}</code>\n\n"
+            "Дождись решения администратора. Повторная заявка не нужна."
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+        ])
+        await show_user_screen(callback, text, reply_markup=markup)
+        return
+    await state.clear()
+    text = (
+        "🎓 <b>Выбери свою учебную группу:</b>\n\n"
+        "Выбери свою учебную группу из списка колледжа им. Ларина 👇"
+    )
+    await safe_edit_message(callback, text, reply_markup=kb.select_group_kb())
+
+@dp.callback_query(F.data.startswith("grp_"))
+async def cb_select_group(callback: CallbackQuery, state: FSMContext):
+    existing = await adb.get_user(callback.from_user.id)
+    if existing and existing.get("status") == "approved":
+        await callback.answer("Верификация уже пройдена. Выбирай группу в разделе расписания.", show_alert=True)
+        return
+    if existing and existing.get("status") == "pending":
+        await callback.answer("Заявка уже на проверке. Повторно выбирать группу не нужно.", show_alert=True)
+        return
+    data = callback.data[len("grp_"):]
+    if data == "custom":
+        await state.set_state(Form.waiting_for_custom_group)
+        text = (
+            "✍️ <b>Введи название своей группы:</b>\n\n"
+            "Например: <code>ТТ-36</code> или <code>ХК-37</code>.\n\n"
+            "<i>(или отправь /cancel для отмены)</i>"
+        )
+        await safe_edit_message(callback, text, reply_markup=None)
+        return
+
+    if data not in db.COLLEGE_GROUPS:
+        try:
+            await callback.answer("Такой группы нет в списке. Попробуй выбрать её заново.", show_alert=True)
+        except Exception:
+            pass
+        return
+        
+    user_id = callback.from_user.id
+    tg_uname = callback.from_user.username
+    tg_name = callback.from_user.full_name or "Студент"
+    student_group = data
+    
+    # Сохраняем заявку на верификацию без запроса личных имён
+    request_created = await adb.add_user_request(
+        user_id=user_id,
+        username=tg_uname,
+        tg_name=tg_name,
+        student_name=tg_name,
+        student_group=student_group
+    )
+    if not request_created:
+        await callback.answer("Заявка уже создана или доступ уже подтверждён.", show_alert=True)
+        return
+    await state.clear()
+    
+    user_confirm_text = (
+        f"✅ <b>Заявка на верификацию отправлена!</b>\n\n"
+        f"🎓 <b>Выбранная группа:</b> <code>{html.escape(student_group)}</code>\n\n"
+        f"Администратор проверит твою заявку. "
+        f"Как только доступ подтвердят, ты сразу получишь оповещение в этом чате! 🔔"
+    )
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    await safe_edit_message(callback, user_confirm_text, reply_markup=confirm_kb)
+    
+    await render_admin_verification_queue(callback.bot)
+
+@dp.message(Form.waiting_for_custom_group)
+async def process_custom_group(message: Message, state: FSMContext):
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        await cmd_start(message, state)
+        return
+        
+    grp = (message.text or "").strip()
+    if not grp:
+        await show_user_screen(message, "⚠️ Название группы не может быть пустым. Попробуй ещё раз:", reply_markup=kb.back_to_menu_kb())
+        return
+    if len(grp.encode("utf-8")) > 40:
+        await show_user_screen(message, "⚠️ Название группы слишком длинное. Введи не более 40 байт UTF-8:", reply_markup=kb.back_to_menu_kb())
+        return
+        
+    user_id = message.from_user.id
+    tg_uname = message.from_user.username
+    tg_name = message.from_user.full_name or "Студент"
+    student_group = grp
+    
+    request_created = await adb.add_user_request(
+        user_id=user_id,
+        username=tg_uname,
+        tg_name=tg_name,
+        student_name=tg_name,
+        student_group=student_group
+    )
+    if not request_created:
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    await state.clear()
+    
+    user_confirm_text = (
+        f"✅ <b>Заявка на верификацию отправлена!</b>\n\n"
+        f"🎓 <b>Выбранная группа:</b> <code>{html.escape(student_group)}</code>\n\n"
+        f"Администратор проверит твою заявку. "
+        f"Как только доступ подтвердят, ты сразу получишь оповещение в этом чате! 🔔"
+    )
+    await show_user_screen(message, user_confirm_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ]))
+    await render_admin_verification_queue(message.bot)
+
+@dp.message(Form.waiting_for_student_name)
+async def process_student_name_legacy(message: Message, state: FSMContext):
+    await state.clear()
+    await cmd_start(message, state)
+
+@dp.callback_query(F.data.startswith("adm_u_appr_"))
+async def cb_admin_approve_user(callback: CallbackQuery, bot: Bot):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔ Доступ только для администратора!", show_alert=True)
+        return
+        
+    target_id = int(callback.data.replace("adm_u_appr_", ""))
+    user_record = await adb.get_user(target_id)
+    if not user_record:
+        await callback.answer("Пользователь не найден!", show_alert=True)
+        return
+        
+    await adb.set_user_status(target_id, "approved")
+    await render_admin_verification_queue(bot)
+    s_grp = html.escape(user_record.get("student_group") or "")
+    u_display = html.escape(user_record.get("student_name") or user_record.get("tg_name") or "Пользователь")
+    
+    await callback.answer("Одобрено!")
+    
+    try:
+        feature_str = (
+            "Тебе открыт доступ к расписанию пар, трекеру долгов и базе знаний."
+            if await adb.group_has_subjects_support(s_grp)
+            else "Тебе открыт доступ к актуальному расписанию пар и звонков колледжа."
+        )
+        student_msg = (
+            f"🎉 <b>Доступ подтверждён!</b>\n\n"
+            f"Твоя верификация для группы <b>{s_grp}</b> успешно одобрена! 🎓\n\n"
+            f"{feature_str}\n"
+            f"Нажми кнопку ниже, чтобы войти в меню 👇"
+        )
+        start_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Войти в «Помощник Пятнашки»", callback_data="main_menu")]
+        ])
+        await bot.send_message(chat_id=target_id, text=student_msg, parse_mode="HTML", reply_markup=start_kb)
+    except Exception as e:
+        logger.warning(f"Could not notify approved user {target_id}: {e}")
+
+@dp.callback_query(F.data.startswith("adm_u_rejc_"))
+async def cb_admin_reject_user(callback: CallbackQuery, bot: Bot):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔ Доступ только для администратора!", show_alert=True)
+        return
+        
+    target_id = int(callback.data.replace("adm_u_rejc_", ""))
+    user_record = await adb.get_user(target_id)
+    if not user_record:
+        await callback.answer("Пользователь уже не найден.", show_alert=True)
+        return
+    await adb.set_user_status(target_id, "rejected")
+    await render_admin_verification_queue(bot)
+    
+    u_display = html.escape(user_record.get("student_name") or user_record.get("tg_name") or "Пользователь") if user_record else "Пользователь"
+    await callback.answer("Отклонено!")
+    
+    try:
+        student_msg = (
+            f"⛔ <b>Твоя заявка на вход в бота была отклонена.</b>\n\n"
+            f"Если произошла ошибка или ты ошибся группой, ты можешь отправить заявку заново по кнопке ниже 👇"
+        )
+        await bot.send_message(chat_id=target_id, text=student_msg, parse_mode="HTML", reply_markup=kb.rejected_user_kb())
+    except Exception:
+        pass
+
+@dp.callback_query((F.data == "adm_users_queue") | F.data.startswith("adm_users_queue_"))
+async def cb_admin_users_queue(callback: CallbackQuery, bot: Bot):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔ Доступ только для @Menmamoh!", show_alert=True)
+        return
+        
+    page = int(callback.data.rsplit("_", 1)[1]) if callback.data != "adm_users_queue" else 0
+    await callback.answer("Обновляю очередь внизу чата…")
+    await render_admin_verification_queue(bot, page, recreate=True)
+
+@dp.callback_query((F.data == "adm_users_list") | F.data.startswith("adm_users_list_"))
+async def cb_admin_users_list(callback: CallbackQuery):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔ Доступ только для @Menmamoh!", show_alert=True)
+        return
+        
+    page = int(callback.data.rsplit("_", 1)[1]) if callback.data != "adm_users_list" else 0
+    total = await adb.count_verified_users()
+    verified = await adb.get_verified_users(ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
+    if not verified:
+        text = "👥 <b>Список верифицированных студентов пуст.</b>"
+    else:
+        text = f"👥 <b>Верифицированные студенты ({total} чел.)</b> · страница {page + 1}\n\n"
+        for i, u in enumerate(verified, page * ADMIN_PAGE_SIZE + 1):
+            s_name = html.escape(u.get("student_name") or "Студент")
+            s_grp = html.escape(u.get("student_group") or "")
+            uname = f" ({html.escape(u['username'])})" if u.get("username") else ""
+            text += f"{i}. <b>{s_name}</b> [<code>{s_grp}</code>]{uname}\n"
+        text += "\n<i>Студенты получают уведомления при обновлении расписания.</i>"
+        
+    await callback.message.edit_text(
+        text, 
+        parse_mode="HTML", 
+        reply_markup=kb.admin_verified_users_page_kb(page, total, ADMIN_PAGE_SIZE)
+    )
+    await callback.answer()
+
+# =========================================================================
+# --- АКТУАЛЬНОЕ ОПЕРАТИВНОЕ РАСПИСАНИЕ ПО ГРУППАМ (ПЯТНАШКА) ---
+# =========================================================================
+
+async def render_group_schedule_view(
+    target,
+    user,
+    group_name: str,
+    is_callback: bool = False,
+    bot: Optional[Bot] = None,
+    notice: Optional[str] = None,
+):
+    """Отображает самое актуальное расписание для указанной группы с учётом правила отсечки (17:00 / суббота)"""
+    user_id = user.id
+    target_chat = target.message.chat if is_callback else target.chat
+    is_adm = is_admin(user) and target_chat.type == "private"
+    my_group = await get_user_primary_group(user_id)
+    is_own = bool(my_group and group_name == my_group)
+    
+    target_date, is_next_day, reason_text = gdrive_sync.get_target_study_date()
+    weekday_idx = target_date.weekday()
+    day_name = gdrive_sync.WEEKDAY_NAMES_RU.get(weekday_idx, "")
+    date_fmt = target_date.strftime("%d.%m.%Y")
+    if is_next_day:
+        header_date = f"на {day_name}, {date_fmt}"
+        note_line = f"🕒 <i>{reason_text}</i>\n\n"
+    else:
+        header_date = f"на сегодня ({day_name}, {date_fmt})"
+        note_line = ""
+
+    sched = await adb.get_group_schedule(group_name)
+    gen_sched = await adb.get_group_schedule("ALL")
+    gen_photo = get_general_schedule_photo(gen_sched, target_date=target_date)
+    has_gen_photo = bool(gen_photo and group_name != "ALL")
+    has_general_schedule = bool(gen_sched and (gen_sched.get("schedule_text") or gen_sched.get("photo_file_id")))
+    manual_general_is_newer = manual_general_schedule_is_newer(gen_sched, target_date)
+    
+    markup = kb.schedule_view_kb(
+        group_name=group_name, 
+        is_admin_user=is_adm, 
+        has_general_photo=has_gen_photo, 
+        has_general_schedule=has_general_schedule,
+        is_user_own_group=is_own,
+        user_own_group=my_group
+    )
+
+    if manual_general_is_newer and gen_sched and gen_sched.get("schedule_text") and not gen_sched.get("photo_file_id"):
+        upd_time = gen_sched.get("updated_at") or "недавно"
+        text = (
+            f"📢 <b>Общее расписание для всех групп {header_date}</b> 🎓\n"
+            f"{note_line}"
+            f"{html.escape(gen_sched['schedule_text'])}\n\n"
+            f"🕒 <i>Обновлено: {html.escape(str(upd_time))}</i>"
+        )
+        photo_id = None
+    elif gen_photo:
+        upd_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        text = (
+            f"📢 <b>Общее расписание для всех групп {header_date}</b> 🎓\n"
+            f"{note_line}"
+            "Актуальные листы замен и консультаций — на фото ниже.\n\n"
+            f"🕒 <i>Обновлено: {upd_time}</i>"
+        )
+        photo_id = gen_photo
+    elif gen_sched and group_name != "ALL" and (gen_sched.get("schedule_text") or gen_sched.get("photo_file_id")):
+        upd_time = gen_sched.get("updated_at") or "недавно"
+        body = html.escape(gen_sched.get("schedule_text") or "") or "<i>(Смотри общий лист замен на фото ниже)</i>"
+        safe_group_name = html.escape(group_name)
+        text = (
+            f"📅 <b>Расписание {header_date} — Группа {safe_group_name}</b> 🎓\n"
+            f"{note_line}"
+            f"📢 <b>Общее расписание для всех групп:</b>\n\n"
+            f"{body}\n\n"
+            f"🕒 <i>Обновлено: {upd_time}</i>"
+        )
+        photo_id = gen_photo
+    elif sched:
+        upd_time = sched.get("updated_at") or "недавно"
+        title = html.escape(sched.get("title") or f"Актуальное расписание ({group_name})")
+        body = html.escape(sched.get("schedule_text") or "") or "<i>(Информация о парах на фото ниже)</i>"
+        safe_group_name = html.escape(group_name)
+        
+        schedule_heading = (
+            f"📢 <b>Общий лист замен колледжа {header_date}</b> 🎓"
+            if group_name == "ALL"
+            else f"📅 <b>Расписание {header_date} — Группа {safe_group_name}</b> 🎓"
+        )
+        text = (
+            f"{schedule_heading}\n"
+            f"{note_line}"
+            f"📌 <b>{title}</b>\n\n"
+            f"{body}\n\n"
+            f"🕒 <i>Обновлено: {upd_time}</i>"
+        )
+        photo_id = sched.get("photo_file_id")
+        if not photo_id:
+            photo_id = gen_photo
+    elif group_name == "ALL" and gen_photo:
+        text = (
+            f"📢 <b>Общий лист замен колледжа {header_date}</b> 🎓\n"
+            f"{note_line}"
+            "Исходные фотографии листов замен и консультаций — ниже."
+        )
+        photo_id = gen_photo
+    else:
+        text = (
+            f"📅 <b>Расписание {header_date} — Группа {html.escape(group_name)}</b> 🎓\n\n"
+            f"{note_line}"
+            f"⏳ <i>Свежее расписание для этой группы пока не опубликовано.</i>\n\n"
+            f"Как только расписание или лист замен появится — тебе сразу придёт оповещение! 📢"
+        )
+        photo_id = None
+
+    if notice:
+        text = f"{notice}\n\n{text}"
+        
+    actual_bot = bot or getattr(target, "bot", None)
+    previous_ui_id = None
+    if target_chat.type == "private" and not is_callback:
+        previous_ui_id = await adb.get_ui_message_id(user_id)
+
+    async def track_schedule_screen(screen_message, related_messages=()):
+        if target_chat.type != "private":
+            return
+        related_ids = []
+        for related_message in related_messages:
+            await adb.set_ui_message_id(user_id, related_message.message_id)
+            related_ids.append(related_message.message_id)
+        await adb.set_ui_message_id(user_id, screen_message.message_id)
+        await cleanup_user_ui_messages(
+            actual_bot,
+            user_id,
+            keep_message_id=screen_message.message_id,
+            keep_message_ids=related_ids,
+        )
+    
+    if isinstance(photo_id, list):
+        if is_callback:
+            try:
+                await target.message.delete()
+            except Exception:
+                pass
+        photo_messages = await actual_bot.send_media_group(
+            chat_id=user_id,
+            media=build_general_schedule_media(photo_id, target_date=target_date),
+        )
+        await cache_general_schedule_media(photo_id, photo_messages)
+        screen_message = await actual_bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        await track_schedule_screen(screen_message, related_messages=photo_messages)
+    elif photo_id:
+        if is_callback:
+            try:
+                await target.message.delete()
+            except Exception:
+                pass
+        if len(text) <= 900:
+            photo_source = FSInputFile(photo_id) if os.path.isfile(photo_id) else photo_id
+            if is_callback:
+                screen_message = await actual_bot.send_photo(chat_id=user_id, photo=photo_source, caption=text, parse_mode="HTML", reply_markup=markup)
+            else:
+                screen_message = await target.answer_photo(photo=photo_source, caption=text, parse_mode="HTML", reply_markup=markup)
+            if os.path.isfile(photo_id):
+                await cache_general_schedule_media([photo_id], [screen_message])
+        else:
+            screen_message = await actual_bot.send_message(
+                chat_id=target_chat.id, text=text, parse_mode="HTML", reply_markup=markup
+            )
+            photo_message = await actual_bot.send_photo(chat_id=target_chat.id, photo=photo_id)
+            await track_schedule_screen(screen_message, related_messages=(photo_message,))
+            return
+        await track_schedule_screen(screen_message)
+    else:
+        if is_callback:
+            await show_user_screen(target, text, reply_markup=markup)
+        else:
+            await show_user_screen(target, text, reply_markup=markup)
+
+@dp.callback_query(F.data == "schedule_menu")
+async def cb_schedule_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    access_ok, err_msg = await check_user_access(callback.from_user)
+    if not access_ok:
+        await prompt_verification_required(callback, callback.from_user, err_msg)
+        return
+        
+    group_name = await get_user_primary_group(callback.from_user.id)
+    if not group_name:
+        text = (
+            "🎓 <b>Выбери свою учебную группу:</b>\n\n"
+            "У тебя ещё не выбрана основная группа.\n"
+            "Выбери группу из списка колледжа им. А.Е. Ларина, чтобы увидеть расписание 👇"
+        )
+        markup = kb.schedule_choose_group_kb(
+            current_group=None,
+            is_admin_user=is_admin(callback.from_user) and callback.message.chat.type == "private"
+        )
+        try:
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
+            await callback.bot.send_message(chat_id=callback.from_user.id, text=text, parse_mode="HTML", reply_markup=markup)
+        await callback.answer()
+        return
+        
+    await callback.answer()
+    await render_group_schedule_view(callback, callback.from_user, group_name, is_callback=True)
+
+@dp.message(Command("schedule"))
+async def cmd_schedule(message: Message, state: FSMContext):
+    await state.clear()
+    if message.chat.type != "private":
+        await message.answer("Чтобы открыть расписание своей группы, отправь /schedule в личном чате с ботом.")
+        return
+    access_ok, err_msg = await check_user_access(message.from_user)
+    if not access_ok:
+        await prompt_verification_required(message, message.from_user, err_msg)
+        return
+    group_name = await get_user_primary_group(message.from_user.id)
+    if not group_name:
+        await show_user_screen(
+            message,
+            "🎓 <b>Сначала выбери учебную группу:</b>",
+            reply_markup=kb.schedule_choose_group_kb(),
+        )
+        return
+    await render_group_schedule_view(message, message.from_user, group_name)
+
+@dp.callback_query(F.data.startswith("sched_view_"))
+async def cb_schedule_view(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    access_ok, err_msg = await check_user_access(callback.from_user)
+    if not access_ok:
+        await prompt_verification_required(callback, callback.from_user, err_msg)
+        return
+    # OCR can take longer than Telegram's callback-query deadline.
+    await callback.answer()
+    group_name = callback.data.replace("sched_view_", "")
+    await render_group_schedule_view(callback, callback.from_user, group_name, is_callback=True)
+
+@dp.callback_query(F.data == "sched_choose_group")
+async def cb_schedule_choose_group(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    access_ok, err_msg = await check_user_access(callback.from_user)
+    if not access_ok:
+        await prompt_verification_required(callback, callback.from_user, err_msg)
+        return
+        
+    user_id = callback.from_user.id
+    my_grp = await get_user_primary_group(user_id)
+    is_adm = is_admin(callback.from_user) and callback.message.chat.type == "private"
+    
+    current_grp_text = f"Твоя текущая группа: <b>{html.escape(my_grp)}</b>\n\n" if my_grp else "Основная группа ещё не выбрана.\n\n"
+    text = (
+        f"👥 <b>Выбор учебной группы (Пятнашка):</b>\n\n"
+        f"{current_grp_text}"
+        f"Выбери группу из списка ниже, чтобы увидеть самое актуальное расписание 👇"
+    )
+    markup = kb.schedule_choose_group_kb(current_group=my_grp, is_admin_user=is_adm)
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except Exception:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.bot.send_message(chat_id=user_id, text=text, parse_mode="HTML", reply_markup=markup)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("sched_set_my_"))
+async def cb_schedule_set_my_group(callback: CallbackQuery):
+    await callback.answer("Твоя основная группа зафиксирована при верификации.", show_alert=True)
+
+@dp.callback_query(F.data == "sched_bells")
+async def cb_schedule_bells(callback: CallbackQuery):
+    my_grp = await get_user_primary_group(callback.from_user.id)
+    text = db.BELLS_SCHEDULE_TEXT
+    back_row = []
+    if my_grp:
+        back_row.append(InlineKeyboardButton(text=f"🔙 К расписанию {my_grp}", callback_data=f"sched_view_{my_grp}"))
+    else:
+        back_row.append(InlineKeyboardButton(text="👥 Выбрать группу", callback_data="sched_choose_group"))
+    back_row.append(InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"))
+    markup = InlineKeyboardMarkup(inline_keyboard=[back_row])
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except Exception:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.bot.send_message(chat_id=callback.from_user.id, text=text, parse_mode="HTML", reply_markup=markup)
+    await callback.answer()
+
+@dp.message(Command("bells", "zvonki"))
+async def cmd_bells(message: Message):
+    """Быстрый вызов расписания звонков колледжа"""
+    my_grp = await get_user_primary_group(message.from_user.id)
+    back_row = []
+    if my_grp:
+        back_row.append(InlineKeyboardButton(text=f"📅 Расписание {my_grp}", callback_data=f"sched_view_{my_grp}"))
+    back_row.append(InlineKeyboardButton(text="👥 Выбрать группу", callback_data="sched_choose_group"))
+    back_row.append(InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"))
+    markup = InlineKeyboardMarkup(inline_keyboard=[back_row])
+    await show_user_screen(message, db.BELLS_SCHEDULE_TEXT, reply_markup=markup)
+
+@dp.callback_query(F.data == "sched_view_gen_photo")
+async def cb_schedule_view_gen_photo(callback: CallbackQuery):
+    target_date, is_next_day, reason_text = gdrive_sync.get_target_study_date()
+    weekday_idx = target_date.weekday()
+    day_name = gdrive_sync.WEEKDAY_NAMES_RU.get(weekday_idx, "")
+    date_fmt = target_date.strftime("%d.%m.%Y")
+    header_date = f"на {day_name}, {date_fmt}" if is_next_day else f"на сегодня ({day_name}, {date_fmt})"
+
+    gen_sched = await adb.get_group_schedule("ALL")
+    photo = get_general_schedule_photo(gen_sched, target_date=target_date)
+    if not photo:
+        await callback.answer(f"Общий лист замен {header_date} пока не опубликован на Google Диске!", show_alert=True)
+        return
+        
+    my_grp = await get_user_primary_group(callback.from_user.id)
+    gen_schedule_text = html.escape((gen_sched or {}).get("schedule_text") or "")
+    updated_at = html.escape(str((gen_sched or {}).get("updated_at") or "недавно"))
+    note_line = f"🕒 <i>{reason_text}</i>\n\n" if is_next_day else ""
+    caption = (
+        f"📸 <b>Общий лист замен колледжа {header_date}</b> 🎓\n"
+        f"{note_line}"
+        f"🕒 <i>Обновлено: {updated_at}</i>\n\n"
+        f"{gen_schedule_text or 'В альбоме собраны актуальные фотографии листов замен и консультаций.'}"
+    )
+    back_kb_rows = []
+    if my_grp:
+        back_kb_rows.append([InlineKeyboardButton(text=f"🔙 К расписанию группы {my_grp}", callback_data=f"sched_view_{my_grp}")])
+    else:
+        back_kb_rows.append([InlineKeyboardButton(text="👥 К выбору группы", callback_data="sched_choose_group")])
+    back_kb_rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
+    
+    back_markup = InlineKeyboardMarkup(inline_keyboard=back_kb_rows)
+    if isinstance(photo, list):
+        await callback.bot.send_media_group(
+            chat_id=callback.from_user.id,
+            media=build_general_schedule_media(photo, target_date=target_date),
+        )
+        await callback.bot.send_message(
+            chat_id=callback.from_user.id,
+            text=caption or "📸 <b>Полный лист замен колледжа</b>",
+            parse_mode="HTML",
+            reply_markup=back_markup,
+        )
+    else:
+        await callback.bot.send_photo(
+            chat_id=callback.from_user.id,
+            photo=photo,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=back_markup,
+        )
+    await callback.answer()
+
+# --- Редактирование / публикация расписания админом @Menmamoh ---
+
+@dp.callback_query(F.data == "adm_sched_publish_all")
+async def cb_admin_sched_publish_all(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔ Доступ только для администратора!", show_alert=True)
+        return
+    if callback.message.chat.type != "private":
+        await callback.answer("Открой личный чат с ботом для публикации расписания.", show_alert=True)
+        return
+
+    await state.update_data(target_group="ALL")
+    await state.set_state(Form.waiting_for_group_schedule)
+    text = (
+        "📅 <b>Публикация расписания для всех групп</b>\n\n"
+        "Отправь расписание одним сообщением: фотографией с подписью или текстом.\n"
+        "Оно появится в расписании у всех групп, а всем верифицированным студентам придёт уведомление.\n\n"
+        "<i>Для отмены отправь /cancel.</i>"
+    )
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm_sched_cancel")]
+    ])
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=cancel_kb)
+    except Exception:
+        await callback.bot.send_message(chat_id=callback.from_user.id, text=text, parse_mode="HTML", reply_markup=cancel_kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "adm_sched_cancel")
+async def cb_admin_sched_cancel(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    await state.clear()
+    await show_admin_panel(callback, callback.from_user, bot, is_callback=True)
+    await callback.answer("Публикация отменена")
+
+@dp.callback_query(F.data.startswith("adm_sched_edit_"))
+async def cb_admin_sched_edit(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔ Доступ только для @Menmamoh!", show_alert=True)
+        return
+    if callback.message.chat.type != "private":
+        await callback.answer("Открой личный чат с ботом для изменения расписания.", show_alert=True)
+        return
+        
+    target_group = callback.data.replace("adm_sched_edit_", "")
+    if target_group not in {*db.COLLEGE_GROUPS, "ALL"}:
+        await callback.answer("Неизвестная группа расписания.", show_alert=True)
+        return
+    await state.update_data(target_group=target_group)
+    await state.set_state(Form.waiting_for_group_schedule)
+    
+    text = (
+        f"✏️ <b>Обновление расписания — Группа {html.escape(target_group)}</b> 🎓\n\n"
+        f"Отправь самое актуальное расписание на сегодня/ближайшие дни:\n"
+        f"📸 <b>Фото листа замен/расписания</b> (можно сразу с текстом в подписи!)\n"
+        f"💬 Или просто <b>текстовое сообщение</b> со списком пар и кабинетами.\n\n"
+        f"<b>Пример текста:</b>\n"
+        f"<code>1. Технология отделки мебели (каб. 204)\n"
+        f"2. Экономика организации (каб. 105)\n"
+        f"3. Замена: ТПМ вместо дизайна (каб. 214)</code>\n\n"
+        f"📢 <i>Сразу после отправки бот автоматически разошлёт оповещение всем верифицированным студентам этой группы!</i>\n\n"
+        f"<i>(или отправь /cancel для отмены)</i>"
+    )
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"sched_view_{target_group}")]
+    ])
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=cancel_kb)
+    except Exception:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.bot.send_message(chat_id=callback.from_user.id, text=text, parse_mode="HTML", reply_markup=cancel_kb)
+    await callback.answer()
+
+@dp.message(Form.waiting_for_group_schedule)
+async def process_group_schedule_input(message: Message, state: FSMContext, bot: Bot):
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        await cmd_start(message, state)
+        return
+        
+    data = await state.get_data()
+    target_group = data.get("target_group")
+    if target_group not in {*db.COLLEGE_GROUPS, "ALL"}:
+        await state.clear()
+        await show_user_screen(message, "⚠️ Сеанс редактирования расписания завершён. Открой редактирование заново.", reply_markup=kb.back_to_menu_kb())
+        return
+    
+    photo_file_id = message.photo[-1].file_id if message.photo else None
+    raw_text = (message.caption if message.photo else message.text) or ""
+    raw_text = raw_text.strip()
+    
+    if not photo_file_id and not raw_text:
+        await show_user_screen(message, "⚠️ Отправь фотографию расписания или текстовое сообщение:", reply_markup=kb.back_to_menu_kb())
+        return
+        
+    title = f"Замена / Расписание ({target_group})"
+    admin_tag = f"@{message.from_user.username or ADMIN_USERNAME}"
+    
+    await adb.set_group_schedule(
+        group_name=target_group,
+        schedule_text=raw_text,
+        title=title,
+        photo_file_id=photo_file_id,
+        updated_by=admin_tag
+    )
+    await state.clear()
+    
+    # Автоматическая рассылка верифицированным студентам
+    safe_target_group = html.escape(target_group)
+    if target_group == "ALL":
+        broadcast_header = "📢 <b>Опубликовано новое расписание для всех групп!</b> 🎓\n\n"
+    else:
+        broadcast_header = f"📢 <b>Новое расписание для группы {safe_target_group}!</b> 🎓\n\n"
+
+    broadcast_body = (
+        f"{broadcast_header}"
+        "Расписание обновлено. Открой бота, чтобы посмотреть текст и фотографии листа."
+    )
+    broadcast_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📅 Расписание ({target_group})", callback_data=f"sched_view_{target_group}")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+    ])
+    
+    sent_count = 0
+    failed_count = 0
+    semaphore = asyncio.Semaphore(8)
+    send_lock = asyncio.Lock()
+    loop = asyncio.get_running_loop()
+    last_send_at = 0.0
+
+    async def send_update(user_id: int) -> bool:
+        nonlocal last_send_at
+        async with semaphore:
+            async with send_lock:
+                delay = 0.05 - (loop.time() - last_send_at)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                last_send_at = loop.time()
+            for attempt in range(2):
+                try:
+                    if photo_file_id:
+                        await bot.send_photo(
+                            chat_id=user_id, photo=photo_file_id, caption=broadcast_body,
+                            parse_mode="HTML", reply_markup=broadcast_kb,
+                        )
+                    else:
+                        await bot.send_message(
+                            chat_id=user_id, text=broadcast_body,
+                            parse_mode="HTML", reply_markup=broadcast_kb,
+                        )
+                    return True
+                except TelegramRetryAfter as error:
+                    if attempt == 0:
+                        await asyncio.sleep(error.retry_after)
+                    else:
+                        logger.warning("Schedule broadcast rate-limited for user %s", user_id)
+                except Exception:
+                    logger.exception("Could not broadcast schedule update to user %s", user_id)
+                    break
+        return False
+
+    offset = 0
+    batch_size = 200
+    while True:
+        if target_group == "ALL":
+            target_users = await adb.get_verified_users(batch_size, offset)
+        else:
+            target_users = await adb.get_verified_users_by_group(target_group, batch_size, offset)
+        if not target_users:
+            break
+        user_ids = [user["user_id"] for user in target_users if user["user_id"] != message.from_user.id]
+        results = await asyncio.gather(*(send_update(user_id) for user_id in user_ids))
+        sent_count += sum(results)
+        failed_count += len(results) - sum(results)
+        offset += len(target_users)
+
+    info_str = (
+        f"📢 Доставлено: <b>{sent_count}</b>; ошибок отправки: <b>{failed_count}</b>."
+        if sent_count or failed_count
+        else ("📢 Пока нет других верифицированных студентов." if target_group == "ALL"
+              else f"📢 В группе {safe_target_group} пока нет других верифицированных студентов.")
+    )
+    published_scope = "всех групп" if target_group == "ALL" else f"группы {safe_target_group}"
+    confirm_text = f"✅ <b>Расписание для {published_scope} успешно обновлено!</b>\n{info_str}"
+    # Отображаем обновленный экран расписания
+    await render_group_schedule_view(message, message.from_user, target_group, is_callback=False, bot=bot, notice=confirm_text)
+
+@dp.callback_query(F.data.startswith("adm_sched_clear_"))
+async def cb_admin_sched_clear(callback: CallbackQuery):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔ Доступ только для @Menmamoh!", show_alert=True)
+        return
+    if callback.message.chat.type != "private":
+        await callback.answer("Открой личный чат с ботом для изменения расписания.", show_alert=True)
+        return
+        
+    target_group = callback.data.replace("adm_sched_clear_", "")
+    if target_group not in {*db.COLLEGE_GROUPS, "ALL"}:
+        await callback.answer("Неизвестная группа расписания.", show_alert=True)
+        return
+    await adb.clear_group_schedule(target_group)
+    await callback.answer(f"Расписание для {target_group} очищено!", show_alert=True)
+    await render_group_schedule_view(callback, callback.from_user, target_group, is_callback=True)
+
+@dp.callback_query(F.data == "adm_gdrive_sync")
+async def cb_admin_gdrive_sync(callback: CallbackQuery, bot: Bot):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔ Доступ только для @Menmamoh!", show_alert=True)
+        return
+    if callback.message.chat.type != "private":
+        await callback.answer("Открой личный чат с ботом для синхронизации.", show_alert=True)
+        return
+
+    await callback.answer("⏳ Синхронизация с Google Диском...", show_alert=False)
+    status_msg = await callback.message.answer(
+        "🔄 <i>Подключаюсь к Google Диску колледжа и проверяю свежие замены...</i>", 
+        parse_mode="HTML",
+        reply_markup=kb.back_to_menu_kb(),
+    )
+    # Treat the sync progress/report as the user's current screen too. Otherwise
+    # it survives menu cleanup and remains as a permanent extra message below it.
+    await adb.set_ui_message_id(callback.from_user.id, status_msg.message_id)
+    await cleanup_user_ui_messages(
+        bot,
+        callback.from_user.id,
+        keep_message_id=status_msg.message_id,
+        extra_ids=(callback.message.message_id,),
+    )
+
+    loop = asyncio.get_running_loop()
+    res = await loop.run_in_executor(None, gdrive_sync.sync_drive_schedule)
+
+    if not res.get("ok"):
+        await status_msg.edit_text(
+            f"⚠️ <b>Ошибка при синхронизации с Google Диском:</b>\n{res.get('error')}",
+            parse_mode="HTML",
+            reply_markup=kb.back_to_menu_kb(),
+        )
+        return
+
+    total = res.get("total_found", 0)
+    new_dl = res.get("new_downloaded", 0)
+    files = res.get("files", [])
+
+    lines = []
+    for f in files:
+        d_str = f.get("schedule_date") or "—"
+        doc_t = "Замены" if f.get("doc_type") == "replacement" else "Консультации"
+        part = f" (часть {f['part_number']})" if f.get("part_number", 1) > 1 else ""
+        lines.append(f"• <b>{doc_t}</b> на <code>{d_str}</code>{part}: {html.escape(f['filename'])}")
+
+    report = (
+        f"✅ <b>Синхронизация с Google Диском успешно завершена!</b>\n\n"
+        f"📁 Всего файлов найдено: <b>{total}</b>\n"
+        f"📥 Новых скачано: <b>{new_dl}</b>\n\n"
+        f"📋 <b>Актуальные документы:</b>\n" + ("\n".join(lines) if lines else "<i>(файлы не найдены)</i>") + "\n\n"
+        f"💡 <i>Свежие листы замен теперь доступны всем студентам во вкладке «📅 Расписание»!</i>"
+    )
+    await status_msg.edit_text(report, parse_mode="HTML", reply_markup=kb.back_to_menu_kb())
+
+
+# Совместимость со старыми кнопками
+@dp.callback_query(F.data.in_(["sched_today", "sched_tomorrow", "sched_week"]) | F.data.startswith("sched_day_"))
+async def cb_legacy_schedule(callback: CallbackQuery, state: FSMContext):
+    await cb_schedule_menu(callback, state)
+
+# =========================================================================
+# --- ТРЕКЕР ДОЛГОВ И УЧЕБНЫХ РАБОТ (ХАБ) ---
+# =========================================================================
+
+@dp.callback_query(F.data == "useful_menu")
+async def cb_useful_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text = "💡 <b>Полезное</b>\n\nВыбери нужный пункт:"
+    await show_user_screen(callback, text, reply_markup=kb.useful_hub_kb())
+
+
+@dp.callback_query(F.data == "useful_application")
+async def cb_useful_application(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+    user_id = callback.from_user.id
+    if not os.path.isfile(APPLICATION_EXAMPLE_PHOTO) or not os.path.isfile(APPLICATION_TEMPLATE_PDF):
+        await show_user_screen(
+            callback,
+            "⚠️ Образец заявления временно недоступен.",
+            reply_markup=kb.useful_hub_kb(),
+        )
+        return
+
+    try:
+        photo_message = await callback.bot.send_photo(
+            chat_id=user_id,
+            photo=FSInputFile(APPLICATION_EXAMPLE_PHOTO),
+            caption="📷 Фото исходного заявления для примера.",
+        )
+        file_message = await callback.bot.send_document(
+            chat_id=user_id,
+            document=FSInputFile(APPLICATION_TEMPLATE_PDF),
+            caption="📄 Чистый шаблон заявления для печати.",
+            reply_markup=kb.useful_application_kb(),
+        )
+    except Exception:
+        logger.exception("Could not send the application example to user %s", user_id)
+        await show_user_screen(
+            callback,
+            "⚠️ Не удалось отправить образец. Попробуй ещё раз.",
+            reply_markup=kb.useful_hub_kb(),
+        )
+        return
+
+    await adb.set_ui_message_id(user_id, photo_message.message_id)
+    await adb.set_ui_message_id(user_id, file_message.message_id)
+    await cleanup_user_ui_messages(
+        callback.bot,
+        user_id,
+        keep_message_ids=(photo_message.message_id, file_message.message_id),
+        extra_ids=(callback.message.message_id,),
+    )
+
+
+@dp.callback_query(F.data == "notification_open")
+async def cb_notification_open(callback: CallbackQuery):
+    if callback.message.chat.type != "private":
+        await callback.answer("Открой уведомление в личном чате с ботом.", show_alert=True)
+        return
+    announcement = await adb.get_unread_announcement(callback.from_user.id)
+    if not announcement:
+        await callback.answer("Новых уведомлений пока нет.", show_alert=True)
+        return
+
+    try:
+        copied = await callback.bot.copy_message(
+            chat_id=callback.from_user.id,
+            from_chat_id=announcement["source_chat_id"],
+            message_id=announcement["source_message_id"],
+            reply_markup=kb.notification_message_kb(),
+        )
+    except Exception:
+        logger.exception("Could not open announcement %s for user %s", announcement["id"], callback.from_user.id)
+        await callback.answer("Не удалось открыть уведомление. Сообщи администратору.", show_alert=True)
+        return
+
+    await adb.mark_announcement_read(callback.from_user.id, announcement["id"])
+    await adb.set_ui_message_id(callback.from_user.id, copied.message_id)
+    await cleanup_user_ui_messages(
+        callback.bot,
+        callback.from_user.id,
+        keep_message_id=copied.message_id,
+        extra_ids=(callback.message.message_id,),
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "debts_hub")
+async def cb_debts_hub(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    access_ok, err_msg = await check_user_access(callback.from_user)
+    if not access_ok:
+        await prompt_verification_required(callback, callback.from_user, err_msg)
+        return
+        
+    if not await is_tt36_student(callback.from_user):
+        await reject_non_tt36(callback)
+        return
+
+    user_id = callback.from_user.id
+    u_rec = await adb.get_user(user_id)
+    s_grp = u_rec.get("student_group") if u_rec else None
+    grp_badge = f" ({s_grp})" if s_grp else ""
+    summary = await adb.get_all_debts_summary(user_id)
+    
+    text = (
+        f"📝 <b>Трекер долгов и учебных работ{grp_badge}</b> 🎓\n\n"
+        f"Здесь ты можешь отмечать сданные лабы, следить за хвостами и добавлять свои предметы.\n\n"
+        f"📊 <b>Твой прогресс сдачи:</b>\n"
+        f"• Всего работ в базе: <b>{summary['total']}</b>\n"
+        f"• Сдано работ: <b>{summary['total'] - summary['pending']}</b>\n"
+        f"• Осталось сдать (долгов): <b>{summary['pending']}</b>\n"
+        f"• Общий прогресс: <code>[{summary['bar']}]</code> <b>{summary['percent']}%</b>\n\n"
+        f"Выбери нужный раздел 👇"
+    )
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.debts_hub_kb())
+    except Exception:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.bot.send_message(chat_id=user_id, text=text, parse_mode="HTML", reply_markup=kb.debts_hub_kb())
+    await callback.answer()
+
+# --- Показать все долги ---
+@dp.callback_query(F.data == "show_all_debts")
+async def cb_show_all_debts(callback: CallbackQuery):
+    if not await is_tt36_student(callback.from_user):
+        await reject_non_tt36(callback)
+        return
+
+    user_id = callback.from_user.id
+    summary = await adb.get_all_debts_summary(user_id)
+    
+    if summary["total"] == 0:
+        text = (
+            "🎉 <b>У тебя пока нет добавленных работ!</b>\n\n"
+            "Выбери предмет в списке и нажми <i>«➕ Добавить работу»</i>, чтобы внести лабы или домашки."
+        )
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.back_to_debts_hub_kb())
+        await callback.answer()
+        return
+
+    if summary["pending"] == 0:
+        text = (
+            "🔥 <b>ЧИСТО! Долгов нет вообще!</b> 🥳\n\n"
+            f"Все <b>{summary['total']}</b> работ сданы на 100%!\n"
+            f"Прогресс: <code>[{summary['bar']}]</code> <b>100%</b>"
+        )
+    else:
+        text = (
+            f"📋 <b>СВОДКА ВСЕХ ДОЛГОВ ПО УЧЁБЕ</b>\n\n"
+            f"🔴 <b>Осталось сдать:</b> {summary['pending']} из {summary['total']} работ\n"
+            f"📈 <b>Прогресс закрытия:</b> <code>[{summary['bar']}]</code> {summary['percent']}%\n\n"
+            f"─── <b>СПИСОК ХВОСТОВ:</b> ───\n"
+        )
+        for subject_name, tasks in summary["by_subject"].items():
+            safe_sub = html.escape(subject_name)
+            text += f"\n📚 <b>{safe_sub}</b> ({len(tasks)}):\n"
+            for t in tasks:
+                safe_task = html.escape(t)
+                text += f"  ❌ {safe_task}\n"
+        
+        text += "\n💡 <i>Чтобы отметить работу или посмотреть методички, перейди в «Мои предметы и работы».</i>"
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.back_to_debts_hub_kb())
+    await callback.answer()
+
+# --- Список предметов ---
+@dp.callback_query(F.data == "list_subjects")
+async def cb_list_subjects(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if not await is_tt36_student(callback.from_user):
+        await reject_non_tt36(callback)
+        return
+
+    user_id = callback.from_user.id
+    subjects = await adb.get_subjects_with_counts(user_id)
+    
+    text = (
+        "📚 <b>Выбери предмет</b>, чтобы посмотреть работы, методички или отметить сданные:\n\n"
+        "🔴 — есть незакрытые долги\n"
+        "🟢 — все работы сданы (или пока нет добавленных)"
+    )
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.subjects_list_kb(subjects))
+    await callback.answer()
+
+# --- Открыть предмет и его работы ---
+@dp.callback_query(F.data.startswith("open_sub_"))
+async def cb_open_subject(callback: CallbackQuery):
+    if not await is_tt36_student(callback.from_user):
+        await reject_non_tt36(callback)
+        return
+
+    user_id = callback.from_user.id
+    parts = callback.data.split("_")
+    subject_id = int(parts[2])
+    page = max(0, int(parts[3])) if len(parts) > 3 else 0
+    page_size = 25
+    
+    subject_page = await adb.get_subject_tasks_page(user_id, subject_id, page_size, page * page_size)
+    if not subject_page:
+        await callback.answer("Предмет не найден!", show_alert=True)
+        return
+    subject = subject_page["subject"]
+    tasks = subject_page["tasks"]
+    total_tasks = subject_page["total"]
+    pending_count = subject_page["pending"]
+    safe_name = html.escape(subject["name"])
+    
+    # Загружаем все счётчики материалов предмета одним запросом.
+    global_counts = await adb.get_global_material_counts_for_subject(subject["name"])
+    mat_counts = {t["id"]: global_counts.get(t["title"].strip().lower(), 0) for t in tasks}
+    
+    text = (
+        f"📖 <b>Предмет:</b> {safe_name}\n"
+        f"📊 <b>Статус:</b> {total_tasks - pending_count}/{total_tasks} сдано (долгов: <b>{pending_count}</b>)\n\n"
+        f"• Нажатие <b>слева</b> переключает статус сдачи (❌ / ✅)\n"
+        f"• Кнопка <b>справа 📚</b> открывает проверенные методички и решения к работе!"
+    )
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.subject_tasks_kb(subject_id, tasks, mat_counts, page, total_tasks, page_size))
+    await callback.answer()
+
+# --- Переключение статуса работы (TOGGLE) ---
+@dp.callback_query(F.data.startswith("toggle_t_"))
+async def cb_toggle_task(callback: CallbackQuery):
+    if not await is_tt36_student(callback.from_user):
+        await reject_non_tt36(callback)
+        return
+
+    user_id = callback.from_user.id
+    parts = callback.data.split("_")
+    task_id = int(parts[2])
+    subject_id = int(parts[3])
+    page = max(0, int(parts[4])) if len(parts) > 4 else 0
+    page_size = 25
+    
+    subject = await adb.get_subject_by_id(user_id, subject_id)
+    if not subject:
+        await callback.answer("Предмет не найден или уже удалён.", show_alert=True)
+        return
+    new_status, tasks, total_tasks, pending_count = await adb.toggle_task_status_and_get_tasks(
+        user_id, subject_id, task_id, page_size, page * page_size
+    )
+    if new_status is None:
+        await callback.answer("Работа не найдена в этом предмете.", show_alert=True)
+        return
+    safe_name = html.escape(subject["name"])
+    global_counts = await adb.get_global_material_counts_for_subject(subject["name"])
+    mat_counts = {t["id"]: global_counts.get(t["title"].strip().lower(), 0) for t in tasks}
+    
+    status_msg = "✅ Засчитано!" if new_status else "❌ Снова в долгах!"
+    
+    text = (
+        f"📖 <b>Предмет:</b> {safe_name}\n"
+        f"📊 <b>Статус:</b> {total_tasks - pending_count}/{total_tasks} сдано (долгов: <b>{pending_count}</b>)\n\n"
+        f"• Нажатие <b>слева</b> переключает статус сдачи (❌ / ✅)\n"
+        f"• Кнопка <b>справа 📚</b> открывает проверенные методички и решения к работе!"
+    )
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.subject_tasks_kb(subject_id, tasks, mat_counts, page, total_tasks, page_size))
+    await callback.answer(status_msg)
+
+# =========================================================================
+# --- БЛОК: МЕТОДИЧКИ И РЕШЕНИЯ (МАТЕРИАЛЫ) ---
+# =========================================================================
+
+@dp.callback_query(F.data.startswith("view_mat_"))
+async def cb_view_materials(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    task_id = int(parts[2])
+    subject_id = int(parts[3])
+    page = max(0, int(parts[4])) if len(parts) > 4 else 0
+    
+    user_id = callback.from_user.id
+    subject = await adb.get_subject_by_id(user_id, subject_id)
+    if not subject:
+        await callback.answer("Работа не найдена в этом предмете.", show_alert=True)
+        return
+    task_info = await adb.get_task_info_for_subject(user_id, subject_id, task_id)
+    if not task_info:
+        await callback.answer("Работа не найдена!", show_alert=True)
+        return
+        
+    # Ищем материалы глобально по названию предмета и работы
+    material_total = await adb.count_materials_for_task_globally(task_info["subject_name"], task_info["title"])
+    materials = await adb.get_materials_for_task_globally(
+        task_info["subject_name"], task_info["title"], limit=25, offset=page * 25
+    )
+    safe_title = html.escape(task_info["title"])
+    safe_sub = html.escape(task_info["subject_name"])
+    
+    if not materials:
+        text = (
+            f"📚 <b>Материалы к работе:</b>\n"
+            f"«{safe_title}» (<i>{safe_sub}</i>)\n\n"
+            f"Пока никто не добавил проверенных методичек или решений к этой работе.\n\n"
+            f"Будь первым! Нажми <b>«📤 Предложить методичку / решение»</b>, загрузи фото или файл, "
+            f"и после быстрой верификации он станет доступен всем студентам!"
+        )
+    else:
+        text = (
+            f"📚 <b>Проверенные материалы к работе:</b>\n"
+            f"«{safe_title}» (<i>{safe_sub}</i>)\n\n"
+            f"Нажми на кнопку материала ниже, чтобы скачать методичку или готовое решение 👇"
+        )
+        
+    await callback.message.edit_text(
+        text, parse_mode="HTML",
+        reply_markup=kb.materials_list_kb(task_id, subject_id, materials, page, material_total, 25)
+    )
+    await callback.answer()
+
+# --- Скачивание / получение материала ---
+@dp.callback_query(F.data.startswith("dl_mat_"))
+async def cb_download_material(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    mat_id = int(parts[2])
+    
+    mat = await adb.get_material_by_id(mat_id)
+    if not mat or mat.get("status") != "approved":
+        await callback.answer("Материал не найден!", show_alert=True)
+        return
+        
+    task_info = await adb.get_task_info(mat["task_id"])
+    subject_name = task_info["subject_name"] if task_info else "предмет"
+    task_title = task_info["title"] if task_info else "Работа"
+    
+    icon = "📖" if mat["material_type"] == "method" else "💡"
+    type_name = "Методичка" if mat["material_type"] == "method" else "Решение"
+    author = html.escape(mat["user_name"] or "Аноним")
+    title = html.escape(mat["title"])
+    
+    caption = (
+        f"{icon} <b>{type_name}:</b> {title}\n"
+        f"📚 <b>Предмет:</b> {html.escape(subject_name)}\n"
+        f"📝 <b>Работа:</b> {html.escape(task_title)}\n"
+        f"👤 <i>Добавил: {author} (проверено модератором ✅)</i>"
+    )
+    is_adm = is_admin(callback.from_user)
+    reply_markup = kb.material_downloaded_kb(subject_name, material_id=mat_id, is_admin_user=is_adm)
+    
+    if mat["file_type"] == "document" and mat["file_id"]:
+        await callback.message.answer_document(document=mat["file_id"], caption=caption, parse_mode="HTML", reply_markup=reply_markup)
+    elif mat["file_type"] == "photo" and mat["file_id"]:
+        await callback.message.answer_photo(photo=mat["file_id"], caption=caption, parse_mode="HTML", reply_markup=reply_markup)
+    elif mat["content_text"]:
+        await callback.message.answer(f"{caption}\n\n📄 <b>Текст / Ссылка:</b>\n{html.escape(mat['content_text'])}", parse_mode="HTML", reply_markup=reply_markup)
+        
+    await callback.answer("Отправлено в чат!")
+
+# =========================================================================
+# --- УДАЛЕНИЕ НЕАКТУАЛЬНЫХ МАТЕРИАЛОВ (ДЛЯ АДМИНИСТРАТОРА @Menmamoh) ---
+# =========================================================================
+
+@dp.callback_query(F.data.startswith("adm_ask_del_"))
+async def cb_admin_ask_delete_material(callback: CallbackQuery):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔ Только @Menmamoh может удалять материалы!", show_alert=True)
+        return
+        
+    mat_id = int(callback.data.replace("adm_ask_del_", ""))
+    mat = await adb.get_material_by_id(mat_id)
+    if not mat:
+        await callback.answer("Материал уже удален!", show_alert=True)
+        return
+        
+    safe_title = html.escape(mat["title"])
+    sub_name = html.escape(mat.get("subject_name") or "предмет")
+    text = (
+        f"🗑️ <b>Подтверждение удаления материала</b>\n\n"
+        f"📚 <b>Предмет:</b> {sub_name}\n"
+        f"📄 <b>Материал:</b> «{safe_title}»\n\n"
+        f"Ты точно хочешь навсегда удалить этот материал?\n\n"
+        f"⚠️ После удаления он будет стерт из базы и перестанет показываться студентам."
+    )
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.admin_confirm_delete_material_kb(mat_id))
+    except Exception:
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=kb.admin_confirm_delete_material_kb(mat_id))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("adm_do_del_"))
+async def cb_admin_do_delete_material(callback: CallbackQuery):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔ Только @Menmamoh может удалять материалы!", show_alert=True)
+        return
+        
+    mat_id = int(callback.data.replace("adm_do_del_", ""))
+    mat = await adb.get_material_by_id(mat_id)
+    if not mat or not await adb.delete_material(mat_id):
+        await callback.answer("Материал уже удален.", show_alert=True)
+        return
+    title = mat["title"]
+    
+    safe_title = html.escape(title)
+    text = (
+        f"🗑️ <b>Материал успешно удален!</b>\n\n"
+        f"«{safe_title}» стерт из базы данных и больше не доступен студентам."
+    )
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗄️ К списку предметов (удалить ещё)", callback_data="adm_manage_materials")],
+        [InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")]
+    ])
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception:
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+    await callback.answer("Удалено!")
+
+@dp.callback_query(F.data == "adm_manage_materials")
+async def cb_admin_manage_materials(callback: CallbackQuery):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔ Только @Menmamoh имеет доступ!", show_alert=True)
+        return
+        
+    known_subjects = await adb.get_all_known_subject_names(callback.from_user.id)
+    counts_map = await adb.get_global_material_counts_by_subject()
+    
+    subjects_with_counts = []
+    seen = set()
+    for name in known_subjects:
+        cnt = counts_map.get(name.strip().lower(), 0)
+        subjects_with_counts.append({"name": name, "count": cnt})
+        seen.add(name.strip().lower())
+        
+    for sub_lower, cnt in counts_map.items():
+        if sub_lower not in seen and cnt > 0:
+            subjects_with_counts.append({"name": sub_lower.capitalize(), "count": cnt})
+            seen.add(sub_lower)
+            
+    total_mats = sum(counts_map.values())
+    if total_mats == 0:
+        text = (
+            "🗄️ <b>Управление базой знаний (Удаление неактуального)</b>\n\n"
+            "В базе сейчас <b>нет опубликованных материалов</b>.\n\n"
+            "Когда студенты добавят методички или решения и они будут одобрены, "
+            "здесь появится список предметов для быстрого удаления устаревших файлов."
         )
     else:
         text = (
