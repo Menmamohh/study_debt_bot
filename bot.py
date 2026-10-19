@@ -1422,7 +1422,11 @@ async def show_group_selection_confirmation(target, state: FSMContext, student_g
     else:
         await show_user_screen(target, text, reply_markup=kb.confirm_group_selection_kb())
 
-@dp.callback_query(F.data.startswith("grp_"))
+@dp.callback_query(
+    F.data.startswith("grp_")
+    & (F.data != "grp_confirm_yes")
+    & (F.data != "grp_confirm_no")
+)
 async def cb_select_group(callback: CallbackQuery, state: FSMContext):
     existing = await adb.get_user(callback.from_user.id)
     state_data = await state.get_data()
