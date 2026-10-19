@@ -1362,6 +1362,11 @@ async def render_group_schedule_view(
         is_user_own_group=is_own,
         user_own_group=my_group
     )
+
+    loop = asyncio.get_running_loop()
+    drive_schedule_text = await loop.run_in_executor(
+        None, gdrive_sync.get_active_schedule_text, group_name, target_date
+    )
     
     if sched:
         upd_time = sched.get("updated_at") or "недавно"
@@ -1412,6 +1417,12 @@ async def render_group_schedule_view(
         )
         photo_id = None
 
+    if drive_schedule_text:
+        text += (
+            "\n\n📝 <b>Текст из актуальных листов Google Диска</b>\n"
+            f"<pre>{html.escape(drive_schedule_text)}</pre>"
+        )
+
     if notice:
         text = f"{notice}\n\n{text}"
         
@@ -1449,9 +1460,16 @@ async def render_group_schedule_view(
                 await target.message.delete()
             except Exception:
                 pass
-            screen_message = await actual_bot.send_photo(chat_id=user_id, photo=photo_id, caption=text, parse_mode="HTML", reply_markup=markup)
+        if len(text) <= 900:
+            if is_callback:
+                screen_message = await actual_bot.send_photo(chat_id=user_id, photo=photo_id, caption=text, parse_mode="HTML", reply_markup=markup)
+            else:
+                screen_message = await target.answer_photo(photo=photo_id, caption=text, parse_mode="HTML", reply_markup=markup)
         else:
-            screen_message = await target.answer_photo(photo=photo_id, caption=text, parse_mode="HTML", reply_markup=markup)
+            screen_message = await actual_bot.send_message(
+                chat_id=target_chat.id, text=text, parse_mode="HTML", reply_markup=markup
+            )
+            await actual_bot.send_photo(chat_id=target_chat.id, photo=photo_id)
         await track_schedule_screen(screen_message)
     else:
         if is_callback:
