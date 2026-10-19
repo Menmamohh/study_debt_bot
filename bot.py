@@ -286,6 +286,7 @@ class Form(StatesGroup):
     waiting_for_schedule_pair = State()
     waiting_for_group_schedule = State()
     waiting_for_custom_group = State()
+    waiting_for_group_confirmation = State()
     waiting_for_student_name = State()
     waiting_for_feedback = State()
     waiting_for_broadcast = State()
@@ -686,7 +687,8 @@ class VerificationMiddleware(BaseMiddleware):
             private_callbacks = {
                 "main_menu", "debts_hub", "show_all_debts", "list_subjects",
                 "add_subject_prompt", "browse_materials_hub", "start_verify_flow", "feedback_start",
-                "useful_menu", "useful_application", "notification_open",
+                "useful_menu", "useful_application", "notification_open", "profile_menu",
+                "profile_change_group",
             }
             if callback_data in private_callbacks or callback_data.startswith(private_prefixes):
                 await event.answer("Открой личный чат с ботом для личных разделов.", show_alert=True)
@@ -1076,6 +1078,8 @@ async def cmd_start(message: Message, state: FSMContext):
         # Проверяем статус верификации студента
         user_record = await adb.get_user(user_id)
         if not user_record:
+            await state.clear()
+            await state.update_data(group_action="verify")
             welcome_text = (
                 f"☝️🤓 <b>ПОМОЩНИК ПЯТНАШКИ</b> 🎓\n"
                 f"<i>УО «БГК им. А.Е. Ларина» (Пятнашка)</i>\n\n"
@@ -1345,24 +1349,94 @@ async def cb_start_verify_flow(callback: CallbackQuery, state: FSMContext):
         await show_user_screen(callback, text, reply_markup=markup)
         return
     await state.clear()
+    await state.update_data(group_action="verify")
     text = (
         "🎓 <b>Выбери свою учебную группу:</b>\n\n"
         "Выбери свою учебную группу из списка колледжа им. Ларина 👇"
     )
     await safe_edit_message(callback, text, reply_markup=kb.select_group_kb())
 
+
+@dp.callback_query(F.data == "profile_menu")
+async def cb_profile_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    user_record = await adb.get_user(callback.from_user.id)
+    if not user_record or user_record.get("status") != "approved":
+        await prompt_verification_required(callback, callback.from_user)
+        return
+    group = html.escape(user_record.get("student_group") or "не выбрана")
+    username = f"@{html.escape(callback.from_user.username)}" if callback.from_user.username else "не указан"
+    text = (
+        "👤 <b>Профиль</b>\n\n"
+        f"Имя: <b>{html.escape(callback.from_user.full_name or 'Пользователь')}</b>\n"
+        f"Telegram: {username}\n"
+        f"ID: <code>{callback.from_user.id}</code>\n"
+        f"🎓 Группа: <b>{group}</b>\n"
+        "Статус: ✅ подтверждён"
+    )
+    await safe_edit_message(callback, text, reply_markup=kb.profile_menu_kb())
+
+
+@dp.callback_query(F.data == "profile_change_group")
+async def cb_profile_change_group(callback: CallbackQuery, state: FSMContext):
+    user_record = await adb.get_user(callback.from_user.id)
+    if not user_record or user_record.get("status") != "approved":
+        await callback.answer("Сначала нужно пройти верификацию.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(group_action="change")
+    current_group = html.escape(user_record.get("student_group") or "не выбрана")
+    text = (
+        "🎓 <b>Изменение учебной группы</b>\n\n"
+        f"Текущая группа: <b>{current_group}</b>\n"
+        "Выбери новую группу. Перед сохранением бот попросит подтвердить выбор."
+    )
+    await safe_edit_message(
+        callback,
+        text,
+        reply_markup=kb.select_group_kb(back_callback="profile_menu", back_label="🔙 В профиль"),
+    )
+
+
+async def show_group_selection_confirmation(target, state: FSMContext, student_group: str, action: str):
+    await state.update_data(group_action=action, selected_group=student_group)
+    await state.set_state(Form.waiting_for_group_confirmation)
+    safe_group = html.escape(student_group)
+    if action == "change":
+        user_record = await adb.get_user(target.from_user.id)
+        current_group = html.escape((user_record or {}).get("student_group") or "не выбрана")
+        text = (
+            "🔄 <b>Подтверди смену группы</b>\n\n"
+            f"Сейчас: <b>{current_group}</b>\n"
+            f"Новая группа: <b>{safe_group}</b>\n\n"
+            "После подтверждения доступ останется активным, а расписание будет открываться для новой группы."
+        )
+    else:
+        text = (
+            "🎓 <b>Проверь выбранную группу</b>\n\n"
+            f"Ты точно хочешь выбрать группу <b>{safe_group}</b>?\n\n"
+            "После подтверждения заявка отправится администратору на проверку."
+        )
+    if isinstance(target, CallbackQuery):
+        await safe_edit_message(target, text, reply_markup=kb.confirm_group_selection_kb())
+    else:
+        await show_user_screen(target, text, reply_markup=kb.confirm_group_selection_kb())
+
 @dp.callback_query(F.data.startswith("grp_"))
 async def cb_select_group(callback: CallbackQuery, state: FSMContext):
     existing = await adb.get_user(callback.from_user.id)
-    if existing and existing.get("status") == "approved":
+    state_data = await state.get_data()
+    action = state_data.get("group_action", "verify")
+    if existing and existing.get("status") == "approved" and action != "change":
         await callback.answer("Верификация уже пройдена. Выбирай группу в разделе расписания.", show_alert=True)
         return
-    if existing and existing.get("status") == "pending":
+    if existing and existing.get("status") == "pending" and action != "change":
         await callback.answer("Заявка уже на проверке. Повторно выбирать группу не нужно.", show_alert=True)
         return
     data = callback.data[len("grp_"):]
     if data == "custom":
         await state.set_state(Form.waiting_for_custom_group)
+        await state.update_data(group_action=action)
         text = (
             "✍️ <b>Введи название своей группы:</b>\n\n"
             "Например: <code>ТТ-36</code> или <code>ХК-37</code>.\n\n"
@@ -1378,36 +1452,83 @@ async def cb_select_group(callback: CallbackQuery, state: FSMContext):
             pass
         return
         
+    await show_group_selection_confirmation(callback, state, data, action)
+
+
+@dp.callback_query(F.data == "grp_confirm_no")
+async def cb_group_confirmation_cancel(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    action = data.get("group_action", "verify")
+    await state.set_state(None)
+    await state.update_data(selected_group=None)
+    back_callback = "profile_menu" if action == "change" else "main_menu"
+    back_label = "🔙 В профиль" if action == "change" else "🔙 Назад"
+    text = "Выбери другую группу:" if action == "change" else "🎓 Выбери свою учебную группу:"
+    await safe_edit_message(
+        callback,
+        text,
+        reply_markup=kb.select_group_kb(back_callback=back_callback, back_label=back_label),
+    )
+
+
+@dp.callback_query(F.data == "grp_confirm_yes")
+async def cb_group_confirmation_accept(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    student_group = (data.get("selected_group") or "").strip()
+    action = data.get("group_action", "verify")
+    if not student_group:
+        await callback.answer("Выбери группу заново.", show_alert=True)
+        await state.clear()
+        await cb_start_verify_flow(callback, state)
+        return
+
     user_id = callback.from_user.id
-    tg_uname = callback.from_user.username
-    tg_name = callback.from_user.full_name or "Студент"
-    student_group = data
-    
-    # Сохраняем заявку на верификацию без запроса личных имён
+    existing = await adb.get_user(user_id)
+    if action == "change":
+        if not existing or existing.get("status") != "approved":
+            await state.clear()
+            await callback.answer("Профиль не найден. Пройди верификацию заново.", show_alert=True)
+            return
+        if existing.get("student_group") == student_group:
+            await state.clear()
+            await callback.answer("Эта группа уже выбрана.", show_alert=True)
+            return
+        await adb.update_user_group(user_id, student_group)
+        await adb.seed_default_subjects(user_id, student_group=student_group)
+        await state.clear()
+        await callback.answer("Группа изменена. Верификация сохранена.")
+        text = (
+            "✅ <b>Группа изменена</b>\n\n"
+            f"Теперь в профиле выбрана группа <b>{html.escape(student_group)}</b>.\n"
+            "Доступ и уже сохранённые данные трекера сохранены."
+        )
+        await safe_edit_message(callback, text, reply_markup=kb.profile_menu_kb())
+        return
+
+    if existing and existing.get("status") in {"approved", "pending"}:
+        await state.clear()
+        await callback.answer("Заявка уже отправлена или доступ подтверждён.", show_alert=True)
+        return
     request_created = await adb.add_user_request(
         user_id=user_id,
-        username=tg_uname,
-        tg_name=tg_name,
-        student_name=tg_name,
-        student_group=student_group
+        username=callback.from_user.username,
+        tg_name=callback.from_user.full_name or "Студент",
+        student_name=callback.from_user.full_name or "Студент",
+        student_group=student_group,
     )
+    await state.clear()
     if not request_created:
         await callback.answer("Заявка уже создана или доступ уже подтверждён.", show_alert=True)
         return
-    await state.clear()
-    
-    user_confirm_text = (
-        f"✅ <b>Заявка на верификацию отправлена!</b>\n\n"
-        f"🎓 <b>Выбранная группа:</b> <code>{html.escape(student_group)}</code>\n\n"
-        f"Администратор проверит твою заявку. "
-        f"Как только доступ подтвердят, ты сразу получишь оповещение в этом чате! 🔔"
+    text = (
+        "✅ <b>Заявка на верификацию отправлена!</b>\n\n"
+        f"🎓 Выбранная группа: <b>{html.escape(student_group)}</b>\n\n"
+        "Администратор проверит заявку и сообщит о решении."
     )
-    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+    await safe_edit_message(callback, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
-    ])
-    await safe_edit_message(callback, user_confirm_text, reply_markup=confirm_kb)
-    
+    ]))
     await render_admin_verification_queue(callback.bot)
 
 @dp.message(Form.waiting_for_custom_group)
@@ -1425,35 +1546,9 @@ async def process_custom_group(message: Message, state: FSMContext):
         await show_user_screen(message, "⚠️ Название группы слишком длинное. Введи не более 40 байт UTF-8:", reply_markup=kb.back_to_menu_kb())
         return
         
-    user_id = message.from_user.id
-    tg_uname = message.from_user.username
-    tg_name = message.from_user.full_name or "Студент"
-    student_group = grp
-    
-    request_created = await adb.add_user_request(
-        user_id=user_id,
-        username=tg_uname,
-        tg_name=tg_name,
-        student_name=tg_name,
-        student_group=student_group
-    )
-    if not request_created:
-        await state.clear()
-        await cmd_start(message, state)
-        return
-    await state.clear()
-    
-    user_confirm_text = (
-        f"✅ <b>Заявка на верификацию отправлена!</b>\n\n"
-        f"🎓 <b>Выбранная группа:</b> <code>{html.escape(student_group)}</code>\n\n"
-        f"Администратор проверит твою заявку. "
-        f"Как только доступ подтвердят, ты сразу получишь оповещение в этом чате! 🔔"
-    )
-    await show_user_screen(message, user_confirm_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
-    ]))
-    await render_admin_verification_queue(message.bot)
+    data = await state.get_data()
+    action = data.get("group_action", "verify")
+    await show_group_selection_confirmation(message, state, grp, action)
 
 @dp.message(Form.waiting_for_student_name)
 async def process_student_name_legacy(message: Message, state: FSMContext):
@@ -1673,6 +1768,8 @@ async def render_group_schedule_view(
             f"Как только расписание или лист замен появится — тебе сразу придёт оповещение! 📢"
         )
         photo_id = None
+
+    text = f"🚧 <i>Индивидуальное расписание в разработке…</i>\n\n{text}"
 
     if notice:
         text = f"{notice}\n\n{text}"
