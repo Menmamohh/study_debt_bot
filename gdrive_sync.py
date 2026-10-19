@@ -382,45 +382,59 @@ def _normalise_group_label(value: str) -> str:
 def _schedule_group_markers(path: str, modified_at: float) -> Tuple[int, int, Tuple[Tuple[str, int], ...]]:
     """Finds group labels and their vertical positions so table pages can be cropped per group."""
     try:
-        image_width = image_height = 0
+        with Image.open(path) as source:
+            original_width, original_height = source.size
+            scale = min(1.0, 1800 / max(original_width, original_height))
+            if scale < 1:
+                image = source.convert("RGB").resize(
+                    (int(original_width * scale), int(original_height * scale)),
+                    Image.Resampling.LANCZOS,
+                )
+            else:
+                image = source.convert("RGB")
+            image_buffer = io.BytesIO()
+            image.save(image_buffer, format="JPEG", quality=88)
+
         group_positions = {}
         normalized_groups = {group: _normalise_group_label(group) for group in db.COLLEGE_GROUPS}
-        for page_segmentation in ("11", "6"):
-            result = subprocess.run(
-                ["tesseract", path, "stdout", "-l", "rus+eng", "--psm", page_segmentation, "tsv"],
-                capture_output=True,
-                text=True,
-                timeout=45,
-                check=False,
-            )
-            if result.returncode != 0:
-                logger.warning("Could not locate group labels in %s (PSM %s): %s",
-                               path, page_segmentation, result.stderr.strip())
-                continue
+        result = subprocess.run(
+            ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", "11", "tsv"],
+            input=image_buffer.getvalue(),
+            capture_output=True,
+            timeout=8,
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.warning("Could not locate group labels in %s: %s", path, result.stderr.decode("utf-8", errors="replace").strip())
+            return 0, 0, ()
 
-            line_words = {}
-            for row in csv.DictReader(io.StringIO(result.stdout), delimiter="\t"):
-                if row.get("level") == "1":
-                    image_width = max(image_width, int(row.get("width") or 0))
-                    image_height = max(image_height, int(row.get("height") or 0))
-                if row.get("level") != "5" or not row.get("text", "").strip():
+        line_words = {}
+        output = result.stdout.decode("utf-8", errors="replace")
+        for row in csv.DictReader(io.StringIO(output), delimiter="\t"):
+            if row.get("level") != "5" or not row.get("text", "").strip():
+                continue
+            try:
+                if float(row.get("conf", "-1")) < 35:
                     continue
                 key = (row.get("page_num"), row.get("block_num"), row.get("par_num"), row.get("line_num"))
                 line_words.setdefault(key, []).append(row)
+            except ValueError:
+                continue
 
-            for words in line_words.values():
-                normalized_line = _normalise_group_label(" ".join(word["text"] for word in words))
-                group = next((name for name in sorted(db.COLLEGE_GROUPS, key=len, reverse=True)
-                              if normalized_groups[name] in normalized_line), None)
-                if group:
-                    top = min(int(word["top"]) for word in words)
-                    group_positions.setdefault(group, []).append(top)
+        for words in line_words.values():
+            normalized_line = _normalise_group_label(" ".join(word["text"] for word in words))
+            group = next((name for name in sorted(db.COLLEGE_GROUPS, key=len, reverse=True)
+                          if normalized_groups[name] in normalized_line), None)
+            if group:
+                top = min(int(word["top"]) for word in words)
+                group_positions.setdefault(group, []).append(int(top / scale))
 
-        # Merge both OCR layouts and use each label's upper edge as the group boundary.
+        # Use the label's upper edge as the group boundary, scaled back to the
+        # full-size source image for the final crop.
         markers = [(group, sorted(positions)[len(positions) // 2])
                    for group, positions in group_positions.items()]
         markers.sort(key=lambda marker: marker[1])
-        return image_width, image_height, tuple(markers)
+        return original_width, original_height, tuple(markers)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         logger.warning("Could not locate schedule groups in %s: %s", path, error)
         return 0, 0, ()
@@ -449,7 +463,9 @@ def _ocr_schedule_group(path: str, modified_at: float, group_name: str) -> str:
             # print and faint grid text survive recognition.
             crop = ImageOps.grayscale(crop)
             crop = ImageOps.autocontrast(crop, cutoff=1)
-            crop = crop.resize((crop.width * 2, crop.height * 2), Image.Resampling.LANCZOS)
+            upscale = min(2.0, 2200 / max(crop.width, crop.height))
+            if upscale > 1:
+                crop = crop.resize((int(crop.width * upscale), int(crop.height * upscale)), Image.Resampling.LANCZOS)
             crop = ImageEnhance.Contrast(crop).enhance(1.35)
             crop = crop.filter(ImageFilter.SHARPEN)
             buffer = io.BytesIO()
@@ -457,38 +473,31 @@ def _ocr_schedule_group(path: str, modified_at: float, group_name: str) -> str:
         # Different layouts work better for the photographed multi-column tables.
         # Select the OCR result with the strongest Tesseract confidence instead
         # of relying on a single page segmentation guess.
+        result = subprocess.run(
+            ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", "6", "tsv"],
+            input=buffer.getvalue(),
+            capture_output=True,
+            timeout=8,
+            check=False,
+        )
         candidates = []
-        for psm in (4, 6, 11):
-            result = subprocess.run(
-                ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", str(psm), "tsv"],
-                input=buffer.getvalue(),
-                capture_output=True,
-                timeout=45,
-                check=False,
-            )
-            if result.returncode != 0:
-                continue
+        if result.returncode == 0:
             words = [row for row in csv.DictReader(io.StringIO(result.stdout.decode("utf-8", errors="replace")), delimiter="\t")
                      if row.get("level") == "5" and row.get("text", "").strip()]
-            if not words:
-                continue
             confidences = [float(row["conf"]) for row in words if row.get("conf", "-1") not in ("-1", "")]
             confidence = sum(confidences) / len(confidences) if confidences else 0
-            if confidence < 38:
-                continue
-            # Preserve table row breaks instead of flattening every cell into
-            # one sentence, which made OCR output difficult to read and check.
-            lines = {}
-            for row in words:
-                key = (row.get("block_num"), row.get("par_num"), row.get("line_num"))
-                lines.setdefault(key, []).append(row["text"].strip())
-            text = "\n".join(" ".join(line) for line in lines.values())
-            candidates.append((confidence, text))
+            if words and confidence >= 38:
+                lines = {}
+                for row in words:
+                    key = (row.get("block_num"), row.get("par_num"), row.get("line_num"))
+                    lines.setdefault(key, []).append(row["text"].strip())
+                text = "\n".join(" ".join(line) for line in lines.values())
+                candidates.append((confidence, text))
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         logger.warning("Could not OCR group %s in %s: %s", group_name, path, error)
         return ""
     if not candidates:
-        logger.warning("Tesseract could not read group %s in %s", group_name, path)
+        logger.warning("Tesseract could not read group %s in %s with sufficient confidence", group_name, path)
         return ""
     return max(candidates, key=lambda candidate: candidate[0])[1].strip()
 
