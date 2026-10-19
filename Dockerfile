@@ -16,10 +16,10 @@ COPY helper_cat.png ./
 COPY assets ./assets
 
 RUN useradd --system --uid 10001 --create-home bot \
-    && mkdir -p /data /app/assets/schedule/downloads \
-    && chown -R bot:bot /data /app/assets/schedule
+    && mkdir -p /app/data /app/assets/schedule/downloads \
+    && chown -R bot:bot /app/data /app/assets/schedule
 
-ENV DB_PATH=/data/debts.db \
+ENV DB_PATH=/app/data/debts.db \
     PYTHONDONTWRITEBYTECODE=1
 USER bot
 
