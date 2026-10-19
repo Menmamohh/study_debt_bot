@@ -1451,6 +1451,16 @@ async def cb_select_group(callback: CallbackQuery, state: FSMContext):
         except Exception:
             pass
         return
+
+    if action == "change" and existing and existing.get("student_group") == data:
+        await state.clear()
+        await callback.answer("У тебя уже выбрана эта группа. Менять ничего не нужно.")
+        await safe_edit_message(
+            callback,
+            f"✅ В профиле уже выбрана группа <b>{html.escape(data)}</b>.",
+            reply_markup=kb.profile_menu_kb(),
+        )
+        return
         
     await show_group_selection_confirmation(callback, state, data, action)
 
@@ -1548,6 +1558,16 @@ async def process_custom_group(message: Message, state: FSMContext):
         
     data = await state.get_data()
     action = data.get("group_action", "verify")
+    if action == "change":
+        existing = await adb.get_user(message.from_user.id)
+        if existing and existing.get("status") == "approved" and existing.get("student_group") == grp:
+            await state.clear()
+            await show_user_screen(
+                message,
+                f"✅ В профиле уже выбрана группа <b>{html.escape(grp)}</b>. Менять ничего не нужно.",
+                reply_markup=kb.profile_menu_kb(),
+            )
+            return
     await show_group_selection_confirmation(message, state, grp, action)
 
 @dp.message(Form.waiting_for_student_name)
