@@ -1913,6 +1913,15 @@ async def cb_admin_gdrive_sync(callback: CallbackQuery, bot: Bot):
         "🔄 <i>Подключаюсь к Google Диску колледжа и проверяю свежие замены...</i>", 
         parse_mode="HTML"
     )
+    # Treat the sync progress/report as the user's current screen too. Otherwise
+    # it survives menu cleanup and remains as a permanent extra message below it.
+    await adb.set_ui_message_id(callback.from_user.id, status_msg.message_id)
+    await cleanup_user_ui_messages(
+        bot,
+        callback.from_user.id,
+        keep_message_id=status_msg.message_id,
+        extra_ids=(callback.message.message_id,),
+    )
 
     loop = asyncio.get_running_loop()
     res = await loop.run_in_executor(None, gdrive_sync.sync_drive_schedule)
