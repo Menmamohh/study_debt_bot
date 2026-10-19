@@ -16,7 +16,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_FOLDER_ID = "1Xh7j66Z7XGCLrrKxfqjlc5VJ8RcnLyQe"
 FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID", DEFAULT_FOLDER_ID)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DOWNLOADS_DIR = os.path.join(BASE_DIR, "assets", "schedule", "downloads")
+DATA_DIR = os.path.dirname(os.path.abspath(db.DB_PATH))
+DOWNLOADS_DIR = os.path.join(DATA_DIR, "schedule", "downloads")
 
 TIMEZONE = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Minsk"))
 CUTOFF_HOUR = int(os.getenv("SCHEDULE_CUTOFF_HOUR", "17"))
