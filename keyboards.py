@@ -115,17 +115,12 @@ def schedule_view_kb(
 ) -> InlineKeyboardMarkup:
     kb = [
         [
-            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sched_view_{group_name}"),
-            
+            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sched_view_{group_name}")
         ]
     ]
     if not is_user_own_group and user_own_group and user_own_group != group_name and user_own_group != "ALL":
         kb.append([
             InlineKeyboardButton(text=f"🔙 К расписанию {user_own_group}", callback_data=f"sched_view_{user_own_group}")
-        ])
-    if group_name != "ALL" and (has_general_photo or has_general_schedule):
-        kb.append([
-            InlineKeyboardButton(text="📢 Общий лист замен для всех групп", callback_data="sched_view_ALL")
         ])
     kb.append([
         InlineKeyboardButton(text="🔔 Расписание звонков", callback_data="sched_bells")
@@ -146,9 +141,6 @@ def schedule_view_kb(
 def schedule_choose_group_kb(current_group: Optional[str] = None, is_admin_user: bool = False) -> InlineKeyboardMarkup:
     kb = []
     if is_admin_user:
-        kb.append([
-            InlineKeyboardButton(text="📢 Общий лист замен (для всех групп)", callback_data="sched_view_ALL")
-        ])
         kb.append([
             InlineKeyboardButton(text="🔄 Синхронизация с Google Диском", callback_data="adm_gdrive_sync")
         ])
