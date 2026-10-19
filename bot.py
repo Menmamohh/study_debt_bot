@@ -472,7 +472,7 @@ async def show_user_screen(
     # then remove the previous bot menu so it never remains above the new one.
     if photo:
         sent = await target.answer_photo(
-            photo=photo,
+            photo=FSInputFile(photo) if isinstance(photo, str) and os.path.isfile(photo) else photo,
             caption=text,
             parse_mode=parse_mode,
             reply_markup=reply_markup,
@@ -1159,7 +1159,7 @@ async def cmd_start(message: Message, state: FSMContext):
             f"«Вообще-то, пары сами себя не отсидят!» 🐾\n\n"
             f"📅 <b>Расписание:</b> актуальные пары и замены для группы <b>{safe_group}</b>\n"
             f"🔔 <b>Звонки:</b> точное время уроков и перемен колледжа\n\n"
-            f"💡 <i>(Предметы и методички сейчас настроены для групп ТТ-36, ХК и ВД)</i>\n\n"
+            f"💡 <i>(Для групп ТТ-37, ТТ-38 и групп без настроенного трекера: чтобы он появился, открой «Полезное» → «Сообщить об ошибке» и отправь список своих предметов. После добавления они появятся в трекере.)</i>\n\n"
             f"Куда направляемся? Выбирай раздел в меню ниже 👇"
         )
     markup = kb.main_menu_kb(
@@ -1300,7 +1300,7 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
                 f"«Вообще-то, расписание само себя не проверит!» 🐾\n\n"
                 f"📅 <b>Расписание:</b> актуальные пары и замены для группы <b>{student_group}</b>\n"
                 f"🔔 <b>Звонки:</b> точное время уроков и перемен колледжа\n\n"
-                f"💡 <i>(Предметы и методички сейчас настроены для групп ТТ-36, ХК и ВД)</i>\n\n"
+                f"💡 <i>(Для групп ТТ-37, ТТ-38 и групп без настроенного трекера: чтобы он появился, открой «Полезное» → «Сообщить об ошибке» и отправь список своих предметов. После добавления они появятся в трекере.)</i>\n\n"
                 f"Выбери нужный раздел:"
             )
     else:
