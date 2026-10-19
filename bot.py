@@ -1344,6 +1344,24 @@ async def render_group_schedule_view(
         text = f"{notice}\n\n{text}"
         
     actual_bot = bot or getattr(target, "bot", None)
+    previous_ui_id = None
+    if target_chat.type == "private" and not is_callback:
+        previous_ui_id = await adb.get_ui_message_id(user_id)
+
+    async def track_schedule_screen(screen_message):
+        if target_chat.type != "private":
+            return
+        await adb.set_ui_message_id(user_id, screen_message.message_id)
+        if previous_ui_id and previous_ui_id != screen_message.message_id:
+            try:
+                await actual_bot.delete_message(chat_id=target_chat.id, message_id=previous_ui_id)
+            except Exception as error:
+                logger.debug(
+                    "Could not remove previous schedule screen %s for user %s: %s",
+                    previous_ui_id,
+                    user_id,
+                    error,
+                )
     
     if isinstance(photo_id, list):
         if is_callback:
@@ -1361,8 +1379,7 @@ async def render_group_schedule_view(
             parse_mode="HTML",
             reply_markup=markup,
         )
-        if target_chat.type == "private":
-            await adb.set_ui_message_id(user_id, screen_message.message_id)
+        await track_schedule_screen(screen_message)
     elif photo_id:
         if is_callback:
             try:
@@ -1372,8 +1389,7 @@ async def render_group_schedule_view(
             screen_message = await actual_bot.send_photo(chat_id=user_id, photo=photo_id, caption=text, parse_mode="HTML", reply_markup=markup)
         else:
             screen_message = await target.answer_photo(photo=photo_id, caption=text, parse_mode="HTML", reply_markup=markup)
-        if target_chat.type == "private":
-            await adb.set_ui_message_id(user_id, screen_message.message_id)
+        await track_schedule_screen(screen_message)
     else:
         if is_callback:
             await show_user_screen(target, text, reply_markup=markup)
