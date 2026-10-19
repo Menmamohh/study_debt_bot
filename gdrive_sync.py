@@ -313,18 +313,19 @@ def get_target_study_date(now: Optional[datetime.datetime] = None) -> Tuple[date
 
 
 def get_active_gdrive_schedule_photos(target_date: Optional[datetime.date] = None) -> List[Tuple[str, str, datetime.date]]:
-    """Возвращает список актуальных фото замен из Google Диска на целевую дату (прошедшие даты отсекаются)."""
+    """Возвращает активные листы замен и консультаций для целевой даты."""
     if target_date is None:
         target_date, _, _ = get_target_study_date()
 
     target_date_str = target_date.isoformat()
-    # Запрашиваем файлы строго для target_date или ближайшей предстоящей даты (не в прошлом!)
-    db_files = db.get_latest_gdrive_schedule_files(doc_type="replacement", min_date=target_date_str)
-    if not db_files:
-        return []
+    # У замен и консультаций собственные ближайшие даты. Забираем оба типа,
+    # иначе лист консультаций из той же папки Диска не попадает в альбом.
+    db_files = []
+    for doc_type in ("replacement", "consultations"):
+        db_files.extend(db.get_latest_gdrive_schedule_files(doc_type=doc_type, min_date=target_date_str))
 
     result = []
-    for f in db_files:
+    for f in sorted(db_files, key=lambda item: (item.get("schedule_date") or "", item.get("doc_type") or "", item.get("part_number") or 1)):
         path = f.get("local_path")
         if not path or not os.path.isfile(path):
             continue
@@ -339,8 +340,8 @@ def get_active_gdrive_schedule_photos(target_date: Optional[datetime.date] = Non
 
         part = f.get("part_number", 1)
         formatted_date = valid_until.strftime("%d.%m.%Y")
-        caption = f"Замены на {formatted_date}"
-        if part > 1:
+        caption = f"Консультации на {formatted_date}" if f.get("doc_type") == "consultations" else f"Замены на {formatted_date}"
+        if f.get("doc_type") != "consultations" and part > 1:
             caption += f" — часть {part}"
 
         result.append((path, caption, valid_until))
