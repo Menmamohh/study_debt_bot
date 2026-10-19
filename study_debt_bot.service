@@ -1,0 +1,26 @@
+[Unit]
+Description=Помощник Пятнашки Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=study-debt-bot
+Group=study-debt-bot
+WorkingDirectory=/opt/study_debt_bot
+ExecStart=/opt/study_debt_bot/venv/bin/python3 /opt/study_debt_bot/bot.py
+EnvironmentFile=/opt/study_debt_bot/.env
+Environment=DB_PATH=/var/lib/study-debt-bot/debts.db
+Environment=PYTHONDONTWRITEBYTECODE=1
+StateDirectory=study-debt-bot
+StateDirectoryMode=0750
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
