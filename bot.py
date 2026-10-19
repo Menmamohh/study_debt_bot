@@ -1427,9 +1427,11 @@ async def cb_select_group(callback: CallbackQuery, state: FSMContext):
     existing = await adb.get_user(callback.from_user.id)
     state_data = await state.get_data()
     action = state_data.get("group_action", "verify")
+    # FSM state can be lost (for example, after /start), but a verified user
+    # selecting a group is changing their profile group, not re-verifying.
     if existing and existing.get("status") == "approved" and action != "change":
-        await callback.answer("Верификация уже пройдена. Выбирай группу в разделе расписания.", show_alert=True)
-        return
+        action = "change"
+        await state.update_data(group_action=action)
     if existing and existing.get("status") == "pending" and action != "change":
         await callback.answer("Заявка уже на проверке. Повторно выбирать группу не нужно.", show_alert=True)
         return
@@ -1469,8 +1471,11 @@ async def cb_select_group(callback: CallbackQuery, state: FSMContext):
 async def cb_group_confirmation_cancel(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     action = data.get("group_action", "verify")
+    existing = await adb.get_user(callback.from_user.id)
+    if existing and existing.get("status") == "approved" and action != "change":
+        action = "change"
     await state.set_state(None)
-    await state.update_data(selected_group=None)
+    await state.update_data(group_action=action, selected_group=None)
     back_callback = "profile_menu" if action == "change" else "main_menu"
     back_label = "🔙 В профиль" if action == "change" else "🔙 Назад"
     text = "Выбери другую группу:" if action == "change" else "🎓 Выбери свою учебную группу:"
@@ -1494,6 +1499,8 @@ async def cb_group_confirmation_accept(callback: CallbackQuery, state: FSMContex
 
     user_id = callback.from_user.id
     existing = await adb.get_user(user_id)
+    if existing and existing.get("status") == "approved" and action != "change":
+        action = "change"
     if action == "change":
         if not existing or existing.get("status") != "approved":
             await state.clear()
