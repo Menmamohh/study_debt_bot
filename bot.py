@@ -684,7 +684,7 @@ class VerificationMiddleware(BaseMiddleware):
             private_callbacks = {
                 "main_menu", "debts_hub", "show_all_debts", "list_subjects",
                 "add_subject_prompt", "browse_materials_hub", "start_verify_flow", "feedback_start",
-                "useful_menu", "useful_application",
+                "useful_menu", "useful_application", "notification_open",
             }
             if callback_data in private_callbacks or callback_data.startswith(private_prefixes):
                 await event.answer("Открой личный чат с ботом для личных разделов.", show_alert=True)
@@ -802,8 +802,8 @@ async def cb_admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Form.waiting_for_broadcast)
     text = (
         "📢 <b>Новое объявление</b>\n\n"
-        "Отправь текст или фотографию с подписью. Перед рассылкой покажу предпросмотр и попрошу подтвердить отправку.\n\n"
-        "Объявление получат все подтверждённые пользователи бота. Для отмены нажми «Главное меню»."
+        "Отправь текст или фотографию с подписью. Перед публикацией покажу предпросмотр и попрошу подтвердить.\n\n"
+        "После отправки у подтверждённых пользователей появится пункт «Уведомление» в главном меню. Для отмены нажми «Главное меню»."
     )
     await show_user_screen(callback, text, reply_markup=kb.back_to_menu_kb())
 
@@ -868,38 +868,15 @@ async def cb_admin_broadcast_send(callback: CallbackQuery, state: FSMContext, bo
         return
 
     await state.clear()
-    await callback.message.edit_text("📢 <b>Отправляю объявление…</b>", parse_mode="HTML", reply_markup=None)
-    sent_count = 0
-    failed_count = 0
+    await callback.message.edit_text("📢 <b>Публикую объявление в разделе уведомлений…</b>", parse_mode="HTML", reply_markup=None)
+    await adb.publish_announcement(source_chat_id, source_message_id)
     users = await adb.get_verified_users()
-    for recipient in users:
-        user_id = recipient["user_id"]
-        if user_id == callback.from_user.id:
-            continue
-        try:
-            await bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=source_chat_id,
-                message_id=source_message_id,
-            )
-            sent_count += 1
-        except TelegramRetryAfter as error:
-            await asyncio.sleep(error.retry_after)
-            try:
-                await bot.copy_message(chat_id=user_id, from_chat_id=source_chat_id, message_id=source_message_id)
-                sent_count += 1
-            except Exception:
-                failed_count += 1
-                logger.exception("Could not deliver announcement to user %s", user_id)
-        except Exception:
-            failed_count += 1
-            logger.exception("Could not deliver announcement to user %s", user_id)
-        await asyncio.sleep(0.05)
+    recipient_count = sum(1 for recipient in users if recipient["user_id"] != callback.from_user.id)
 
     report = (
-        "✅ <b>Рассылка завершена</b>\n\n"
-        f"Доставлено: <b>{sent_count}</b>\n"
-        f"Не удалось отправить: <b>{failed_count}</b>"
+        "✅ <b>Объявление опубликовано</b>\n\n"
+        f"Уведомление появится в главном меню у <b>{recipient_count}</b> подтверждённых пользователей.\n"
+        "Оно будет отображаться, пока пользователь его не откроет."
     )
     await callback.message.edit_text(
         report,
@@ -1013,6 +990,7 @@ async def cmd_start(message: Message, state: FSMContext):
     student_group = user_record.get("student_group") if user_record else None
     pending_count = (await adb.count_pending_materials() + await adb.count_pending_users()) if is_adm else 0
     has_study = await user_has_study_features(message.from_user, user_record)
+    has_unread_notification = bool(await adb.get_unread_announcement(user_id)) if is_verified else False
 
     # Автоматически загружаем предметы семестра для поддерживаемых групп.
     if has_study:
@@ -1050,7 +1028,8 @@ async def cmd_start(message: Message, state: FSMContext):
         pending_count=pending_count,
         is_verified=is_verified,
         student_group=student_group,
-        is_private_chat=message.chat.type == "private"
+        is_private_chat=message.chat.type == "private",
+        has_unread_notification=has_unread_notification,
     )
     
     await show_user_screen(
@@ -1145,6 +1124,7 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
     verification_pending = bool(user_record and user_record.get("status") == "pending")
     student_group = user_record.get("student_group") if user_record else None
     pending_count = (await adb.count_pending_materials() + await adb.count_pending_users()) if is_adm else 0
+    has_unread_notification = bool(await adb.get_unread_announcement(user_id)) if is_verified else False
     
     markup = kb.main_menu_kb(
         is_admin_user=is_adm,
@@ -1153,6 +1133,7 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
         student_group=student_group,
         is_private_chat=callback.message.chat.type == "private",
         verification_pending=verification_pending,
+        has_unread_notification=has_unread_notification,
     )
     
     group_str = f" [<code>{student_group}</code>]" if student_group else ""
@@ -2126,6 +2107,39 @@ async def cb_useful_application(callback: CallbackQuery, state: FSMContext):
         keep_message_ids=(photo_message.message_id, file_message.message_id),
         extra_ids=(callback.message.message_id,),
     )
+
+
+@dp.callback_query(F.data == "notification_open")
+async def cb_notification_open(callback: CallbackQuery):
+    if callback.message.chat.type != "private":
+        await callback.answer("Открой уведомление в личном чате с ботом.", show_alert=True)
+        return
+    announcement = await adb.get_unread_announcement(callback.from_user.id)
+    if not announcement:
+        await callback.answer("Новых уведомлений пока нет.", show_alert=True)
+        return
+
+    try:
+        copied = await callback.bot.copy_message(
+            chat_id=callback.from_user.id,
+            from_chat_id=announcement["source_chat_id"],
+            message_id=announcement["source_message_id"],
+            reply_markup=kb.notification_message_kb(),
+        )
+    except Exception:
+        logger.exception("Could not open announcement %s for user %s", announcement["id"], callback.from_user.id)
+        await callback.answer("Не удалось открыть уведомление. Сообщи администратору.", show_alert=True)
+        return
+
+    await adb.mark_announcement_read(callback.from_user.id, announcement["id"])
+    await adb.set_ui_message_id(callback.from_user.id, copied.message_id)
+    await cleanup_user_ui_messages(
+        callback.bot,
+        callback.from_user.id,
+        keep_message_id=copied.message_id,
+        extra_ids=(callback.message.message_id,),
+    )
+    await callback.answer()
 
 @dp.callback_query(F.data == "debts_hub")
 async def cb_debts_hub(callback: CallbackQuery, state: FSMContext):

@@ -9,7 +9,7 @@ def subject_callback_token(subject_name: str) -> str:
 def _short_label(value: str, max_length: int = 48) -> str:
     return value if len(value) <= max_length else value[:max_length - 1] + "…"
 
-def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verified: bool = True, student_group: Optional[str] = None, is_private_chat: bool = True, verification_pending: bool = False) -> InlineKeyboardMarkup:
+def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verified: bool = True, student_group: Optional[str] = None, is_private_chat: bool = True, verification_pending: bool = False, has_unread_notification: bool = False) -> InlineKeyboardMarkup:
     kb = []
 
     # Личный трекер, профиль и админ-раздел доступны только в личном чате.
@@ -52,6 +52,9 @@ def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verifie
             ],
             [InlineKeyboardButton(text="💡 Полезное", callback_data="useful_menu")]
         ])
+
+    if has_unread_notification:
+        kb.append([InlineKeyboardButton(text="🔔 Уведомление", callback_data="notification_open")])
     
     if is_admin_user and is_private_chat:
         badge = f" (⏳ {pending_count})" if pending_count > 0 else ""
@@ -88,6 +91,11 @@ def useful_hub_kb() -> InlineKeyboardMarkup:
 def useful_application_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 К разделу «Полезное»", callback_data="useful_menu")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+
+def notification_message_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
 

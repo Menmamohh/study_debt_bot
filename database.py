@@ -141,6 +141,23 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS announcements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_chat_id INTEGER NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS announcement_reads (
+                user_id INTEGER NOT NULL,
+                announcement_id INTEGER NOT NULL,
+                read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, announcement_id),
+                FOREIGN KEY (announcement_id) REFERENCES announcements(id) ON DELETE CASCADE
+            )
+        """)
         cursor.executescript("""
             CREATE INDEX IF NOT EXISTS idx_subjects_user ON subjects(user_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_user_subject ON tasks(user_id, subject_id);
@@ -917,6 +934,37 @@ def set_admin_id(admin_id: int):
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_id', ?)", (str(admin_id),))
+        conn.commit()
+
+def publish_announcement(source_chat_id: int, source_message_id: int) -> int:
+    """Persists an admin broadcast as the current in-menu notification."""
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "INSERT INTO announcements (source_chat_id, source_message_id) VALUES (?, ?)",
+            (source_chat_id, source_message_id),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+def get_unread_announcement(user_id: int) -> Optional[Dict]:
+    """Returns the oldest announcement not yet opened by the user."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT a.id, a.source_chat_id, a.source_message_id, a.created_at "
+            "FROM announcements AS a "
+            "LEFT JOIN announcement_reads AS r "
+            "ON r.announcement_id = a.id AND r.user_id = ? "
+            "WHERE r.announcement_id IS NULL ORDER BY a.id ASC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+def mark_announcement_read(user_id: int, announcement_id: int):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO announcement_reads (user_id, announcement_id) VALUES (?, ?)",
+            (user_id, announcement_id),
+        )
         conn.commit()
 
 # --- Расписание занятий (Пятнашка) ---
