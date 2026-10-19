@@ -25,7 +25,6 @@ def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verifie
             kb.append([
                 InlineKeyboardButton(text="🔐 Выбрать группу для доступа", callback_data="start_verify_flow")
             ])
-        kb.append([InlineKeyboardButton(text="💡 Полезное", callback_data="useful_menu")])
         return InlineKeyboardMarkup(inline_keyboard=kb)
         
     has_study_features = (
