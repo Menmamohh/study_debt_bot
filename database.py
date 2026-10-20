@@ -1,4 +1,5 @@
 import sqlite3
+import hashlib
 import os
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
@@ -1655,3 +1656,33 @@ def get_upcoming_gdrive_schedule_files(min_date: str, doc_type: Optional[str] = 
 
 
 
+
+
+def get_verified_user_groups() -> List[Dict]:
+    """Categories derived from current approved records, including custom groups."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT COALESCE(student_group, '') AS group_name, COUNT(*) AS total
+            FROM users WHERE status = 'approved'
+            GROUP BY COALESCE(student_group, '') ORDER BY group_name
+        """).fetchall()
+        return [dict(row, token=hashlib.sha256(row['group_name'].encode('utf-8')).hexdigest()[:32])
+                for row in rows]
+
+
+def get_verified_group_page(group_name: str, page: int, page_size: int = 10) -> Dict:
+    """Read count and a bounded page in one SQLite snapshot."""
+    page_size = max(1, page_size)
+    with get_connection() as conn:
+        conn.execute('BEGIN')
+        total = conn.execute("""
+            SELECT COUNT(*) FROM users
+            WHERE status = 'approved' AND COALESCE(student_group, '') = ?
+        """, (group_name,)).fetchone()[0]
+        page = min(max(0, page), max(0, (total - 1) // page_size))
+        rows = conn.execute("""
+            SELECT user_id, student_name, username FROM users
+            WHERE status = 'approved' AND COALESCE(student_group, '') = ?
+            ORDER BY user_id LIMIT ? OFFSET ?
+        """, (group_name, page_size, page * page_size)).fetchall()
+        return {'total': total, 'page': page, 'users': [dict(row) for row in rows]}
