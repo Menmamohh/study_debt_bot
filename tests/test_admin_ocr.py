@@ -66,8 +66,8 @@ class AdminOcrTests(unittest.TestCase):
                 self.assertEqual(get_files.call_args.kwargs, {"doc_type": "replacement"})
 
             self.assertIn("Пара: технология", rendered["text"])
-            self.assertIn("не публикуется студентам", rendered["text"])
-            self.assertIn("Найдены группы: ТТ-36", rendered["text"])
+            self.assertIn("Проверка для администратора", rendered["text"])
+            self.assertNotIn("Найдены группы", rendered["text"])
             self.assertIn("2026-10-20", rendered["text"])
             self.assertEqual(rendered["photo"]["chat_id"], 99)
             buttons = [button.callback_data for row in rendered["markup"].inline_keyboard for button in row]
