@@ -22,6 +22,9 @@ import database as db
 
 logger = logging.getLogger(__name__)
 
+# OCR runs in a worker thread; allow the server time to read a photographed table.
+OCR_TIMEOUT_SECONDS = 60
+
 DEFAULT_FOLDER_ID = "1Xh7j66Z7XGCLrrKxfqjlc5VJ8RcnLyQe"
 FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID", DEFAULT_FOLDER_ID)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -425,7 +428,7 @@ def _ocr_schedule_image(path: str, modified_at: float) -> str:
             ["tesseract", path, "stdout", "-l", "rus+eng", "--psm", "6"],
             capture_output=True,
             text=True,
-            timeout=45,
+            timeout=OCR_TIMEOUT_SECONDS,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -470,7 +473,7 @@ def _schedule_group_markers(path: str, modified_at: float) -> Tuple[int, int, Tu
             ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", "6", "tsv"],
             input=image_buffer.getvalue(),
             capture_output=True,
-            timeout=8,
+            timeout=OCR_TIMEOUT_SECONDS,
             check=False,
         )
         if result.returncode != 0:
@@ -546,7 +549,7 @@ def _ocr_schedule_group(path: str, modified_at: float, group_name: str) -> str:
             ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", "6", "tsv"],
             input=buffer.getvalue(),
             capture_output=True,
-            timeout=8,
+            timeout=OCR_TIMEOUT_SECONDS,
             check=False,
         )
         candidates = []
