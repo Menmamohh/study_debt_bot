@@ -1233,6 +1233,32 @@ async def cb_admin_review_queue(callback: CallbackQuery, bot: Bot):
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
     await callback.answer("Очередь загружена!")
 
+def main_menu_description(student_group, summary, markup):
+    """Describe only the sections actually present in the user's keyboard."""
+    safe_group = html.escape((student_group or '')[:40])
+    group_label = f" [{safe_group}]" if safe_group else ''
+    lines = [f"☝️🤓 <b>ПОМОЩНИК ПЯТНАШКИ</b> 🎓{group_label}",
+             '<i>УО «БГК им. А.Е. Ларина»</i>', '']
+    if summary is not None:
+        lines.extend([f"📊 <b>Твои долги:</b> {summary['total'] - summary['pending']} из {summary['total']} сдано ({summary['percent']}%)", ''])
+    descriptions = {
+        'schedule_menu': '📅 <b>Расписание занятий</b> — общие листы замен и консультаций, история публикаций и звонки.',
+        'debts_hub': '📝 <b>Трекер долгов и работ</b> — предметы, отметки о сдаче, база методичек и решений, добавление материалов.',
+        'useful_menu': '💡 <b>Полезное</b> — сообщить об ошибке, посмотреть пример заявления и скачать PDF для печати.',
+        'profile_menu': '👤 <b>Профиль</b> — твой Telegram ID, выбранная группа и её изменение.',
+        'notification_open': '🔔 <b>Уведомление</b> — непрочитанное объявление администратора.',
+        'admin_panel': '👑 <b>Админ-панель</b> — заявки, пользователи, публикации, объявления и ответы на отчёты.',
+    }
+    for row in markup.inline_keyboard:
+        for button in row:
+            if button.callback_data in descriptions:
+                lines.extend([descriptions[button.callback_data], ''])
+    if summary is None:
+        lines.extend(['Чтобы добавить трекер для своей группы, отправь список предметов через «Полезное → Сообщить об ошибке».', ''])
+    lines.append('Выбери нужный раздел:')
+    return '\n'.join(lines)
+
+
 # --- Команда /start ---
 @dp.message(CommandStart())
 @dp.message(F.text.lower().in_({"начать", "🚀 начать", "старт", "start", "/start", "меню", "главное меню"}))
@@ -1319,31 +1345,7 @@ async def cmd_start(message: Message, state: FSMContext):
     if has_study:
         await adb.seed_default_subjects(user_id, student_group=student_group)
     
-    safe_group = html.escape(student_group or "")
-    group_str = f" [<code>{safe_group}</code>]" if student_group else ""
-    if has_study:
-        summary = await adb.get_all_debts_summary(user_id)
-        text = (
-            f"☝️🤓 <b>ПОМОЩНИК ПЯТНАШКИ</b> 🎓{group_str}\n"
-            f"<i>УО «БГК им. А.Е. Ларина»</i>\n\n"
-            f"«Вообще-то, пары сами себя не отсидят, а лабы и курсовые сами себя не закроют!» 🐾\n\n"
-            f"📅 <b>Расписание:</b> свежие пары и замены колледжа\n"
-            f"📝 <b>Трекер долгов и работ:</b> предметы, долги и учебные материалы\n"
-            f"💡 <b>Полезное:</b> помощь и важные материалы\n\n"
-            f"📊 <b>Твоя зачётка:</b>\n"
-            f"• Активных долгов: <b>{summary['pending']}</b> из {summary['total']}\n"
-            f"• Прогресс сдачи: <code>[{summary['bar']}]</code> <b>{summary['percent']}%</b>\n\n"
-            f"Куда направляемся? Выбирай раздел в меню ниже 👇"
-        )
-    else:
-        text = (
-            f"☝️🤓 <b>ПОМОЩНИК ПЯТНАШКИ</b> 🎓{group_str}\n"
-            f"<i>УО «БГК им. А.Е. Ларина»</i>\n\n"
-            f"«Вообще-то, пары сами себя не отсидят!» 🐾\n\n"
-            f"📅 <b>Расписание:</b> актуальные пары и замены для группы <b>{safe_group}</b>\n\n"
-            f"💡 <i>(Для групп ТТ-37, ТТ-38 и групп без настроенного трекера: чтобы он появился, открой «Полезное» → «Сообщить об ошибке» и отправь список своих предметов. После добавления они появятся в трекере.)</i>\n\n"
-            f"Куда направляемся? Выбирай раздел в меню ниже 👇"
-        )
+    summary = await adb.get_all_debts_summary(user_id) if has_study else None
     markup = kb.main_menu_kb(
         is_admin_user=is_adm, 
         pending_count=pending_count,
@@ -1353,6 +1355,7 @@ async def cmd_start(message: Message, state: FSMContext):
         has_unread_notification=has_unread_notification,
     )
     
+    text = main_menu_description(student_group, summary, markup)
     await show_user_screen(
         message,
         text,
@@ -1463,28 +1466,10 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
         has_unread_notification=has_unread_notification,
     )
     
-    group_str = f" [<code>{student_group}</code>]" if student_group else ""
     has_study = await user_has_study_features(callback.from_user, user_record)
     if is_verified:
-        if has_study:
-            summary = await adb.get_all_debts_summary(user_id)
-            grp_label = f" ({student_group})" if student_group else ""
-            text = (
-                f"☝️🤓 <b>ПОМОЩНИК ПЯТНАШКИ</b> 🎓{group_str}\n"
-                f"<i>УО «БГК им. А.Е. Ларина»</i>\n\n"
-                f"«Вообще-то, пора закрывать долги и проверять расписание!» 🐾\n\n"
-                f"📊 <b>Твои долги{grp_label}:</b> <b>{summary['total'] - summary['pending']}</b> из {summary['total']} сдано (<code>{summary['percent']}%</code>)\n\n"
-                f"Выбери нужный раздел:"
-            )
-        else:
-            text = (
-                f"☝️🤓 <b>ПОМОЩНИК ПЯТНАШКИ</b> 🎓{group_str}\n"
-                f"<i>УО «БГК им. А.Е. Ларина»</i>\n\n"
-                f"«Вообще-то, расписание само себя не проверит!» 🐾\n\n"
-                f"📅 <b>Расписание:</b> актуальные пары и замены для группы <b>{student_group}</b>\n\n"
-                f"💡 <i>(Для групп ТТ-37, ТТ-38 и групп без настроенного трекера: чтобы он появился, открой «Полезное» → «Сообщить об ошибке» и отправь список своих предметов. После добавления они появятся в трекере.)</i>\n\n"
-                f"Выбери нужный раздел:"
-            )
+        summary = await adb.get_all_debts_summary(user_id) if has_study else None
+        text = main_menu_description(student_group, summary, markup)
     else:
         if verification_pending:
             text = (
