@@ -86,3 +86,17 @@ class GeminiTests(unittest.TestCase):
             with self.assertRaisesRegex(gemini.GeminiError, 'недействителен') as result:
                 gemini._gemini_json_request(gemini.urllib.request.Request('https://example.invalid'), 'Доступ', 20)
             self.assertNotIn('secret', str(result.exception))
+
+    def test_all_groups_are_split_and_unknown_groups_rejected(self):
+        group = dict(self.data(), group_name='ТТ-36')
+        response = {'candidates': [{'finishReason': 'STOP', 'content': {'parts': [
+            {'text': json.dumps({'groups': [group], 'uncertainties': []})}]}}]}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'photo.jpg'; path.write_bytes(b'photo')
+            with patch.dict(os.environ, {'GEMINI_API_KEY': 'secret'}), patch.object(
+                    gemini, '_gemini_json_request', return_value=response):
+                result = gemini.read_schedule([path], None)
+                self.assertEqual(list(result['groups']), ['ТТ-36'])
+                group['group_name'] = 'Выдуманная группа'
+                response['candidates'][0]['content']['parts'][0]['text'] = json.dumps({'groups': [group]})
+                with self.assertRaises(gemini.GeminiError): gemini.read_schedule([path], None)
