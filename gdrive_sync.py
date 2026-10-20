@@ -456,21 +456,31 @@ def _schedule_group_markers(path: str, modified_at: float) -> Tuple[int, int, Tu
     try:
         with Image.open(path) as source:
             original_width, original_height = source.size
-            scale = min(1.0, 1800 / max(original_width, original_height))
-            if scale < 1:
-                image = source.convert("RGB").resize(
-                    (int(original_width * scale), int(original_height * scale)),
-                    Image.Resampling.LANCZOS,
-                )
-            else:
-                image = source.convert("RGB")
+            # Read just the group column, independently of subjects/teachers.
+            # A narrow sparse column is much easier to segment than the whole table.
+            column = ImageOps.grayscale(source.crop((0, 0, int(original_width * 0.19), original_height)))
+            column = ImageOps.autocontrast(column, cutoff=1)
+            pixels = column.load()
+            # Remove long table rules; short strokes and hyphens stay intact.
+            horizontal = [y for y in range(column.height)
+                          if sum(pixels[x, y] < 120 for x in range(column.width)) > column.width * 0.55]
+            vertical = [x for x in range(column.width)
+                        if sum(pixels[x, y] < 120 for y in range(column.height)) > column.height * 0.45]
+            for y in horizontal:
+                for x in range(column.width):
+                    pixels[x, y] = 255
+            for x in vertical:
+                for y in range(column.height):
+                    pixels[x, y] = 255
+            scale = 3.0
+            image = column.resize((column.width * 3, column.height * 3), Image.Resampling.LANCZOS)
             image_buffer = io.BytesIO()
-            image.save(image_buffer, format="JPEG", quality=88)
+            image.save(image_buffer, format="PNG")
 
         group_positions = {}
         normalized_groups = {group: _normalise_group_label(group) for group in db.COLLEGE_GROUPS}
         result = subprocess.run(
-            ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", "6", "tsv"],
+            ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", "11", "tsv"],
             input=image_buffer.getvalue(),
             capture_output=True,
             timeout=OCR_TIMEOUT_SECONDS,
@@ -486,7 +496,7 @@ def _schedule_group_markers(path: str, modified_at: float) -> Tuple[int, int, Tu
             if row.get("level") != "5" or not row.get("text", "").strip():
                 continue
             try:
-                if float(row.get("conf", "-1")) < 35:
+                if float(row.get("conf", "-1")) < 15:
                     continue
                 key = (row.get("page_num"), row.get("block_num"), row.get("par_num"), row.get("line_num"))
                 line_words.setdefault(key, []).append(row)
@@ -496,7 +506,7 @@ def _schedule_group_markers(path: str, modified_at: float) -> Tuple[int, int, Tu
         for words in line_words.values():
             normalized_line = _normalise_group_label(" ".join(word["text"] for word in words))
             group = next((name for name in sorted(db.COLLEGE_GROUPS, key=len, reverse=True)
-                          if normalized_groups[name] in normalized_line), None)
+                          if normalized_groups[name] == normalized_line), None)
             if group:
                 top = min(int(word["top"]) for word in words)
                 group_positions.setdefault(group, []).append(int(top / scale))
@@ -522,13 +532,19 @@ def _ocr_schedule_group(path: str, modified_at: float, group_name: str) -> str:
         return ""
 
     top = markers[group_index][1]
-    bottom = height if group_index + 1 == len(markers) else markers[group_index + 1][1]
+    bottom = height if group_index + 1 == len(markers) else markers[group_index + 1][1] - 4
     try:
         with Image.open(path) as image:
-            # Keep the group heading and the first table row in frame; OCR's
-            # detected baseline can otherwise cut the heading off completely.
+            # Stop the last group's block at the table edge, before signatures.
+            if group_index + 1 == len(markers):
+                grey = ImageOps.grayscale(image)
+                rules = [y for y in range(top + 5, image.height)
+                         if sum(value < 120 for value in grey.crop((0, y, image.width, y + 1)).getdata())
+                         > image.width * 0.60]
+                if rules:
+                    bottom = rules[-1] + 2
             crop = image.convert("RGB").crop(
-                (0, max(0, top - 24), image.width, min(image.height, bottom))
+                (0, max(0, top - 4), image.width, min(image.height, bottom))
             )
             # Drive sheets are phone photos of tightly ruled tables. Enlarge and
             # normalize the selected group's block before OCR so small Cyrillic
