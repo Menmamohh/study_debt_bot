@@ -884,6 +884,12 @@ async def cb_admin_ocr_mode(callback: CallbackQuery):
 
 async def show_gemini_schedule_check(callback, files, group_name):
     try:
+        await show_user_screen(callback, "⏳ Проверяю доступ к Gemini без отправки фото…",
+                               reply_markup=kb.admin_ocr_result_kb())
+        model = await asyncio.to_thread(gemini_schedule.check_connection)
+        await show_user_screen(callback,
+                               f"✅ Доступ к {html.escape(model)} подтверждён. Распознаю фото…",
+                               reply_markup=kb.admin_ocr_result_kb())
         result = await asyncio.to_thread(
             gemini_schedule.read_schedule, [item["local_path"] for item in files], group_name
         )
