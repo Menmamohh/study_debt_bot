@@ -64,20 +64,9 @@ def main_menu_kb(is_admin_user: bool = False, pending_count: int = 0, is_verifie
 
 def debts_hub_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📚 Мои предметы и работы", callback_data="list_subjects")
-        ],
-        [
-            InlineKeyboardButton(text="📊 Показать все долги списком", callback_data="show_all_debts")
-        ],
-        [
-            InlineKeyboardButton(text="➕ Добавить свой предмет", callback_data="add_subject_prompt")
-        ],
-        [InlineKeyboardButton(text="📖 База методичек и решений", callback_data="browse_materials_hub")],
-        [InlineKeyboardButton(text="📤 Добавить методичку или решение", callback_data="quick_upload_material")],
-        [
-            InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")
-        ]
+        [InlineKeyboardButton(text="📚 Мои работы", callback_data="list_subjects")],
+        [InlineKeyboardButton(text="📖 Методички и решения", callback_data="browse_materials_hub")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
 
 def useful_hub_kb() -> InlineKeyboardMarkup:
@@ -100,7 +89,7 @@ def notification_message_kb() -> InlineKeyboardMarkup:
 
 def back_to_debts_hub_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 К трекеру долгов", callback_data="debts_hub")],
+        [InlineKeyboardButton(text="🔙 К «Моей учёбе»", callback_data="debts_hub")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
     ])
 
@@ -221,18 +210,20 @@ def subjects_list_kb(subjects: List[Dict]) -> InlineKeyboardMarkup:
     kb = []
     for s in subjects:
         pending = s["pending_tasks"]
-        status_icon = "🔴" if pending > 0 else "🟢"
-        text = _short_label(f"{status_icon} {s['name']} (долгов: {pending})")
+        status_icon = "🔴" if pending > 0 else "⚪" if s.get("total_tasks", 0) == 0 else "✅"
+        text = _short_label(f"{status_icon} {s['name']} (не сдано: {pending})")
         kb.append([InlineKeyboardButton(text=text, callback_data=f"open_sub_{s['id']}")])
     
+    kb.append([InlineKeyboardButton(text="📊 Все долги", callback_data="show_all_debts")])
     kb.append([
         InlineKeyboardButton(text="➕ Добавить предмет", callback_data="add_subject_prompt")
     ])
     kb.append([
-        InlineKeyboardButton(text="🔙 К трекеру долгов", callback_data="debts_hub"),
+        InlineKeyboardButton(text="🔙 К «Моей учёбе»", callback_data="debts_hub"),
         InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")
     ])
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
 
 def subject_tasks_kb(
     subject_id: int,
@@ -274,7 +265,9 @@ def subject_tasks_kb(
         InlineKeyboardButton(text="🗑️ Удалить предмет", callback_data=f"confirm_del_sub_{subject_id}"),
         InlineKeyboardButton(text="🔙 К предметам", callback_data="list_subjects")
     ])
+    kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
 
 def materials_list_kb(
     task_id: int,
@@ -297,12 +290,14 @@ def materials_list_kb(
             kb.append(controls)
         
     kb.append([
-        InlineKeyboardButton(text="📤 Предложить методичку / решение", callback_data=f"upload_mat_{task_id}_{subject_id}")
+        InlineKeyboardButton(text="📤 Отправить свой материал", callback_data=f"upload_mat_{task_id}_{subject_id}")
     ])
     kb.append([
         InlineKeyboardButton(text="🔙 Назад к работам", callback_data=f"open_sub_{subject_id}_{page}")
     ])
+    kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
 
 def choose_material_type_kb(task_id: int, subject_id: int) -> InlineKeyboardMarkup:
     kb = [
@@ -314,7 +309,9 @@ def choose_material_type_kb(task_id: int, subject_id: int) -> InlineKeyboardMark
             InlineKeyboardButton(text="❌ Отмена", callback_data=f"view_mat_{task_id}_{subject_id}")
         ]
     ]
+    kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
 
 def admin_verify_kb(material_id: int) -> InlineKeyboardMarkup:
     kb = [
@@ -520,8 +517,10 @@ def debt_tasks_page_kb(page: int, total: int, page_size: int = 25) -> InlineKeyb
     controls = _page_controls("show_all_debts", page, total, page_size)
     if controls:
         rows.append(controls)
-    rows.append([InlineKeyboardButton(text="🔙 К трекеру долгов", callback_data="debts_hub")])
+    rows.append([InlineKeyboardButton(text="🔙 К моим работам", callback_data="list_subjects")])
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 def confirm_delete_subject_kb(subject_id: int) -> InlineKeyboardMarkup:
     kb = [
@@ -532,12 +531,16 @@ def confirm_delete_subject_kb(subject_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="❌ Отмена", callback_data=f"open_sub_{subject_id}")
         ]
     ]
+    kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
 
 def back_to_subject_kb(subject_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад к работам", callback_data=f"open_sub_{subject_id}")]
+        [InlineKeyboardButton(text="🔙 Назад к работам", callback_data=f"open_sub_{subject_id}")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
     ])
+
 
 def back_to_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -548,10 +551,12 @@ def quick_subjects_select_kb(subjects: List[Dict]) -> InlineKeyboardMarkup:
     kb = []
     for s in subjects:
         kb.append([InlineKeyboardButton(text=_short_label(f"📚 {s['name']}"), callback_data=f"quick_sub_{s['id']}")])
+    kb.append([InlineKeyboardButton(text="🔙 К методичкам и решениям", callback_data="browse_materials_hub")])
     kb.append([
         InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")
     ])
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
 
 def quick_tasks_select_kb(
     subject_id: int, tasks: List[Dict], page: int = 0, total: Optional[int] = None, page_size: int = 25
@@ -569,7 +574,9 @@ def quick_tasks_select_kb(
     kb.append([
         InlineKeyboardButton(text="🔙 К выбору предмета", callback_data="quick_upload_material")
     ])
+    kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
 
 def material_sent_success_kb(subject_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -580,8 +587,10 @@ def material_sent_success_kb(subject_id: int) -> InlineKeyboardMarkup:
 def text_only_or_cancel_kb(task_id: int, subject_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Сохранить только этот текст (без фото)", callback_data=f"save_text_mat_{task_id}_{subject_id}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu")]
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"view_mat_{task_id}_{subject_id}")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
     ])
+
 
 def materials_hub_kb(subjects_with_counts: List[Dict]) -> InlineKeyboardMarkup:
     kb = []
@@ -594,12 +603,14 @@ def materials_hub_kb(subjects_with_counts: List[Dict]) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=_short_label(f"{icon} {name}{badge}"), callback_data=f"b_sub_{subject_callback_token(name)}")
         ])
     kb.append([
-        InlineKeyboardButton(text="📤 Добавить методичку или решение", callback_data="quick_upload_material")
+        InlineKeyboardButton(text="📤 Отправить свой материал", callback_data="quick_upload_material")
     ])
+    kb.append([InlineKeyboardButton(text="🔙 К «Моей учёбе»", callback_data="debts_hub")])
     kb.append([
         InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")
     ])
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
 
 def subject_materials_view_kb(subject_name: str, materials: List[Dict]) -> InlineKeyboardMarkup:
     kb = []
@@ -614,7 +625,7 @@ def subject_materials_view_kb(subject_name: str, materials: List[Dict]) -> Inlin
             InlineKeyboardButton(text=btn_text, callback_data=f"dl_mat_{m['id']}")
         ])
     kb.append([
-        InlineKeyboardButton(text="📤 Добавить материал к этому предмету", callback_data=f"quick_sub_name_{subject_callback_token(subject_name)}")
+        InlineKeyboardButton(text="📤 Отправить свой материал", callback_data=f"quick_sub_name_{subject_callback_token(subject_name)}")
     ])
     kb.append([
         InlineKeyboardButton(text="🔙 К списку предметов", callback_data="browse_materials_hub"),
@@ -688,3 +699,10 @@ def feedback_reply_kb(token: str, preview: bool = False, can_send: bool = True):
         rows.append([InlineKeyboardButton(text="✏️ Изменить", callback_data=f"fbr_edit_{token}")])
     rows.append([InlineKeyboardButton(text="Отмена", callback_data=f"fbr_cancel_{token}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def study_back_kb(callback_data: str = "list_subjects", label: str = "🔙 К моим работам") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=label, callback_data=callback_data)],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])

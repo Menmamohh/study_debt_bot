@@ -61,6 +61,9 @@ class BotHandlerTests(unittest.TestCase):
         rendered = {}
 
         class FakeMessage:
+            chat = SimpleNamespace(type="private")
+            message_id = 1
+
             async def edit_text(self, text, **kwargs):
                 rendered["text"] = text
                 rendered.update(kwargs)
@@ -195,6 +198,9 @@ class BotHandlerTests(unittest.TestCase):
         rendered = {}
 
         class FakeMessage:
+            chat = SimpleNamespace(type="private")
+            message_id = 1
+
             async def edit_text(self, text, **kwargs):
                 rendered["text"] = text
                 rendered.update(kwargs)
@@ -227,6 +233,9 @@ class BotHandlerTests(unittest.TestCase):
         rendered = {}
 
         class FakeMessage:
+            chat = SimpleNamespace(type="private")
+            message_id = 1
+
             async def edit_text(self, text, **kwargs):
                 rendered["text"] = text
                 rendered.update(kwargs)
@@ -243,12 +252,12 @@ class BotHandlerTests(unittest.TestCase):
             pass
 
         asyncio.run(bot.cb_debts_hub(FakeCallback(), state=SimpleNamespace(clear=fake_clear)))
-        self.assertIn("Трекер долгов и учебных работ (ХК-37)", rendered["text"])
+        self.assertIn("Моя учёба", rendered["text"])
 
         rendered.clear()
         FakeCallback.data = "browse_materials_hub"
         asyncio.run(bot.cb_browse_materials_hub(FakeCallback(), state=SimpleNamespace(clear=fake_clear)))
-        self.assertIn("База методичек и готовых решений (ХК-37)", rendered["text"])
+        self.assertIn("Методички и решения (ХК-37)", rendered["text"])
 
     def test_stale_admin_material_delete_callback_is_rejected(self):
         user_id = 10

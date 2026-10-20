@@ -694,7 +694,7 @@ class VerificationMiddleware(BaseMiddleware):
             private_prefixes = (
                 "open_sub_", "toggle_t_", "view_mat_", "dl_mat_", "add_task_prompt_",
                 "confirm_del_sub_", "del_sub_", "b_sub_", "quick_", "upload_mat_",
-                "set_mat_type_", "save_text_mat_", "adm_",
+                "set_mat_type_", "save_text_mat_", "show_all_debts_", "adm_",
             )
             private_callbacks = {
                 "main_menu", "debts_hub", "show_all_debts", "list_subjects",
@@ -1243,7 +1243,7 @@ def main_menu_description(student_group, summary, markup):
         lines.extend([f"📊 <b>Твои долги:</b> {summary['total'] - summary['pending']} из {summary['total']} сдано ({summary['percent']}%)", ''])
     descriptions = {
         'schedule_menu': '📅 <b>Расписание занятий</b> — общие листы замен и консультаций, история публикаций и звонки.',
-        'debts_hub': '📝 <b>Трекер долгов и работ</b> — предметы, отметки о сдаче, база методичек и решений, добавление материалов.',
+        'debts_hub': '📝 <b>Трекер долгов и работ</b> — «Мои работы» для предметов и отметок о сдаче; «Методички и решения» для поиска и отправки материалов.',
         'useful_menu': '💡 <b>Полезное</b> — сообщить об ошибке, посмотреть пример заявления и скачать PDF для печати.',
         'profile_menu': '👤 <b>Профиль</b> — твой Telegram ID, выбранная группа и её изменение.',
         'notification_open': '🔔 <b>Уведомление</b> — непрочитанное объявление администратора.',
@@ -2724,34 +2724,31 @@ async def cb_debts_hub(callback: CallbackQuery, state: FSMContext):
         return
 
     user_id = callback.from_user.id
-    u_rec = await adb.get_user(user_id)
-    s_grp = u_rec.get("student_group") if u_rec else None
-    grp_badge = f" ({s_grp})" if s_grp else ""
     summary = await adb.get_all_debts_summary(user_id)
-    
     text = (
-        f"📝 <b>Трекер долгов и учебных работ{grp_badge}</b> 🎓\n\n"
-        f"Здесь ты можешь отмечать сданные лабы, следить за хвостами и добавлять свои предметы.\n\n"
-        f"📊 <b>Твой прогресс сдачи:</b>\n"
-        f"• Всего работ в базе: <b>{summary['total']}</b>\n"
-        f"• Сдано работ: <b>{summary['total'] - summary['pending']}</b>\n"
-        f"• Осталось сдать (долгов): <b>{summary['pending']}</b>\n"
-        f"• Общий прогресс: <code>[{summary['bar']}]</code> <b>{summary['percent']}%</b>\n\n"
-        f"Выбери нужный раздел 👇"
+        "📝 <b>Моя учёба</b>\n\n"
+        f"Осталось сдать: {summary['pending']} · Сдано: {summary['total'] - summary['pending']} из {summary['total']}\n\n"
+        f"{study_empty_status(summary['total'], summary['pending'])}\n\n"
+        "Мои работы — предметы, задания и отметки о сдаче\n"
+        "Методички и решения — найти материал или отправить свой"
     )
-    try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.debts_hub_kb())
-    except Exception:
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
-        await callback.bot.send_message(chat_id=user_id, text=text, parse_mode="HTML", reply_markup=kb.debts_hub_kb())
-    await callback.answer()
+    await safe_edit_message(callback, text, reply_markup=kb.debts_hub_kb())
+
+
+def study_empty_status(total: int, pending: int) -> str:
+    if total == 0:
+        return "Работ пока нет. Открой предмет, чтобы добавить первую"
+    if pending == 0:
+        return "Все добавленные работы сданы"
+    return "Открой «Мои работы», чтобы отметить сдачу"
+
 
 # --- Показать все долги ---
 @dp.callback_query(F.data == "show_all_debts")
-async def cb_show_all_debts(callback: CallbackQuery):
+@dp.callback_query(F.data.regexp(r"^show_all_debts_\d+$"))
+async def cb_show_all_debts(callback: CallbackQuery, state: FSMContext = None):
+    if state:
+        await state.clear()
     if not await is_tt36_student(callback.from_user):
         await reject_non_tt36(callback)
         return
@@ -2759,39 +2756,33 @@ async def cb_show_all_debts(callback: CallbackQuery):
     user_id = callback.from_user.id
     summary = await adb.get_all_debts_summary(user_id)
     
-    if summary["total"] == 0:
-        text = (
-            "🎉 <b>У тебя пока нет добавленных работ!</b>\n\n"
-            "Выбери предмет в списке и нажми <i>«➕ Добавить работу»</i>, чтобы внести лабы или домашки."
-        )
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.back_to_debts_hub_kb())
-        await callback.answer()
-        return
+    page_size = 10
+    requested_page = int(callback.data.rsplit("_", 1)[1]) if callback.data != "show_all_debts" else 0
+    page = min(requested_page, max(0, (summary["pending"] - 1) // page_size))
+    markup = kb.debt_tasks_page_kb(page, summary["pending"], page_size)
 
-    if summary["pending"] == 0:
-        text = (
-            "🔥 <b>ЧИСТО! Долгов нет вообще!</b> 🥳\n\n"
-            f"Все <b>{summary['total']}</b> работ сданы на 100%!\n"
-            f"Прогресс: <code>[{summary['bar']}]</code> <b>100%</b>"
-        )
+    if summary["total"] == 0:
+        text = "📊 <b>Все долги</b>\n\n" + study_empty_status(0, 0)
+    elif summary["pending"] == 0:
+        text = "📊 <b>Все долги</b>\n\n" + study_empty_status(summary['total'], 0)
     else:
         text = (
-            f"📋 <b>СВОДКА ВСЕХ ДОЛГОВ ПО УЧЁБЕ</b>\n\n"
+            f"📋 <b>Все долги</b>\n\n"
             f"🔴 <b>Осталось сдать:</b> {summary['pending']} из {summary['total']} работ\n"
-            f"📈 <b>Прогресс закрытия:</b> <code>[{summary['bar']}]</code> {summary['percent']}%\n\n"
-            f"─── <b>СПИСОК ХВОСТОВ:</b> ───\n"
+            f"📈 <b>Прогресс сдачи:</b> <code>[{summary['bar']}]</code> {summary['percent']}%\n\n"
+            f"─── <b>Несданные работы:</b> ───\n"
         )
-        for subject_name, tasks in summary["by_subject"].items():
-            safe_sub = html.escape(subject_name)
-            text += f"\n📚 <b>{safe_sub}</b> ({len(tasks)}):\n"
-            for t in tasks:
-                safe_task = html.escape(t)
-                text += f"  ❌ {safe_task}\n"
-        
-        text += "\n💡 <i>Чтобы отметить работу или посмотреть методички, перейди в «Мои предметы и работы».</i>"
+        tasks = await adb.get_pending_tasks_page(user_id, page_size, page * page_size)
+        for task in tasks:
+            safe_sub = html.escape(task["subject_name"][:60])
+            safe_task = html.escape(task["title"][:160])
+            text += f"\n📚 <b>{safe_sub}</b> — ❌ {safe_task}\n"
+        text += f"\nСтраница {page + 1} из {max(1, (summary['pending'] + page_size - 1) // page_size)}\n"
 
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.back_to_debts_hub_kb())
-    await callback.answer()
+        text += "\n💡 <i>Чтобы отметить работу или посмотреть методички, перейди в «Мои работы».</i>"
+
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=markup)
+
 
 # --- Список предметов ---
 @dp.callback_query(F.data == "list_subjects")
@@ -2804,18 +2795,21 @@ async def cb_list_subjects(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     subjects = await adb.get_subjects_with_counts(user_id)
     
+    summary = await adb.get_all_debts_summary(user_id)
     text = (
-        "📚 <b>Выбери предмет</b>, чтобы посмотреть работы, методички или отметить сданные:\n\n"
-        "🔴 — есть незакрытые долги\n"
-        "🟢 — все работы сданы (или пока нет добавленных)"
+        "📚 <b>Мои работы</b>\n\n"
+        "Выбери предмет: рядом указано количество несданных работ.\n"
+        "🔴 — есть несданные работы · ✅ — всё сдано · ⚪ — работ пока нет\n\n"
+        + study_empty_status(summary['total'], summary['pending'])
     )
-    
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.subjects_list_kb(subjects))
-    await callback.answer()
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.subjects_list_kb(subjects))
+
 
 # --- Открыть предмет и его работы ---
 @dp.callback_query(F.data.startswith("open_sub_"))
-async def cb_open_subject(callback: CallbackQuery):
+async def cb_open_subject(callback: CallbackQuery, state: FSMContext = None):
+    if state:
+        await state.clear()
     if not await is_tt36_student(callback.from_user):
         await reject_non_tt36(callback)
         return
@@ -2842,13 +2836,15 @@ async def cb_open_subject(callback: CallbackQuery):
     
     text = (
         f"📖 <b>Предмет:</b> {safe_name}\n"
-        f"📊 <b>Статус:</b> {total_tasks - pending_count}/{total_tasks} сдано (долгов: <b>{pending_count}</b>)\n\n"
+        f"📊 <b>Статус:</b> {total_tasks - pending_count}/{total_tasks} сдано (не сдано: <b>{pending_count}</b>)\n\n"
         f"• Нажатие <b>слева</b> переключает статус сдачи (❌ / ✅)\n"
         f"• Кнопка <b>справа 📚</b> открывает проверенные методички и решения к работе!"
     )
     
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.subject_tasks_kb(subject_id, tasks, mat_counts, page, total_tasks, page_size))
-    await callback.answer()
+    if total_tasks == 0 or pending_count == 0:
+        text += '\n\n' + study_empty_status(total_tasks, pending_count)
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.subject_tasks_kb(subject_id, tasks, mat_counts, page, total_tasks, page_size))
+
 
 # --- Переключение статуса работы (TOGGLE) ---
 @dp.callback_query(F.data.startswith("toggle_t_"))
@@ -2878,16 +2874,18 @@ async def cb_toggle_task(callback: CallbackQuery):
     global_counts = await adb.get_global_material_counts_for_subject(subject["name"])
     mat_counts = {t["id"]: global_counts.get(t["title"].strip().lower(), 0) for t in tasks}
     
-    status_msg = "✅ Засчитано!" if new_status else "❌ Снова в долгах!"
+    status_msg = "✅ Работа сдана" if new_status else "❌ Работа отмечена как несданная"
     
     text = (
         f"📖 <b>Предмет:</b> {safe_name}\n"
-        f"📊 <b>Статус:</b> {total_tasks - pending_count}/{total_tasks} сдано (долгов: <b>{pending_count}</b>)\n\n"
+        f"📊 <b>Статус:</b> {total_tasks - pending_count}/{total_tasks} сдано (не сдано: <b>{pending_count}</b>)\n\n"
         f"• Нажатие <b>слева</b> переключает статус сдачи (❌ / ✅)\n"
         f"• Кнопка <b>справа 📚</b> открывает проверенные методички и решения к работе!"
     )
     
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.subject_tasks_kb(subject_id, tasks, mat_counts, page, total_tasks, page_size))
+    if total_tasks == 0 or pending_count == 0:
+        text += '\n\n' + study_empty_status(total_tasks, pending_count)
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.subject_tasks_kb(subject_id, tasks, mat_counts, page, total_tasks, page_size))
     await callback.answer(status_msg)
 
 # =========================================================================
@@ -2895,7 +2893,9 @@ async def cb_toggle_task(callback: CallbackQuery):
 # =========================================================================
 
 @dp.callback_query(F.data.startswith("view_mat_"))
-async def cb_view_materials(callback: CallbackQuery):
+async def cb_view_materials(callback: CallbackQuery, state: FSMContext = None):
+    if state:
+        await state.clear()
     parts = callback.data.split("_")
     task_id = int(parts[2])
     subject_id = int(parts[3])
@@ -2924,8 +2924,8 @@ async def cb_view_materials(callback: CallbackQuery):
             f"📚 <b>Материалы к работе:</b>\n"
             f"«{safe_title}» (<i>{safe_sub}</i>)\n\n"
             f"Пока никто не добавил проверенных методичек или решений к этой работе.\n\n"
-            f"Будь первым! Нажми <b>«📤 Предложить методичку / решение»</b>, загрузи фото или файл, "
-            f"и после быстрой верификации он станет доступен всем студентам!"
+            f"Будь первым! Нажми <b>«📤 Отправить свой материал»</b>, загрузи фото или файл, "
+            f"и после проверки администратором он станет доступен всем студентам!"
         )
     else:
         text = (
@@ -2934,11 +2934,11 @@ async def cb_view_materials(callback: CallbackQuery):
             f"Нажми на кнопку материала ниже, чтобы скачать методичку или готовое решение 👇"
         )
         
-    await callback.message.edit_text(
+    await safe_edit_message(callback,
         text, parse_mode="HTML",
         reply_markup=kb.materials_list_kb(task_id, subject_id, materials, page, material_total, 25)
     )
-    await callback.answer()
+
 
 # --- Скачивание / получение материала ---
 @dp.callback_query(F.data.startswith("dl_mat_"))
@@ -3140,20 +3140,22 @@ async def cb_browse_materials_hub(callback: CallbackQuery, state: FSMContext):
         {"name": name, "count": counts_map.get(name.lower(), 0)}
         for name in known_subjects
     ]
-    total_approved = sum(counts_map.values())
+    total_approved = sum(item["count"] for item in subjects_with_counts)
     
     text = (
-        f"📖 <b>База методичек и готовых решений{grp_badge}</b> 🎓\n\n"
+        f"📖 <b>Методички и решения{html.escape(grp_badge)}</b> 🎓\n\n"
         f"Здесь собраны все проверенные материалы по учёбе нашей группы (всего доступно: <b>{total_approved}</b> шт.).\n\n"
         "🟢 — есть проверенные материалы\n"
-        "⚪ — пока пусто (поделись с группой!)\n\n"
+        "⚪ — пока пусто (можно отправить свой материал)\n\n"
         "Выбери предмет, чтобы открыть список файлов 👇"
     )
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.materials_hub_kb(subjects_with_counts))
-    await callback.answer()
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.materials_hub_kb(subjects_with_counts))
+
 
 @dp.callback_query(F.data.startswith("b_sub_"))
-async def cb_browse_subject_materials(callback: CallbackQuery):
+async def cb_browse_subject_materials(callback: CallbackQuery, state: FSMContext = None):
+    if state:
+        await state.clear()
     if not await is_tt36_student(callback.from_user):
         await reject_non_tt36(callback)
         return
@@ -3176,8 +3178,8 @@ async def cb_browse_subject_materials(callback: CallbackQuery):
             f"Нажми на нужный материал ниже, чтобы открыть его прямо в чате 👇"
         )
         
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.subject_materials_view_kb(subject_name, materials))
-    await callback.answer()
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.subject_materials_view_kb(subject_name, materials))
+
 
 @dp.callback_query(F.data.startswith("quick_sub_name_"))
 async def cb_quick_sub_by_name(callback: CallbackQuery, state: FSMContext):
@@ -3194,7 +3196,7 @@ async def cb_quick_sub_by_name(callback: CallbackQuery, state: FSMContext):
     subjects = await adb.get_subjects_with_counts(user_id)
     sub = next((s for s in subjects if s["name"].lower() == subject_name.lower()), None)
     if sub:
-        callback.data = f"quick_sub_{sub['id']}"
+        callback = callback.model_copy(update={"data": f"quick_sub_{sub['id']}"})
         await cb_quick_sub_select(callback, state)
     else:
         await cb_quick_upload_material(callback, state)
@@ -3223,13 +3225,13 @@ async def cb_quick_upload_material(callback: CallbackQuery, state: FSMContext):
     subjects = await adb.get_subjects_with_counts(user_id)
     
     text = (
-        f"📤 <b>Добавление методички или решения{grp_badge}</b>\n\n"
+        f"📤 <b>Отправить свой материал{html.escape(grp_badge)}</b>\n\n"
         "Поделись материалами к учёбе с одногруппниками! После верификации администратором "
-        "материал появится в общей базе бота и поможет всем закрыть долги.\n\n"
+        "материал появится в общей базе бота и поможет всем подготовиться к работам.\n\n"
         "Выбери предмет из списка ниже 👇"
     )
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.quick_subjects_select_kb(subjects))
-    await callback.answer()
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.quick_subjects_select_kb(subjects))
+
 
 @dp.callback_query(F.data.startswith("quick_sub_"))
 async def cb_quick_sub_select(callback: CallbackQuery, state: FSMContext):
@@ -3261,18 +3263,18 @@ async def cb_quick_sub_select(callback: CallbackQuery, state: FSMContext):
             f"(например, <code>Общая методичка по предмету</code> или <code>Лабораторная №1</code>)\n\n"
             f"<i>(или отправь /cancel для отмены)</i>"
         )
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.back_to_menu_kb())
+        await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.study_back_kb("quick_upload_material", "🔙 К выбору предмета"))
     else:
         text = (
             f"📚 <b>Предмет:</b> {safe_name}\n\n"
             f"Выбери работу, к которой хочешь прикрепить методичку или решение 👇"
         )
-        await callback.message.edit_text(
+        await safe_edit_message(callback,
             text, parse_mode="HTML",
             reply_markup=kb.quick_tasks_select_kb(subject_id, tasks, page, total_tasks, page_size)
         )
         
-    await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("quick_task_"))
 async def cb_quick_task_select(callback: CallbackQuery):
@@ -3295,8 +3297,8 @@ async def cb_quick_task_select(callback: CallbackQuery):
         f"• <b>💡 Решение</b> — готовая работа, правильный вариант, расчетка, код.\n\n"
         f"<i>Все материалы проходят верификацию перед публикацией.</i>"
     )
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.choose_material_type_kb(task_id, subject_id))
-    await callback.answer()
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.choose_material_type_kb(task_id, subject_id))
+
 
 @dp.callback_query(F.data.startswith("quick_new_task_"))
 async def cb_quick_new_task(callback: CallbackQuery, state: FSMContext):
@@ -3320,8 +3322,8 @@ async def cb_quick_new_task(callback: CallbackQuery, state: FSMContext):
         f"Например: <code>Лабораторная работа №2</code> или <code>Методические указания</code>.\n\n"
         f"<i>(или отправь /cancel для отмены)</i>"
     )
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.back_to_menu_kb())
-    await callback.answer()
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.study_back_kb("quick_upload_material", "🔙 К выбору предмета"))
+
 
 @dp.message(Form.waiting_for_quick_task_title)
 async def process_quick_task_title(message: Message, state: FSMContext, bot: Bot):
@@ -3346,18 +3348,18 @@ async def process_quick_task_title(message: Message, state: FSMContext, bot: Bot
         raw_title = message.text.strip()
         
     if not raw_title:
-        await show_user_screen(message, "⚠️ Отправь название текстом или прикрепи фотографию/файл с подписью.", reply_markup=kb.back_to_menu_kb())
+        await show_user_screen(message, "⚠️ Отправь название текстом или прикрепи фотографию/файл с подписью.", reply_markup=kb.study_back_kb("quick_upload_material", "🔙 К выбору предмета"))
         return
     subject = await adb.get_subject_by_id(user_id, subject_id) if subject_id else None
     if not subject:
         await state.clear()
-        await show_user_screen(message, "⚠️ Предмет не найден или уже удалён. Начни загрузку заново.", reply_markup=kb.back_to_menu_kb())
+        await show_user_screen(message, "⚠️ Предмет не найден или уже удалён. Начни загрузку заново.", reply_markup=kb.study_back_kb("quick_upload_material", "🔙 К выбору предмета"))
         return
 
     task_id = await adb.add_task(user_id, subject_id, raw_title)
     if task_id is None:
         await state.clear()
-        await show_user_screen(message, "⚠️ Не удалось создать работу. Проверь предмет и попробуй ещё раз.", reply_markup=kb.back_to_menu_kb())
+        await show_user_screen(message, "⚠️ Не удалось создать работу. Проверь предмет и попробуй ещё раз.", reply_markup=kb.study_back_kb("quick_upload_material", "🔙 К выбору предмета"))
         return
     safe_sub = html.escape(subject["name"])
     safe_title = html.escape(raw_title)
@@ -3411,8 +3413,8 @@ async def cb_upload_material(callback: CallbackQuery):
         "• <b>💡 Решение</b> — готовая работа, правильный вариант, расчетка, шпаргалка или код.\n\n"
         "<i>Все материалы проходят верификацию перед публикацией.</i>"
     )
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.choose_material_type_kb(task_id, subject_id))
-    await callback.answer()
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.choose_material_type_kb(task_id, subject_id))
+
 
 @dp.callback_query(F.data.startswith("set_mat_type_"))
 async def cb_set_material_type(callback: CallbackQuery, state: FSMContext, bot: Bot):
@@ -3463,7 +3465,7 @@ async def cb_set_material_type(callback: CallbackQuery, state: FSMContext, bot: 
         safe_task = html.escape(task_info["title"]) if task_info else ""
         
         # 1. Сообщение пользователю с обратной связью от Менмы
-        await callback.message.edit_text(
+        await safe_edit_message(callback,
             "🚀 <b>Фотография успешно отправлена!</b>\n\n"
             "💬 <b>Сообщение от Менмы:</b>\n"
             "<i>«Щас проверю 😎🤙»</i>\n\n"
@@ -3490,7 +3492,6 @@ async def cb_set_material_type(callback: CallbackQuery, state: FSMContext, bot: 
             except Exception as e:
                 logger.error(f"Failed to notify admin {admin_id}: {e}")
                 
-        await callback.answer()
         return
 
     # Обычный сценарий: сразу просим скинуть фото с названием в одном сообщении
@@ -3509,8 +3510,8 @@ async def cb_set_material_type(callback: CallbackQuery, state: FSMContext, bot: 
         "<i>💡 Или можешь сначала написать название текстом, а следующим сообщением скинуть фото!</i>\n\n"
         "<i>(или отправь /cancel для отмены)</i>"
     )
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.back_to_menu_kb())
-    await callback.answer()
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.study_back_kb(f"view_mat_{task_id}_{subject_id}", "🔙 К материалам работы"))
+
 
 @dp.message(Form.waiting_for_material_title)
 async def process_material_title(message: Message, state: FSMContext, bot: Bot):
@@ -3519,11 +3520,13 @@ async def process_material_title(message: Message, state: FSMContext, bot: Bot):
         await cmd_start(message, state)
         return
         
+    data = await state.get_data()
+    task_id, subject_id = data.get("task_id"), data.get("subject_id")
     if message.photo or message.document:
         await process_material_file(message, state, bot)
         return
     if not message.text or not message.text.strip():
-        await show_user_screen(message, "⚠️ Отправь название текстом или прикрепи фотографию/файл.", reply_markup=kb.back_to_menu_kb())
+        await show_user_screen(message, "⚠️ Отправь название текстом или прикрепи фотографию/файл.", reply_markup=kb.study_back_kb(f"view_mat_{task_id}_{subject_id}", "🔙 К материалам работы"))
         return
 
     title = message.text.strip()
@@ -3535,7 +3538,7 @@ async def process_material_title(message: Message, state: FSMContext, bot: Bot):
         f"📸 Теперь <b>скинь фотографию</b> (или файл) 📷 👇\n\n"
         f"<i>(или отправь /cancel для отмены)</i>"
     )
-    await show_user_screen(message, text, reply_markup=kb.back_to_menu_kb())
+    await show_user_screen(message, text, reply_markup=kb.study_back_kb(f"view_mat_{task_id}_{subject_id}", "🔙 К материалам работы"))
 
 @dp.message(Form.waiting_for_material_file)
 async def process_material_file(message: Message, state: FSMContext, bot: Bot):
@@ -3554,7 +3557,7 @@ async def process_material_file(message: Message, state: FSMContext, bot: Bot):
     task_info = await adb.get_task_info_for_subject(user_id, subject_id, task_id) if subject_id else None
     if not task_info:
         await state.clear()
-        await show_user_screen(message, "⚠️ Работа больше недоступна. Начни загрузку материала заново.", reply_markup=kb.back_to_menu_kb())
+        await show_user_screen(message, "⚠️ Работа больше недоступна. Начни загрузку материала заново.", reply_markup=kb.study_back_kb("browse_materials_hub", "🔙 К методичкам и решениям"))
         return
 
     user_name = message.from_user.username or message.from_user.full_name or f"User_{user_id}"
@@ -3605,7 +3608,7 @@ async def process_material_file(message: Message, state: FSMContext, bot: Bot):
             file_type = "text"
             content_text = text_val
     else:
-        await show_user_screen(message, "⚠️ Пожалуйста, просто скинь фотографию, документ или текст.", reply_markup=kb.back_to_menu_kb())
+        await show_user_screen(message, "⚠️ Пожалуйста, просто скинь фотографию, документ или текст.", reply_markup=kb.study_back_kb(f"view_mat_{task_id}_{subject_id}", "🔙 К материалам работы"))
         return
         
     # Сохраняем в базу со статусом 'pending'
@@ -3621,7 +3624,7 @@ async def process_material_file(message: Message, state: FSMContext, bot: Bot):
     )
     if mat_id is None:
         await state.clear()
-        await show_user_screen(message, "⚠️ Не удалось сохранить материал: работа не найдена.", reply_markup=kb.back_to_menu_kb())
+        await show_user_screen(message, "⚠️ Не удалось сохранить материал: работа не найдена.", reply_markup=kb.study_back_kb(f"view_mat_{task_id}_{subject_id}", "🔙 К материалам работы"))
         return
     await state.clear()
     
@@ -3709,7 +3712,7 @@ async def cb_save_text_mat(callback: CallbackQuery, state: FSMContext, bot: Bot)
     safe_task = html.escape(task_info["title"]) if task_info else ""
     
     # 1. Сообщение пользователю
-    await callback.message.edit_text(
+    await safe_edit_message(callback,
         "🚀 <b>Текстовый материал успешно отправлен!</b>\n\n"
         "💬 <b>Сообщение от Менмы:</b>\n"
         "<i>«Щас проверю 😎🤙»</i>\n\n"
@@ -3737,7 +3740,6 @@ async def cb_save_text_mat(callback: CallbackQuery, state: FSMContext, bot: Bot)
         except Exception as e:
             logger.error(f"Failed to notify admin {admin_id}: {e}")
             
-    await callback.answer()
 
 # --- Обработка верификации админом ---
 @dp.callback_query(F.data.startswith("adm_appr_"))
@@ -3867,8 +3869,8 @@ async def cb_add_subject_prompt(callback: CallbackQuery, state: FSMContext):
         "Например: <code>Инженерная графика</code> или <code>Сопромат</code>.\n\n"
         "<i>(или отправь /cancel для отмены)</i>"
     )
-    await callback.message.edit_text(text, parse_mode="HTML")
-    await callback.answer()
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.study_back_kb())
+
 
 @dp.message(Form.waiting_for_subject_name)
 async def process_subject_name(message: Message, state: FSMContext):
@@ -3880,7 +3882,7 @@ async def process_subject_name(message: Message, state: FSMContext):
     user_id = message.from_user.id
     name = (message.text or message.caption or "").strip()
     if not name:
-        await show_user_screen(message, "⚠️ Название предмета не может быть пустым. Попробуй ещё раз:", reply_markup=kb.back_to_menu_kb())
+        await show_user_screen(message, "⚠️ Название предмета не может быть пустым. Попробуй ещё раз:", reply_markup=kb.study_back_kb())
         return
     
     sub_id = await adb.add_subject(user_id, name)
@@ -3919,8 +3921,8 @@ async def cb_add_task_prompt(callback: CallbackQuery, state: FSMContext):
         f"<code>Курсовой проект</code>\n\n"
         f"<i>(или отправь /cancel для отмены)</i>"
     )
-    await callback.message.edit_text(text, parse_mode="HTML")
-    await callback.answer()
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.back_to_subject_kb(subject_id))
+
 
 @dp.message(Form.waiting_for_task_title)
 async def process_task_title(message: Message, state: FSMContext):
@@ -3935,12 +3937,12 @@ async def process_task_title(message: Message, state: FSMContext):
     subject = await adb.get_subject_by_id(user_id, subject_id) if subject_id else None
     if not subject:
         await state.clear()
-        await show_user_screen(message, "⚠️ Предмет не найден или уже удалён. Начни добавление работы заново.", reply_markup=kb.back_to_menu_kb())
+        await show_user_screen(message, "⚠️ Предмет не найден или уже удалён. Начни добавление работы заново.", reply_markup=kb.study_back_kb())
         return
     
     raw_text = (message.text or message.caption or "").strip()
     if not raw_text:
-        await show_user_screen(message, "⚠️ Отправь название работы текстом. Можно указать несколько строк.", reply_markup=kb.back_to_menu_kb())
+        await show_user_screen(message, "⚠️ Отправь название работы текстом. Можно указать несколько строк.", reply_markup=kb.study_back_kb(f"open_sub_{subject_id}", "🔙 К работам предмета"))
         return
     lines = [line.strip() for line in raw_text.replace(",", "\n").split("\n") if line.strip()]
     added_count = await adb.add_tasks(user_id, subject_id, lines)
@@ -3958,7 +3960,7 @@ async def process_task_title(message: Message, state: FSMContext):
     text = (
         f"🎉 Добавлено работ: <b>{added_count}</b>!\n\n"
         f"📖 <b>Предмет:</b> {safe_name}\n"
-        f"📊 <b>Статус:</b> {total_tasks - pending_count}/{total_tasks} сдано (долгов: <b>{pending_count}</b>)\n\n"
+        f"📊 <b>Статус:</b> {total_tasks - pending_count}/{total_tasks} сдано (не сдано: <b>{pending_count}</b>)\n\n"
         f"• Нажатие <b>слева</b> переключает статус сдачи\n"
         f"• Кнопка <b>справа 📚</b> открывает проверенные методички и решения"
     )
@@ -3984,8 +3986,8 @@ async def cb_confirm_del_sub(callback: CallbackQuery):
     safe_name = html.escape(subject["name"])
     
     text = f"❓ Ты точно хочешь удалить предмет <b>«{safe_name}»</b> и ВСЕ его работы?"
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.confirm_delete_subject_kb(subject_id))
-    await callback.answer()
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.confirm_delete_subject_kb(subject_id))
+
 
 @dp.callback_query(F.data.startswith("del_sub_"))
 async def cb_del_sub(callback: CallbackQuery):
@@ -4002,8 +4004,8 @@ async def cb_del_sub(callback: CallbackQuery):
     
     subjects = await adb.get_subjects_with_counts(user_id)
     text = "🗑️ Предмет успешно удален!"
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.subjects_list_kb(subjects))
-    await callback.answer()
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.subjects_list_kb(subjects))
+
 
 async def gdrive_sync_background_loop(bot: Bot):
     """Фоновый опрос Google Диска: проверяет новые файлы каждые 30 минут."""
