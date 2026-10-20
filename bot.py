@@ -926,7 +926,7 @@ async def cb_admin_ocr_group(callback: CallbackQuery):
         elif group_name not in {name for name, _ in markers}:
             recognized = "⚠️ Эта группа не найдена в распознанных заголовках страницы."
         elif text:
-            recognized = html.escape(text)
+            recognized = text
         else:
             recognized = "⚠️ Заголовок группы найден, но текст расписания прочитать не удалось."
         pages.append((path, item, width, height, detected, recognized))
@@ -937,10 +937,15 @@ async def cb_admin_ocr_group(callback: CallbackQuery):
         "Результат виден только администратору и не публикуется студентам.",
         "",
     ]
+    ocr_text_limit = max(1, 1200 // len(pages))
     for index, (_, item, width, height, detected, recognized) in enumerate(pages, start=1):
+        truncated = len(recognized) > ocr_text_limit
+        recognized = html.escape(recognized[:ocr_text_limit])
+        if truncated:
+            recognized += "… <i>(сокращено)</i>"
         lines.extend([
-            f"<b>Страница {index} из {len(pages)}</b> · {html.escape(item.get('filename') or 'лист')}",
-            f"Размер: {width} × {height} · Найдены группы: {html.escape(detected)}",
+            f"<b>Страница {index} из {len(pages)}</b> · {html.escape((item.get('filename') or 'лист')[:100])}",
+            f"Размер: {width} × {height} · Найдены группы: {html.escape(detected[:120])}",
             "<b>Распознанный текст:</b>",
             recognized,
             "",
