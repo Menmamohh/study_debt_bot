@@ -7,6 +7,10 @@ import datetime
 import functools
 import csv
 import io
+import hashlib
+import shutil
+import tempfile
+import threading
 import subprocess
 from typing import List, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -27,6 +31,7 @@ DOWNLOADS_DIR = os.path.join(DATA_DIR, "schedule", "downloads")
 TIMEZONE = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Minsk"))
 CUTOFF_HOUR = int(os.getenv("SCHEDULE_CUTOFF_HOUR", "17"))
 SATURDAY_CUTOFF_HOUR = int(os.getenv("SCHEDULE_SATURDAY_CUTOFF_HOUR", "14"))
+_sync_lock = threading.Lock()
 
 WEEKDAY_NAMES_RU = {
     0: "понедельник",
@@ -180,7 +185,57 @@ def download_file(file_id: str, dest_path: str) -> bool:
         return False
 
 
+def drive_schedule_payload() -> Optional[Dict]:
+    """Snapshot the latest dated sheets, keeping their bytes immutable for history."""
+    photos = []
+    for doc_type in ("replacement", "consultations"):
+        for item in db.get_latest_gdrive_schedule_files(doc_type=doc_type):
+            path = item.get("local_path")
+            if not path or not os.path.isfile(path):
+                continue
+            with open(path, "rb") as source:
+                checksum = hashlib.sha256()
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    checksum.update(chunk)
+                digest = checksum.hexdigest()
+            archive_dir = os.path.join(os.path.dirname(path), "versions")
+            os.makedirs(archive_dir, exist_ok=True)
+            immutable_path = os.path.join(archive_dir, digest + os.path.splitext(path)[1])
+            if not os.path.exists(immutable_path):
+                shutil.copyfile(path, immutable_path)
+            label = "Консультации" if doc_type == "consultations" else "Замены"
+            photos.append({"source": immutable_path,
+                           "caption": f"{label}: {item.get('schedule_date') or ''}, часть {item.get('part_number') or 1}"})
+    if not photos:
+        return None
+    return {"title": "Листы замен и консультаций", "schedule_text": "", "photos": photos}
+
+
+def preserve_existing_schedule():
+    """Bootstrap existing installations before the first publication replaces data."""
+    if db.get_schedule_versions("ALL"):
+        return
+    manual = db.get_group_schedule("ALL")
+    drive = drive_schedule_payload()
+    if manual and (manual.get("schedule_text") or manual.get("photo_file_id")):
+        files = db.get_latest_gdrive_schedule_files()
+        timestamps = [int(item.get("drive_timestamp") or 0) for item in files]
+        drive_time = max((value / 1000 if value > 10**12 else value for value in timestamps), default=0)
+        manual_time = datetime.datetime.fromisoformat(manual["updated_at"]).replace(tzinfo=datetime.timezone.utc).timestamp()
+        if manual_time >= drive_time:
+            db.record_schedule_version("ALL", db.manual_schedule_payload(manual), only_if_empty=True)
+            return
+    if drive:
+        db.record_schedule_version("ALL", drive, only_if_empty=True)
+
+
 def sync_drive_schedule(force: bool = False) -> Dict:
+    # Admin-triggered and background sync share files and must publish in order.
+    with _sync_lock:
+        return _sync_drive_schedule(force)
+
+
+def _sync_drive_schedule(force: bool = False) -> Dict:
     """Синхронизирует расписание с Google Диском: находит и скачивает новые файлы."""
     os.makedirs(DOWNLOADS_DIR, exist_ok=True)
     files = fetch_drive_files_list()
@@ -194,6 +249,8 @@ def sync_drive_schedule(force: bool = False) -> Dict:
             "files": []
         }
 
+    preserve_existing_schedule()
+    before_payload = drive_schedule_payload()
     new_downloaded = 0
     updated_files = []
 
@@ -226,7 +283,14 @@ def sync_drive_schedule(force: bool = False) -> Dict:
         )
 
         if needs_download:
-            success = download_file(file_id, dest_path)
+            # Download separately so an interrupted update cannot corrupt a retained sheet.
+            with tempfile.NamedTemporaryFile(dir=DOWNLOADS_DIR, suffix=".download", delete=False) as staging:
+                staging_path = staging.name
+            success = download_file(file_id, staging_path)
+            if success:
+                os.replace(staging_path, dest_path)
+            elif os.path.exists(staging_path):
+                os.remove(staging_path)
             if success:
                 f_size = os.path.getsize(dest_path)
                 db.save_gdrive_file(
@@ -258,6 +322,10 @@ def sync_drive_schedule(force: bool = False) -> Dict:
                 file_size=existing.get("file_size", 0),
                 drive_timestamp=f["drive_timestamp"]
             )
+
+    after_payload = drive_schedule_payload()
+    if after_payload and after_payload != before_payload:
+        db.record_schedule_version("ALL", after_payload)
 
     return {
         "ok": True,

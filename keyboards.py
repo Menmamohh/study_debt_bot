@@ -137,6 +137,27 @@ def schedule_view_kb(
     ])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
+def schedule_version_kb(group_name: str, older_id: Optional[int], version_id: int,
+                        is_current: bool, is_admin_user: bool = False) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="Актуальное расписание", callback_data=f"sched_view_{group_name}")]]
+    if older_id:
+        rows.append([InlineKeyboardButton(text="Предыдущее расписание",
+                                          callback_data=f"schold_{older_id}_{group_name}")])
+    if is_admin_user:
+        if not is_current:
+            rows.append([InlineKeyboardButton(text="🗑 Удалить это старое расписание",
+                                              callback_data=f"schdel_{version_id}_{group_name}")])
+        rows.append([InlineKeyboardButton(text="✏️ Опубликовать расписание",
+                                          callback_data=f"adm_sched_edit_{group_name}")])
+        rows.append([InlineKeyboardButton(text="🔄 Синхронизация с Google Диском", callback_data="adm_gdrive_sync")])
+    rows.extend([
+        [InlineKeyboardButton(text="🔔 Расписание звонков", callback_data="sched_bells")],
+        [InlineKeyboardButton(text="👥 Выбрать группу", callback_data="sched_choose_group")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def schedule_choose_group_kb(current_group: Optional[str] = None, is_admin_user: bool = False) -> InlineKeyboardMarkup:
     kb = []
     if is_admin_user:

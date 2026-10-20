@@ -182,7 +182,7 @@ def get_general_schedule_photo(gen_sched: Optional[Dict], target_date: Optional[
     manual_is_newer = manual_general_schedule_is_newer(gen_sched, target_date)
     if manual_is_newer:
         if gen_sched.get("photo_file_id"):
-            return gen_sched["photo_file_id"]
+            return gen_sched.get("photo_file_ids") or gen_sched["photo_file_id"]
         return None
 
     drive_photos = gdrive_sync.get_active_gdrive_schedule_photos(target_date=target_date)
@@ -203,7 +203,7 @@ def get_general_schedule_photo(gen_sched: Optional[Dict], target_date: Optional[
                 return cached_file_id
         return path
     if gen_sched and gen_sched.get("photo_file_id"):
-        return gen_sched["photo_file_id"]
+        return gen_sched.get("photo_file_ids") or gen_sched["photo_file_id"]
     fallback_paths = [
         path
         for path, _, valid_until in GENERAL_SCHEDULE_PHOTOS
@@ -721,6 +721,41 @@ verification_middleware = VerificationMiddleware()
 dp.message.middleware(verification_middleware)
 dp.callback_query.middleware(verification_middleware)
 
+
+class ScheduleAlbumMiddleware(BaseMiddleware):
+    """Telegram delivers each album photo as an update; publish once after collecting it."""
+
+    def __init__(self, settle_seconds=1.0):
+        self.pending = {}
+        self.settle_seconds = settle_seconds
+
+    async def __call__(self, handler, event, data):
+        state = data.get("state")
+        if (not event.media_group_id or not state or not is_admin(event.from_user)
+                or event.chat.type != "private"
+                or await state.get_state() != Form.waiting_for_group_schedule.state):
+            return await handler(event, data)
+        key = (event.chat.id, event.from_user.id, event.media_group_id)
+        if key in self.pending:
+            self.pending[key][event.message_id] = event
+            return
+        album = self.pending[key] = {event.message_id: event}
+        try:
+            while True:
+                count = len(album)
+                await asyncio.sleep(self.settle_seconds)
+                if count == len(album):
+                    break
+            if await state.get_state() != Form.waiting_for_group_schedule.state:
+                return
+            data["schedule_album"] = [album[item] for item in sorted(album)]
+            return await handler(data["schedule_album"][0], data)
+        finally:
+            self.pending.pop(key, None)
+
+
+dp.message.middleware(ScheduleAlbumMiddleware())
+
 # --- Команда /my_id ---
 @dp.message(Command("my_id", "id"))
 async def cmd_my_id(message: Message):
@@ -1195,6 +1230,7 @@ async def cmd_verify(message: Message, state: FSMContext):
         "🎓 <b>Верификация в «Помощнике Пятнашки»:</b>\n\n"
         "Выбери свою учебную группу из списка колледжа им. А.Е. Ларина 👇"
     )
+    await state.update_data(group_action="verify")
     await show_user_screen(message, text, reply_markup=kb.select_group_kb())
 
 @dp.message(Command("cancel"))
@@ -1727,8 +1763,18 @@ async def render_group_schedule_view(
     is_callback: bool = False,
     bot: Optional[Bot] = None,
     notice: Optional[str] = None,
+    version_id: Optional[int] = None,
 ):
-    """Отображает самое актуальное расписание для указанной группы с учётом правила отсечки (17:00 / суббота)"""
+    """Show the newest publication, or a requested retained version for this user."""
+    versions = await adb.get_schedule_versions(group_name)
+    if versions:
+        selected = next((item for item in versions if item["id"] == version_id), None) if version_id else versions[0]
+        if selected is None:
+            notice = "Это старое расписание уже удалено администратором."
+            selected = versions[0]
+        await render_schedule_version(target, user, group_name, versions, selected,
+                                      is_callback=is_callback, bot=bot, notice=notice)
+        return
     user_id = user.id
     target_chat = target.message.chat if is_callback else target.chat
     is_adm = is_admin(user) and target_chat.type == "private"
@@ -1899,6 +1945,84 @@ async def render_group_schedule_view(
             await show_user_screen(target, text, reply_markup=markup)
         else:
             await show_user_screen(target, text, reply_markup=markup)
+
+async def render_schedule_version(target, user, group_name, versions, selected,
+                                  is_callback=False, bot=None, notice=None):
+    chat = target.message.chat if is_callback else target.chat
+    actual_bot = bot or target.bot
+    index = versions.index(selected)
+    payload = selected["payload"]
+    label = "Актуальное расписание" if index == 0 else "Предыдущее расписание"
+    published = datetime.datetime.fromisoformat(selected["created_at"]).replace(
+        tzinfo=datetime.timezone.utc).astimezone(gdrive_sync.TIMEZONE).strftime("%d.%m.%Y %H:%M")
+    text = (f"📅 <b>{label} — {html.escape(group_name)}</b>\n"
+            f"Опубликовано: {published}\n\n"
+            f"<b>{html.escape(payload.get('title') or 'Расписание')}</b>\n"
+            f"{html.escape(payload.get('schedule_text') or '')}")
+    if index:
+        text += "\n\nЭто сохранённая версия. Новое расписание доступно по кнопке ниже."
+    if notice:
+        text = f"{notice}\n\n{text}"
+    markup = kb.schedule_version_kb(
+        group_name, versions[index + 1]["id"] if index + 1 < len(versions) else None,
+        selected["id"], index == 0,
+        is_admin_user=is_admin(user) and chat.type == "private",
+    )
+    photos = payload.get("photos") or []
+    if not photos:
+        await show_user_screen(target, text, reply_markup=markup)
+        return
+    related = []
+    for offset in range(0, len(photos), 10):
+        batch = photos[offset:offset + 10]
+        def source(photo):
+            value = photo["source"]
+            return FSInputFile(value) if os.path.isfile(value) else value
+        if len(batch) == 1:
+            sent = await actual_bot.send_photo(chat_id=chat.id, photo=source(batch[0]),
+                                              caption=batch[0].get("caption") or None)
+            related.append(sent)
+        else:
+            related.extend(await actual_bot.send_media_group(chat_id=chat.id, media=[
+                InputMediaPhoto(media=source(photo), caption=photo.get("caption") or None) for photo in batch
+            ]))
+    screen = await actual_bot.send_message(chat_id=chat.id, text=text, parse_mode="HTML", reply_markup=markup)
+    if chat.type == "private":
+        for sent in [*related, screen]:
+            await adb.set_ui_message_id(user.id, sent.message_id)
+        await cleanup_user_ui_messages(actual_bot, user.id, keep_message_id=screen.message_id,
+                                       keep_message_ids=[sent.message_id for sent in related])
+
+
+@dp.callback_query(F.data.startswith("schold_") | F.data.startswith("schdel_"))
+async def cb_schedule_history(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    access_ok, error = await check_user_access(callback.from_user)
+    if not access_ok:
+        await prompt_verification_required(callback, callback.from_user, error)
+        return
+    try:
+        action, raw_id, group = callback.data.split("_", 2)
+        version_id = int(raw_id)
+        if group not in {*db.COLLEGE_GROUPS, "ALL"}:
+            raise ValueError
+    except (ValueError, AttributeError):
+        await callback.answer("Открой расписание заново.", show_alert=True)
+        return
+    versions = await adb.get_schedule_versions(group)
+    selected = next((item for item in versions if item["id"] == version_id), None)
+    if action == "schdel":
+        if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+            await callback.answer("Удалять старое расписание может только администратор в личном чате.", show_alert=True)
+            return
+        deleted = selected and await adb.delete_old_schedule_version(version_id)
+        await callback.answer("Старое расписание удалено." if deleted else "Расписание уже удалено или является актуальным.", show_alert=True)
+        await render_group_schedule_view(callback, callback.from_user, group, is_callback=True)
+        return
+    await callback.answer()
+    await render_group_schedule_view(callback, callback.from_user, group, is_callback=True,
+                                     version_id=version_id)
+
 
 @dp.callback_query(F.data == "schedule_menu")
 async def cb_schedule_menu(callback: CallbackQuery, state: FSMContext):
@@ -2160,7 +2284,10 @@ async def cb_admin_sched_edit(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 @dp.message(Form.waiting_for_group_schedule)
-async def process_group_schedule_input(message: Message, state: FSMContext, bot: Bot):
+async def process_group_schedule_input(message: Message, state: FSMContext, bot: Bot,
+                                       schedule_album: Optional[List[Message]] = None):
+    if not is_admin(message.from_user) or message.chat.type != "private":
+        return
     if message.text and message.text.startswith("/"):
         await state.clear()
         await cmd_start(message, state)
@@ -2173,9 +2300,11 @@ async def process_group_schedule_input(message: Message, state: FSMContext, bot:
         await show_user_screen(message, "⚠️ Сеанс редактирования расписания завершён. Открой редактирование заново.", reply_markup=kb.back_to_menu_kb())
         return
     
-    photo_file_id = message.photo[-1].file_id if message.photo else None
-    raw_text = (message.caption if message.photo else message.text) or ""
-    raw_text = raw_text.strip()
+    messages = schedule_album or [message]
+    photo_file_ids = [item.photo[-1].file_id for item in messages if item.photo]
+    photo_file_id = photo_file_ids[0] if photo_file_ids else None
+    raw_text = "\n\n".join((item.caption if item.photo else item.text).strip()
+                            for item in messages if (item.caption if item.photo else item.text))
     
     if not photo_file_id and not raw_text:
         await show_user_screen(message, "⚠️ Отправь фотографию расписания или текстовое сообщение:", reply_markup=kb.back_to_menu_kb())
@@ -2184,14 +2313,20 @@ async def process_group_schedule_input(message: Message, state: FSMContext, bot:
     title = f"Замена / Расписание ({target_group})"
     admin_tag = f"@{message.from_user.username or ADMIN_USERNAME}"
     
-    await adb.set_group_schedule(
+    await asyncio.get_running_loop().run_in_executor(None, gdrive_sync.preserve_existing_schedule)
+    changed = await adb.set_group_schedule(
         group_name=target_group,
         schedule_text=raw_text,
         title=title,
         photo_file_id=photo_file_id,
-        updated_by=admin_tag
+        updated_by=admin_tag,
+        photo_file_ids=photo_file_ids,
     )
     await state.clear()
+    if not changed:
+        await render_group_schedule_view(message, message.from_user, target_group, bot=bot,
+                                         notice="Это расписание уже опубликовано.")
+        return
     
     # Автоматическая рассылка верифицированным студентам
     safe_target_group = html.escape(target_group)
@@ -2226,7 +2361,14 @@ async def process_group_schedule_input(message: Message, state: FSMContext, bot:
                 last_send_at = loop.time()
             for attempt in range(2):
                 try:
-                    if photo_file_id:
+                    if len(photo_file_ids) > 1:
+                        await bot.send_media_group(chat_id=user_id, media=[
+                            InputMediaPhoto(media=photo, caption=broadcast_body if index == 0 else None,
+                                            parse_mode="HTML")
+                            for index, photo in enumerate(photo_file_ids)
+                        ])
+                        await bot.send_message(chat_id=user_id, text="Открыть расписание:", reply_markup=broadcast_kb)
+                    elif photo_file_id:
                         await bot.send_photo(
                             chat_id=user_id, photo=photo_file_id, caption=broadcast_body,
                             parse_mode="HTML", reply_markup=broadcast_kb,

@@ -1,5 +1,6 @@
 import sqlite3
 import hashlib
+import json
 import os
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
@@ -93,6 +94,15 @@ def init_db():
                 photo_file_id TEXT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_by TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS schedule_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_name TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         cursor.execute("""
@@ -1328,16 +1338,89 @@ def clear_schedule_day(day_of_week: int):
 
 # --- Актуальное оперативное расписание по группам (Пятнашка) ---
 
+def manual_schedule_payload(schedule: Dict) -> Dict:
+    photos = schedule.get("photo_file_ids")
+    if photos is None:
+        raw = schedule.get("photo_file_id")
+        photos = json.loads(raw) if raw and raw.startswith("[") else ([raw] if raw else [])
+    return {
+        "title": schedule.get("title") or "Расписание",
+        "schedule_text": schedule.get("schedule_text") or "",
+        "photos": [{"source": photo, "caption": ""} for photo in photos],
+    }
+
+
+def _record_schedule_version(conn, group_name: str, payload: Dict) -> bool:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    fingerprint = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    latest = conn.execute(
+        "SELECT fingerprint FROM schedule_versions WHERE group_name = ? ORDER BY id DESC LIMIT 1",
+        (group_name,),
+    ).fetchone()
+    if latest and latest["fingerprint"] == fingerprint:
+        return False
+    conn.execute("INSERT INTO schedule_versions (group_name, fingerprint, payload) VALUES (?, ?, ?)",
+                 (group_name, fingerprint, encoded))
+    return True
+
+
+def record_schedule_version(group_name: str, payload: Dict, only_if_empty: bool = False) -> bool:
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if only_if_empty and conn.execute(
+            "SELECT 1 FROM schedule_versions WHERE group_name = ?", (group_name,)
+        ).fetchone():
+            return False
+        return _record_schedule_version(conn, group_name, payload)
+
+
+def get_schedule_versions(group_name: str) -> List[Dict]:
+    """Newest publication first; shared publications are visible to every group."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM schedule_versions WHERE group_name IN (?, 'ALL') ORDER BY id DESC",
+            (group_name,),
+        ).fetchall()
+        return [dict(row, payload=json.loads(row["payload"])) for row in rows]
+
+
+def delete_old_schedule_version(version_id: int) -> bool:
+    """Never remove the current publication of a scope, even via a stale button."""
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        result = conn.execute("""
+            DELETE FROM schedule_versions WHERE id = ? AND id < (
+                SELECT MAX(newer.id) FROM schedule_versions AS newer
+                WHERE newer.group_name IN (schedule_versions.group_name, 'ALL')
+            )
+        """, (version_id,))
+        return result.rowcount == 1
+
+
 def set_group_schedule(group_name: str, schedule_text: str, title: Optional[str] = None, 
-                       photo_file_id: Optional[str] = None, updated_by: Optional[str] = None):
+                       photo_file_id: Optional[str] = None, updated_by: Optional[str] = None,
+                       photo_file_ids: Optional[List[str]] = None):
     """Сохраняет актуальное расписание для группы (или ALL для всех)"""
     with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        old = conn.execute("SELECT * FROM group_schedules WHERE group_name = ?", (group_name,)).fetchone()
+        if old and not conn.execute("SELECT 1 FROM schedule_versions WHERE group_name = ?", (group_name,)).fetchone():
+            _record_schedule_version(conn, group_name, manual_schedule_payload(dict(old)))
+        changed = _record_schedule_version(conn, group_name, manual_schedule_payload({
+            "title": title or f"Расписание ({group_name})", "schedule_text": schedule_text,
+            "photo_file_id": photo_file_id, "photo_file_ids": photo_file_ids,
+        }))
+        if not changed:
+            return False
+        stored_photo = (json.dumps(photo_file_ids) if photo_file_ids and len(photo_file_ids) > 1
+                        else (photo_file_ids[0] if photo_file_ids else photo_file_id))
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO group_schedules (group_name, title, schedule_text, photo_file_id, updated_at, updated_by)
             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-        """, (group_name, title or f"Расписание ({group_name})", schedule_text, photo_file_id, updated_by))
+        """, (group_name, title or f"Расписание ({group_name})", schedule_text, stored_photo, updated_by))
         conn.commit()
+        return True
 
 def get_group_schedule(group_name: str) -> Optional[Dict]:
     """Возвращает расписание, скрывая устаревшие автоматически засеянные шаблоны."""
@@ -1348,6 +1431,10 @@ def get_group_schedule(group_name: str) -> Optional[Dict]:
         if not row:
             return None
         schedule = dict(row)
+        raw_photo = schedule.get("photo_file_id")
+        if raw_photo and raw_photo.startswith("["):
+            schedule["photo_file_ids"] = json.loads(raw_photo)
+            schedule["photo_file_id"] = schedule["photo_file_ids"][0] if schedule["photo_file_ids"] else None
         seeded = next((item for item in DEFAULT_GROUP_SCHEDULES.get(group_name, {}).values()
                        if item == schedule.get("schedule_text")), None)
         is_seeded = schedule.get("updated_by") == "Автоматический шаблон" or (
@@ -1369,6 +1456,7 @@ def clear_group_schedule(group_name: str):
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM group_schedules WHERE group_name = ?", (group_name,))
+        cursor.execute("DELETE FROM schedule_versions WHERE group_name = ?", (group_name,))
         conn.commit()
 
 def get_all_group_schedules() -> List[Dict]:
