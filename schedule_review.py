@@ -302,8 +302,10 @@ def read_schedule(paths, group):
         'uncertainties:array строк. Никакого Markdown.'
     )
     if group is None:
+        prompt = prompt.replace('ТОЛЬКО группу None', 'ВСЕ группы')
         prompt += (
             '\nРежим всех групп: извлеки ВСЕ группы со ВСЕХ переданных страниц. '
+            'Одна группа — один объект: объедини её строки со всех страниц. '
             'Вместо результата одной группы верни {"groups":[объекты групп],"uncertainties":[]}. '
             'Каждый объект группы содержит group_name, group_found=true, lessons и uncertainties '
             'по схеме выше. Не пропускай группы. Допустимые названия: '
