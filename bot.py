@@ -2684,7 +2684,8 @@ async def cb_schedule_review_queue(callback: CallbackQuery):
     await callback.answer()
     drafts = await asyncio.to_thread(schedule_review.pending_reviews)
     if not drafts:
-        await callback.message.answer("Черновиков на проверку нет.")
+        await show_user_screen(callback, "Черновиков на проверку нет.", reply_markup=kb.back_to_menu_kb())
+        return
     for draft in drafts[:10]:
         await send_schedule_review(callback.bot, callback.from_user.id, draft)
     if len(drafts) > 10:

@@ -135,3 +135,14 @@ class ScheduleReviewTests(unittest.TestCase):
             asyncio.run(bot.cb_schedule_review_action(callback, state))
             asyncio.run(bot.cb_schedule_review_action(callback, state))
         self.assertEqual(callback.bot.send_message.await_count, 1)
+
+    def test_empty_queue_uses_tracked_interface_screen(self):
+        callback = SimpleNamespace(from_user=SimpleNamespace(id=10),
+                                   message=SimpleNamespace(chat=SimpleNamespace(type='private')),
+                                   answer=AsyncMock())
+        with patch.object(bot, 'is_admin', return_value=True), \
+             patch.object(review, 'pending_reviews', return_value=[]), \
+             patch.object(bot, 'show_user_screen', AsyncMock()) as show:
+            asyncio.run(bot.cb_schedule_review_queue(callback))
+        self.assertEqual(show.call_args.args[1], 'Черновиков на проверку нет.')
+        self.assertIsNotNone(show.call_args.kwargs['reply_markup'])
