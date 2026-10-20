@@ -174,6 +174,74 @@ def format_result(data):
     return result
 
 
+def _gemini_json_request(request, stage, timeout):
+    """Return JSON with safe, distinct diagnostics; never echo a remote message."""
+    import ssl
+    import certifi
+    context = ssl.create_default_context(cafile=certifi.where())
+    try:
+        with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+            try:
+                return json.load(response)
+            except (ValueError, UnicodeError):
+                raise GeminiError(f'{stage}: сервер ответил, но прислал некорректный JSON.') from None
+    except urllib.error.HTTPError as error:
+        messages = {400: 'Запрос отклонён. Возможна ошибка ключа, модели или ограничения региона.',
+                    401: 'Ключ Gemini не принят.',
+                    403: 'Доступ запрещён. Проверь ограничения ключа и разрешения проекта.',
+                    404: 'Модель недоступна. Проверь GEMINI_MODEL.',
+                    429: 'Лимит запросов исчерпан или квота проекта недоступна.'}
+        # Only map known codes to our own text; raw Google messages can contain
+        # submitted data, so they never reach Telegram or logs.
+        try:
+            detail = json.loads(error.read(65536) if error.fp is not None else b'{}').get('error', {})
+            reasons = {item.get('reason') for item in detail.get('details', []) if isinstance(item, dict)}
+            if 'API_KEY_INVALID' in reasons:
+                messages[error.code] = 'Ключ Gemini недействителен. Проверь GEMINI_API_KEY на BotHost.'
+            elif 'SERVICE_DISABLED' in reasons:
+                messages[error.code] = 'Gemini API не включён в проекте Google.'
+        except (ValueError, AttributeError, TypeError, OSError):
+            pass
+        raise GeminiError(f'{stage}: HTTP {error.code}. ' + messages.get(error.code, 'Сбой сервиса Gemini.')) from None
+    except urllib.error.URLError as error:
+        reason = error.reason
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            message = 'не удалось проверить сертификат HTTPS (TLS).'
+        elif isinstance(reason, ssl.SSLError):
+            message = 'ошибка защищённого соединения HTTPS (TLS).'
+        elif isinstance(reason, socket.gaierror):
+            message = 'сервер BotHost не смог найти адрес Google (DNS).'
+        elif isinstance(reason, (socket.timeout, TimeoutError)):
+            message = f'истекло время ожидания соединения ({timeout} с).'
+        else:
+            message = 'не удалось установить соединение с Google. Проверь сеть сервера.'
+        raise GeminiError(f'{stage}: {message}') from None
+    except (socket.timeout, TimeoutError):
+        raise GeminiError(f'{stage}: Google не ответил за {timeout} с.') from None
+    except ssl.SSLError:
+        raise GeminiError(f'{stage}: ошибка защищённого соединения HTTPS (TLS).') from None
+    except OSError:
+        raise GeminiError(f'{stage}: соединение с Google прервалось.') from None
+
+
+def check_connection():
+    """Check API key and model metadata without images or a generation request."""
+    key = os.environ.get('GEMINI_API_KEY', '').strip()
+    if not key:
+        raise GeminiError('На сервере не задан GEMINI_API_KEY.')
+    model = os.environ.get('GEMINI_MODEL', 'gemini-3.8-flash').removeprefix('models/')
+    if not re.fullmatch(r'[a-zA-Z0-9._-]+', model):
+        raise GeminiError('Некорректное имя GEMINI_MODEL.')
+    request = urllib.request.Request(
+        f'https://generativelanguage.googleapis.com/v1beta/models/{model}',
+        headers={'x-goog-api-key': key},
+    )
+    result = _gemini_json_request(request, 'Проверка доступа без фото', 20)
+    if not isinstance(result, dict) or 'generateContent' not in result.get('supportedGenerationMethods', []):
+        raise GeminiError('Проверка доступа: модель не подтвердила поддержку generateContent.')
+    return model
+
+
 def read_schedule(paths, group):
     key = os.environ.get('GEMINI_API_KEY', '').strip()
     if not key:
@@ -213,17 +281,7 @@ def read_schedule(paths, group):
         data=json.dumps(payload).encode(),
         headers={'x-goog-api-key': key, 'Content-Type': 'application/json'},
     )
-    try:
-        with urllib.request.urlopen(request, timeout=90) as response:
-            result = json.load(response)
-    except urllib.error.HTTPError as error:
-        messages = {400: 'Запрос отклонён: проверь доступность Gemini в регионе сервера и настройки модели.',
-                    401: 'Ключ Gemini не принят.', 403: 'Gemini запретил доступ. Проверь ключ и ограничения проекта.',
-                    404: 'Модель Gemini недоступна. Нужно выбрать другую через GEMINI_MODEL.',
-                    429: 'Лимит Gemini исчерпан или бесплатная квота недоступна. Проверь квоту проекта.'}
-        raise GeminiError(messages.get(error.code, f'Сбой Gemini (HTTP {error.code}). Повтори позже.')) from None
-    except (urllib.error.URLError, socket.timeout, TimeoutError, ValueError):
-        raise GeminiError('Не удалось получить ответ Gemini за отведённое время. Попробуй позже.') from None
+    result = _gemini_json_request(request, 'Распознавание фото', 90)
     try:
         candidate = result['candidates'][0]
         if candidate.get('finishReason') != 'STOP':
