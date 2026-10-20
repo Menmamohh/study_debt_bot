@@ -72,7 +72,7 @@ def read_schedule(paths, group):
     key = os.environ.get('GEMINI_API_KEY', '').strip()
     if not key:
         raise GeminiError('На сервере не задан GEMINI_API_KEY.')
-    model = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash').removeprefix('models/')
+    model = os.environ.get('GEMINI_MODEL', 'gemini-3.8-flash').removeprefix('models/')
     if not re.fullmatch(r'[a-zA-Z0-9._-]+', model):
         raise GeminiError('Некорректное имя GEMINI_MODEL.')
     prompt = (
