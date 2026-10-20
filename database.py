@@ -196,6 +196,20 @@ def init_db():
                 telegram_message_id INTEGER
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS schedule_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_name TEXT NOT NULL,
+                schedule_date TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                sources TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'draft',
+                notified INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(group_name, schedule_date, fingerprint)
+            )
+        """)
         cursor.executescript("""
             CREATE INDEX IF NOT EXISTS idx_subjects_user ON subjects(user_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_user_subject ON tasks(user_id, subject_id);

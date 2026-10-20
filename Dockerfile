@@ -14,7 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Только файлы, необходимые в рантайме.
-COPY bot.py database.py keyboards.py gdrive_sync.py ./
+COPY bot.py database.py keyboards.py gdrive_sync.py schedule_review.py ./
 COPY helper_cat.png ./
 COPY assets ./assets
 

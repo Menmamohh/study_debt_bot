@@ -28,6 +28,7 @@ from aiogram.types import Message, CallbackQuery, FSInputFile, InputMediaPhoto, 
 import database as db
 import keyboards as kb
 import gdrive_sync
+import schedule_review
 
 
 class AsyncDatabase:
@@ -284,6 +285,7 @@ class Form(StatesGroup):
     waiting_for_material_title = State()
     waiting_for_material_file = State()
     waiting_for_schedule_pair = State()
+    waiting_for_schedule_review = State()
     waiting_for_group_schedule = State()
     waiting_for_custom_group = State()
     waiting_for_group_confirmation = State()
@@ -811,6 +813,8 @@ async def show_admin_panel(message_or_callback, user, bot: Bot, is_callback: boo
         pending_feedback_count=pending_feedback_count,
     )
     
+    markup.inline_keyboard.insert(0, [InlineKeyboardButton(text="📝 Черновики замен", callback_data="sr_queue")])
+
     status_lines = []
     if pending_users_count > 0:
         status_lines.append(f"👥 <b>Заявок на вход (верификация):</b> <b>{pending_users_count}</b> шт.")
@@ -1896,6 +1900,21 @@ async def render_group_schedule_view(
     version_id: Optional[int] = None,
 ):
     """Show the newest publication, or a requested retained version for this user."""
+    if version_id is None and group_name != "ALL":
+        date = gdrive_sync.get_target_study_date()[0]
+        approved = await asyncio.to_thread(schedule_review.approved_schedule, group_name, date)
+        if approved:
+            text = (f"📅 <b>Замены — {html.escape(group_name)}, {date:%d.%m.%Y}</b>\n\n"
+                    f"{html.escape(approved['body'])}\n\n"
+                    "✅ Текст проверен администратором.\n"
+                    "Это лист замен; остальные занятия — по основному расписанию.")
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📸 Исходные листы", callback_data="sched_view_ALL")],
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sched_view_{group_name}")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+            ])
+            await show_user_screen(target, text, reply_markup=markup)
+            return
     versions = await adb.get_schedule_versions(group_name)
     if versions:
         selected = next((item for item in versions if item["id"] == version_id), None) if version_id else versions[0]
@@ -2616,7 +2635,135 @@ async def cb_admin_gdrive_sync(callback: CallbackQuery, bot: Bot):
         f"📋 <b>Актуальные документы:</b>\n" + ("\n".join(lines) if lines else "<i>(файлы не найдены)</i>") + "\n\n"
         f"💡 <i>Свежие листы замен теперь доступны всем студентам во вкладке «📅 Расписание»!</i>"
     )
-    await status_msg.edit_text(report, parse_mode="HTML", reply_markup=kb.back_to_menu_kb())
+    await status_msg.edit_text(report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Черновики замен", callback_data="sr_queue")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ]))
+    await prepare_and_notify_schedule_reviews(bot)
+
+
+def schedule_review_kb(review_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Исправить текст", callback_data=f"sr_edit_{review_id}")],
+        [InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"sr_publish_{review_id}"),
+         InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"sr_skip_{review_id}")],
+    ])
+
+
+async def send_schedule_review(bot, chat_id, draft):
+    import json
+    for photo in json.loads(draft['sources']):
+        await bot.send_photo(chat_id=chat_id, photo=FSInputFile(photo['source']), caption=photo['caption'])
+    body = html.escape(draft['body']) if draft['body'] else (
+        "⚠️ Текст не удалось прочитать. Нажми «Исправить текст» и введи замены вручную.")
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(f"📝 <b>Черновик замен — {html.escape(draft['group_name'])}, {draft['schedule_date']}</b>\n\n"
+              f"{body}\n\nСверь группу, дату, пары и кабинеты с фото. Студенты увидят текст после публикации."),
+        parse_mode="HTML", reply_markup=schedule_review_kb(draft['id']))
+
+
+async def prepare_and_notify_schedule_reviews(bot):
+    await asyncio.to_thread(schedule_review.prepare_reviews)
+    if not ADMIN_ID:
+        return
+    for draft in await asyncio.to_thread(schedule_review.pending_reviews, True):
+        try:
+            await send_schedule_review(bot, ADMIN_ID, draft)
+            await asyncio.to_thread(schedule_review.mark_notified, draft['id'])
+        except Exception as error:
+            logger.warning("Could not send schedule review %s: %s", draft['id'], error)
+            break  # Retry after the next sync, without losing the draft.
+
+
+@dp.callback_query(F.data == "sr_queue")
+async def cb_schedule_review_queue(callback: CallbackQuery):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Только для администратора в личном чате.", show_alert=True)
+        return
+    await callback.answer()
+    drafts = await asyncio.to_thread(schedule_review.pending_reviews)
+    if not drafts:
+        await callback.message.answer("Черновиков на проверку нет.")
+    for draft in drafts[:10]:
+        await send_schedule_review(callback.bot, callback.from_user.id, draft)
+    if len(drafts) > 10:
+        await callback.message.answer("Показаны первые 10 черновиков. Обработай их и открой очередь снова.")
+
+
+@dp.callback_query(F.data.startswith("sr_edit_") | F.data.startswith("sr_publish_") | F.data.startswith("sr_skip_"))
+async def cb_schedule_review_action(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Только для администратора в личном чате.", show_alert=True)
+        return
+    try:
+        _, action, raw_id = callback.data.split('_', 2)
+        review_id = int(raw_id)
+    except ValueError:
+        await callback.answer("Некорректная кнопка.", show_alert=True)
+        return
+    draft = await asyncio.to_thread(schedule_review.get_review, review_id)
+    if not draft or draft['status'] != 'draft' or draft['schedule_date'] < gdrive_sync.get_target_study_date()[0].isoformat():
+        await callback.answer("Черновик уже обработан, устарел или заменён новым листом.", show_alert=True)
+        return
+    if action == 'edit':
+        await state.set_state(Form.waiting_for_schedule_review)
+        await state.update_data(schedule_review_id=review_id)
+        await callback.answer()
+        await callback.message.answer(
+            f"Отправь полный исправленный текст замен для {draft['group_name']} на {draft['schedule_date']}. "
+            f"До {schedule_review.MAX_BODY} символов. Для отмены — /cancel.")
+        return
+    if action == 'publish' and not draft['body'].strip():
+        await callback.answer("Сначала введи текст через «Исправить текст».", show_alert=True)
+        return
+    changed = await asyncio.to_thread(schedule_review.finish_review, review_id, action == 'publish')
+    if not changed:
+        await callback.answer("Этот черновик уже обработан или устарел.", show_alert=True)
+        return
+    await callback.answer("Опубликовано" if action == 'publish' else "Пропущено")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await state.clear()
+    if action == 'publish':
+        users = await adb.get_verified_users_by_group(draft['group_name'])
+        sent = failed = 0
+        for user in users:
+            try:
+                await callback.bot.send_message(
+                    chat_id=user['user_id'],
+                    text=f"📅 Проверены замены для {draft['group_name']} на {draft['schedule_date']}.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="Открыть расписание", callback_data=f"sched_view_{draft['group_name']}")]]))
+                sent += 1
+                await asyncio.sleep(0.05)
+            except Exception as error:
+                failed += 1
+                logger.warning("Schedule review notification failed: %s", error)
+        await callback.message.answer(f"Текст опубликован. Уведомлений доставлено: {sent}, не доставлено: {failed}.")
+    else:
+        await callback.message.answer("Черновик пропущен. Его текст не опубликован.")
+
+
+@dp.message(Form.waiting_for_schedule_review)
+async def process_schedule_review_edit(message: Message, state: FSMContext):
+    if not is_admin(message.from_user) or message.chat.type != "private":
+        return
+    if message.text and message.text.startswith('/'):
+        await state.clear()
+        await message.answer("Редактирование черновика отменено.")
+        return
+    data = await state.get_data()
+    review_id = data.get('schedule_review_id')
+    if not message.text or not message.text.strip() or len(message.text.strip()) > schedule_review.MAX_BODY:
+        await message.answer(f"Отправь текст от 1 до {schedule_review.MAX_BODY} символов.")
+        return
+    saved = await asyncio.to_thread(schedule_review.edit_review, review_id, message.text)
+    await state.clear()
+    if not saved:
+        await message.answer("Черновик уже обработан или заменён новым листом. Открой очередь снова.")
+        return
+    draft = await asyncio.to_thread(schedule_review.get_review, review_id)
+    await send_schedule_review(message.bot, message.chat.id, draft)
 
 
 # Совместимость со старыми кнопками
@@ -4014,6 +4161,8 @@ async def gdrive_sync_background_loop(bot: Bot):
         try:
             loop = asyncio.get_running_loop()
             res = await loop.run_in_executor(None, gdrive_sync.sync_drive_schedule)
+            if res.get("ok"):
+                await prepare_and_notify_schedule_reviews(bot)
             if res.get("ok") and res.get("new_downloaded", 0) > 0:
                 logger.info(f"Google Drive background sync: downloaded {res['new_downloaded']} new files")
                 if ADMIN_ID:
