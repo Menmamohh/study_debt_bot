@@ -57,16 +57,18 @@ class AdminOcrTests(unittest.TestCase):
                 "schedule_date": "2026-10-20",
             }]
             with patch.object(bot, "show_user_screen", new=AsyncMock(side_effect=capture_screen)), \
-                    patch.object(bot.db, "get_latest_gdrive_schedule_files", return_value=files), \
-                    patch.object(bot.gdrive_sync, "get_target_study_date", return_value=(datetime.date(2026, 10, 20), False, "")), \
+                    patch.object(bot.db, "get_latest_gdrive_schedule_files", return_value=files) as get_files, \
+                    patch.object(bot.gdrive_sync, "get_target_study_date", return_value=(datetime.date(2026, 10, 21), False, "")), \
                     patch.object(bot.gdrive_sync, "_schedule_group_markers", return_value=(900, 1200, (("ТТ-36", 100),))), \
                     patch.object(bot.gdrive_sync, "_ocr_schedule_group", return_value="Пара: технология"), \
                     patch.object(bot.adb, "set_ui_message_id", new=AsyncMock()):
                 asyncio.run(bot.cb_admin_ocr_group(FakeCallback()))
+                self.assertEqual(get_files.call_args.kwargs, {"doc_type": "replacement"})
 
             self.assertIn("Пара: технология", rendered["text"])
             self.assertIn("не публикуется студентам", rendered["text"])
             self.assertIn("Найдены группы: ТТ-36", rendered["text"])
+            self.assertIn("2026-10-20", rendered["text"])
             self.assertEqual(rendered["photo"]["chat_id"], 99)
             buttons = [button.callback_data for row in rendered["markup"].inline_keyboard for button in row]
             self.assertNotIn("sr_publish_", " ".join(buttons))

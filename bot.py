@@ -874,7 +874,7 @@ async def cb_admin_ocr_mode(callback: CallbackQuery):
         return
     text = (
         "🔎 <b>Проверка распознавания расписания</b>\n\n"
-        "Выбери группу. Бот на сервере прочитает ближайший лист замен, покажет найденный текст и исходные фото. "
+        "Выбери группу. Бот на сервере прочитает самый свежий сохранённый лист замен, покажет его дату, найденный текст и исходные фото. "
         "Этот результат увидишь только ты; студентам он не отправляется."
     )
     await show_user_screen(callback, text, reply_markup=kb.admin_ocr_groups_kb(db.COLLEGE_GROUPS))
@@ -897,17 +897,15 @@ async def cb_admin_ocr_group(callback: CallbackQuery):
         f"⏳ Проверяю распознавание для <b>{html.escape(group_name)}</b> на сервере…",
         reply_markup=kb.admin_ocr_result_kb(),
     )
-    target_date = gdrive_sync.get_target_study_date()[0]
     files = await asyncio.to_thread(
         db.get_latest_gdrive_schedule_files,
         doc_type="replacement",
-        min_date=target_date.isoformat(),
     )
     files = [item for item in files if item.get("local_path") and os.path.isfile(item["local_path"])]
     if not files:
         await show_user_screen(
             callback,
-            "📄 Не нашёл сохранённый лист замен для ближайшей учебной даты. Сначала обнови расписание с Google Диска.",
+            "📄 Не нашёл сохранённые листы замен. Сначала обнови расписание с Google Диска.",
             reply_markup=kb.admin_ocr_result_kb(),
         )
         return
@@ -931,7 +929,7 @@ async def cb_admin_ocr_group(callback: CallbackQuery):
             recognized = "⚠️ Заголовок группы найден, но текст расписания прочитать не удалось."
         pages.append((path, item, width, height, detected, recognized))
 
-    target = files[0].get("schedule_date") or target_date.isoformat()
+    target = files[0].get("schedule_date") or "дата не указана"
     lines = [
         f"🔎 <b>Проверка OCR · {html.escape(group_name)} · {html.escape(target)}</b>",
         "Результат виден только администратору и не публикуется студентам.",
@@ -955,7 +953,8 @@ async def cb_admin_ocr_group(callback: CallbackQuery):
         result = result[:3850] + "…\n\n<i>Текст сокращён для сообщения Telegram.</i>"
     await show_user_screen(callback, result, reply_markup=kb.admin_ocr_result_kb())
 
-    # Keep sent photo IDs in the tracked menu history so menu navigation cleans them up.
+    # Показываем оригиналы после результата и учитываем их в общей уборке
+    # сообщений, чтобы они исчезали при следующем переходе по меню.
     for start in range(0, len(pages), 10):
         batch = pages[start:start + 10]
         try:
