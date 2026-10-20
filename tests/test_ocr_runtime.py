@@ -51,3 +51,26 @@ class OcrRuntimeTests(unittest.TestCase):
         with patch.object(sync.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, tsv, b'')) as run:
             self.assertEqual(sync._ocr_schedule_group(str(self.image), 0, 'ТТ-36'), '')
         self.assertEqual(run.call_count, 1)
+    def test_tsv_is_formatted_as_lesson_subject_and_teacher(self):
+        header = 'level\tpage_num\tblock_num\tpar_num\tline_num\tleft\ttop\twidth\theight\tconf\ttext\n'
+        entries = [
+            (5, 1, 1, 1, 1, 340, 100, 32, 18, 91, '1,2'),
+            (5, 1, 1, 1, 1, 420, 100, 180, 18, 91, 'Математика'),
+            (5, 1, 1, 1, 1, 1050, 100, 115, 18, 91, 'Иванова'),
+            (5, 1, 1, 1, 2, 340, 130, 12, 18, 91, '3'),
+            (5, 1, 1, 1, 2, 420, 130, 200, 18, 91, 'Физика'),
+            (5, 1, 1, 1, 2, 1050, 130, 115, 18, 91, 'Петров'),
+            (5, 1, 1, 1, 3, 340, 160, 32, 18, 91, '6,7'),
+            (5, 1, 1, 1, 3, 420, 160, 210, 18, 91, 'Дизайн мебели'),
+            (5, 1, 1, 1, 3, 1050, 160, 115, 18, 91, 'Чернышев'),
+            (5, 1, 1, 1, 4, 420, 190, 210, 18, 91, 'Экономика'),
+            (5, 1, 1, 1, 4, 1050, 190, 115, 18, 91, 'Шенок'),
+        ]
+        tsv = header + ''.join('\t'.join(map(str, row)) + '\n' for row in entries)
+        self.assertEqual(
+            sync._format_schedule_ocr(tsv, 1650),
+            '1-2 Математика (Иванова)\n'
+            '3 Физика (Петров)\n'
+            '6-7 Дизайн мебели (Чернышев)\n'
+            '6-7 Экономика (Шенок)',
+        )
