@@ -146,3 +146,41 @@ class ScheduleReviewTests(unittest.TestCase):
             asyncio.run(bot.cb_schedule_review_queue(callback))
         self.assertEqual(show.call_args.args[1], 'Черновиков на проверку нет.')
         self.assertIsNotNone(show.call_args.kwargs['reply_markup'])
+
+    def test_gemini_batch_is_cached_across_restart_and_manual_edits_survive(self):
+        with patch.object(review, 'configured', return_value=True), \
+             patch.object(gdrive_sync, 'drive_schedule_payload', return_value={'photos': self.sources}), \
+             patch.object(review, 'check_connection'), \
+             patch.object(review, 'read_schedule', return_value={'groups': {'ТТ-36': '1-2 Дизайн (Иванов)', 'ВД-70': '3 Математика'}}) as read, \
+             patch.object(gdrive_sync, '_schedule_group_markers') as markers:
+            review.prepare_reviews()
+            self.assertEqual(read.call_count, 1)
+            self.assertIsNone(read.call_args.args[1])
+            self.assertEqual(len(review.pending_reviews()), 2)
+            draft = next(d for d in review.pending_reviews() if d['group_name'] == 'ТТ-36')
+            review.edit_review(draft['id'], 'Исправлено вручную')
+            db.init_db()
+            review.prepare_reviews()
+            self.assertEqual(read.call_count, 1)
+            self.assertEqual(review.get_review(draft['id'])['body'], 'Исправлено вручную')
+            markers.assert_not_called()
+            self.assertIsNone(review.approved_schedule('ТТ-36', self.date))
+
+    def test_gemini_new_content_at_same_path_invalidates_old_publication_and_retries_failure(self):
+        with patch.object(review, 'configured', return_value=True), \
+             patch.object(gdrive_sync, 'drive_schedule_payload', return_value={'photos': self.sources}), \
+             patch.object(review, 'check_connection'), \
+             patch.object(review, 'read_schedule', return_value={'groups': {'ТТ-36': '1 Дизайн'}}) as read:
+            review.prepare_reviews()
+            draft = review.pending_reviews()[0]
+            review.finish_review(draft['id'], True)
+            Path(self.sources[0]['source']).write_bytes(b'changed photo content')
+            read.side_effect = review.GeminiError('Квота исчерпана')
+            with self.assertRaises(review.GeminiError): review.prepare_reviews()
+            self.assertIsNone(review.approved_schedule('ТТ-36', self.date))
+            self.assertFalse(review.finish_review(draft['id'], True))
+            read.side_effect = None
+            read.return_value = {'groups': {'ТТ-36': '3 Новый предмет'}}
+            review.prepare_reviews()
+            self.assertEqual(review.pending_reviews()[0]['body'], '3 Новый предмет')
+            self.assertEqual(read.call_count, 3)
