@@ -1660,31 +1660,61 @@ async def cb_admin_users_queue(callback: CallbackQuery, bot: Bot):
     await callback.answer("Обновляю очередь внизу чата…")
     await render_admin_verification_queue(bot, page, recreate=True)
 
-@dp.callback_query((F.data == "adm_users_list") | F.data.startswith("adm_users_list_"))
+@dp.callback_query((F.data == "adm_users_list") | F.data.startswith("adm_users_list_") | F.data.startswith("vuc_"))
 async def cb_admin_users_list(callback: CallbackQuery):
-    if not is_admin(callback.from_user):
-        await callback.answer("⛔ Доступ только для @Menmamoh!", show_alert=True)
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("⛔ Доступ только администратору в личном чате!", show_alert=True)
         return
-        
-    page = int(callback.data.rsplit("_", 1)[1]) if callback.data != "adm_users_list" else 0
-    total = await adb.count_verified_users()
-    verified = await adb.get_verified_users(ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
-    if not verified:
-        text = "👥 <b>Список верифицированных студентов пуст.</b>"
+    page = 0
+    if callback.data.startswith("vuc_"):
+        try:
+            page = int(callback.data[len("vuc_"):])
+        except ValueError:
+            await callback.answer("Открой список групп заново.", show_alert=True)
+            return
+    groups = await adb.get_verified_user_groups()
+    page = min(max(0, page), max(0, (len(groups) - 1) // ADMIN_PAGE_SIZE))
+    if not groups:
+        text = "👥 <b>Верифицированных студентов пока нет.</b>"
     else:
-        text = f"👥 <b>Верифицированные студенты ({total} чел.)</b> · страница {page + 1}\n\n"
-        for i, u in enumerate(verified, page * ADMIN_PAGE_SIZE + 1):
-            s_name = html.escape(u.get("student_name") or "Студент")
-            s_grp = html.escape(u.get("student_group") or "")
-            uname = f" ({html.escape(u['username'])})" if u.get("username") else ""
-            text += f"{i}. <b>{s_name}</b> [<code>{s_grp}</code>]{uname}\n"
-        text += "\n<i>Студенты получают уведомления при обновлении расписания.</i>"
-        
-    await safe_edit_message(
-        callback,
-        text,
-        reply_markup=kb.admin_verified_users_page_kb(page, total, ADMIN_PAGE_SIZE)
-    )
+        text = (
+            "👥 <b>Верифицированные студенты по группам</b>\n\n"
+            f"Всего: <b>{sum(group['total'] for group in groups)}</b> · групп: <b>{len(groups)}</b>\n"
+            f"Страница {page + 1} из {(len(groups) - 1) // ADMIN_PAGE_SIZE + 1}\n\n"
+            "Выбери группу:"
+        )
+    await safe_edit_message(callback, text, reply_markup=kb.admin_verified_groups_kb(groups, page, ADMIN_PAGE_SIZE))
+
+
+@dp.callback_query(F.data.startswith("vug_"))
+async def cb_admin_verified_group(callback: CallbackQuery):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("⛔ Доступ только администратору в личном чате!", show_alert=True)
+        return
+    try:
+        _, token, page_value = callback.data.split("_")
+        page = int(page_value)
+    except (ValueError, AttributeError):
+        await callback.answer("Открой список групп заново.", show_alert=True)
+        return
+    groups = await adb.get_verified_user_groups()
+    group = next((group for group in groups if group['token'] == token), None)
+    if group is None:
+        await safe_edit_message(callback, "В этой группе больше нет верифицированных студентов.",
+                                reply_markup=kb.admin_verified_users_page_kb(token, 0, 0))
+        return
+    result = await adb.get_verified_group_page(group['group_name'], page, ADMIN_PAGE_SIZE)
+    page, total = result['page'], result['total']
+    lines = [f"👥 <b>{html.escape(group['group_name'] or 'Без группы')}</b> — {total} чел.",
+             f"Страница {page + 1} из {max(1, (total - 1) // ADMIN_PAGE_SIZE + 1)}", ""]
+    for index, user in enumerate(result['users'], page * ADMIN_PAGE_SIZE + 1):
+        name = html.escape(user['student_name'] or 'Студент')
+        username = f" · {html.escape(user['username'])}" if user.get('username') else ""
+        lines.append(f"{index}. <b>{name}</b>{username}\nID: <code>{user['user_id']}</code>")
+    if not total:
+        lines.append("В этой группе больше нет верифицированных студентов.")
+    await safe_edit_message(callback, "\n".join(lines),
+                            reply_markup=kb.admin_verified_users_page_kb(token, page, total, ADMIN_PAGE_SIZE))
 
 # =========================================================================
 # --- АКТУАЛЬНОЕ ОПЕРАТИВНОЕ РАСПИСАНИЕ ПО ГРУППАМ (ПЯТНАШКА) ---
