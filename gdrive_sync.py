@@ -459,7 +459,7 @@ def _format_schedule_ocr(tsv_text: str, image_width: int) -> str:
     """
     words_by_line = {}
     try:
-        for word in csv.DictReader(io.StringIO(tsv_text), delimiter="\t"):
+        for word in csv.DictReader(io.StringIO(tsv_text), delimiter="\t", quoting=csv.QUOTE_NONE):
             if word.get("level") != "5" or not word.get("text", "").strip():
                 continue
             left = int(word.get("left", 0))
@@ -500,11 +500,11 @@ def _format_schedule_ocr(tsv_text: str, image_width: int) -> str:
         cells = {"lesson": [], "subject": [], "teacher": []}
         for left, _y, _width, _height, text in sorted(words, key=lambda word: word[0]):
             x = left / image_width
-            if 0.17 <= x < 0.245:
+            if 0.17 <= x < 0.23:
                 cells["lesson"].append(text)
-            elif 0.245 <= x < 0.63:
+            elif 0.23 <= x < 0.625:
                 cells["subject"].append(text)
-            elif 0.63 <= x < 0.85:
+            elif 0.625 <= x < 0.87:
                 cells["teacher"].append(text)
 
         lesson_text = " ".join(cells["lesson"]).strip(" .:|-")
@@ -530,7 +530,7 @@ def _format_schedule_ocr(tsv_text: str, image_width: int) -> str:
 
     formatted = []
     for lesson, subject, teacher in records:
-        subject = re.sub(r"\s+", " ", subject).strip(" |:;\t")
+        subject = re.sub(r"\s+", " ", subject).strip(' |:;\t"“')
         teacher = re.sub(r"\s+", " ", teacher).strip(" |:;\t")
         if not subject:
             continue
@@ -580,7 +580,7 @@ def _schedule_group_markers(path: str, modified_at: float) -> Tuple[int, int, Tu
 
         line_words = {}
         output = result.stdout.decode("utf-8", errors="replace")
-        for row in csv.DictReader(io.StringIO(output), delimiter="\t"):
+        for row in csv.DictReader(io.StringIO(output), delimiter="\t", quoting=csv.QUOTE_NONE):
             if row.get("level") != "5" or not row.get("text", "").strip():
                 continue
             try:
@@ -623,62 +623,69 @@ def _ocr_schedule_group(path: str, modified_at: float, group_name: str) -> str:
     bottom = height if group_index + 1 == len(markers) else markers[group_index + 1][1] - 4
     try:
         with Image.open(path) as image:
-            # Stop the last group's block at the table edge, before signatures.
+            # A photographed table is slightly skewed. A vertical minimum
+            # filter lets a horizontal rule span neighboring scan lines.
             if group_index + 1 == len(markers):
-                grey = ImageOps.grayscale(image)
+                grey = ImageOps.grayscale(image).filter(ImageFilter.MinFilter(7))
                 rules = [y for y in range(top + 5, image.height)
                          if sum(value < 120 for value in grey.crop((0, y, image.width, y + 1)).getdata())
                          > image.width * 0.60]
                 if rules:
-                    bottom = rules[-1] + 2
-            crop = image.convert("RGB").crop(
+                    bottom = rules[-1] + 1
+            crop = ImageOps.autocontrast(ImageOps.grayscale(image.crop(
                 (0, max(0, top - 4), image.width, min(image.height, bottom))
-            )
-            # Drive sheets are phone photos of tightly ruled tables. Enlarge and
-            # normalize the selected group's block before OCR so small Cyrillic
-            # print and faint grid text survive recognition.
-            crop = ImageOps.grayscale(crop)
-            crop = ImageOps.autocontrast(crop, cutoff=1)
-            upscale = min(2.0, 2200 / max(crop.width, crop.height))
-            if upscale > 1:
-                crop = crop.resize((int(crop.width * upscale), int(crop.height * upscale)), Image.Resampling.LANCZOS)
-            crop = ImageEnhance.Contrast(crop).enhance(1.35)
-            crop = crop.filter(ImageFilter.SHARPEN)
+            )), cutoff=1)
+
+        combined = []
+        fields = None
+        # Read each column independently so table rules and the group label
+        # cannot be mistaken for part of a lesson number or teacher name.
+        for column, (left_ratio, right_ratio) in enumerate(
+                ((0.185, 0.228), (0.235, 0.625), (0.627, 0.869)), start=1):
+            left, right = int(width * left_ratio), int(width * right_ratio)
+            cell = crop.crop((left, 0, right, crop.height))
+            pixels = cell.load()
+            rules = [y for y in range(cell.height)
+                     if sum(any(pixels[x, yy] < 140
+                                for yy in range(max(0, y - 1), min(cell.height, y + 2)))
+                            for x in range(cell.width)) > cell.width * 0.70]
+            for y in rules:
+                for x in range(cell.width):
+                    pixels[x, y] = 255
+            cell = cell.resize((cell.width * 4, cell.height * 4), Image.Resampling.LANCZOS)
+            cell = cell.point(lambda pixel: 0 if pixel < 140 else 255)
+            cell = ImageOps.expand(cell, border=20, fill=255)
             buffer = io.BytesIO()
-            crop.save(buffer, format="PNG")
-        # Different layouts work better for the photographed multi-column tables.
-        # Select the OCR result with the strongest Tesseract confidence instead
-        # of relying on a single page segmentation guess.
-        result = subprocess.run(
-            ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", "6", "tsv"],
-            input=buffer.getvalue(),
-            capture_output=True,
-            timeout=OCR_TIMEOUT_SECONDS,
-            check=False,
-        )
-        candidates = []
-        if result.returncode == 0:
-            words = [row for row in csv.DictReader(io.StringIO(result.stdout.decode("utf-8", errors="replace")), delimiter="\t")
-                     if row.get("level") == "5" and row.get("text", "").strip()]
-            confidences = [float(row["conf"]) for row in words if row.get("conf", "-1") not in ("-1", "")]
-            confidence = sum(confidences) / len(confidences) if confidences else 0
-            if words and confidence >= 38:
-                lines = {}
-                for row in words:
-                    key = (row.get("block_num"), row.get("par_num"), row.get("line_num"))
-                    lines.setdefault(key, []).append(row["text"].strip())
-                text = "\n".join(" ".join(line) for line in lines.values())
-                formatted = _format_schedule_ocr(
-                    result.stdout.decode("utf-8", errors="replace"), crop.width
-                )
-                candidates.append((confidence, formatted or text))
+            cell.save(buffer, format="PNG")
+            result = subprocess.run(
+                ["tesseract", "stdin", "stdout", "-l", "rus+eng", "--psm", "6", "tsv"],
+                input=buffer.getvalue(), capture_output=True,
+                timeout=OCR_TIMEOUT_SECONDS, check=False,
+            )
+            if result.returncode != 0:
+                return ""
+            reader = csv.DictReader(io.StringIO(result.stdout.decode("utf-8", errors="replace")), delimiter="\t", quoting=csv.QUOTE_NONE)
+            fields = reader.fieldnames
+            for row in reader:
+                if row.get("level") != "5" or not row.get("text", "").strip():
+                    continue
+                if not all(row.get(key) for key in ("left", "top", "width", "height")):
+                    continue
+                row["left"] = str(int(row["left"]) - 20 + left * 4)
+                row["top"] = str(int(row["top"]) - 20)
+                row["block_num"] = str(column)
+                combined.append(row)
+        if not combined:
+            return ""
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=fields, delimiter="\t", quoting=csv.QUOTE_NONE)
+        writer.writeheader()
+        writer.writerows(combined)
+        # A failed table reconstruction must never silently return raw OCR.
+        return _format_schedule_ocr(buffer.getvalue(), width * 4)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         logger.warning("Could not OCR group %s in %s: %s", group_name, path, error)
         return ""
-    if not candidates:
-        logger.warning("Tesseract could not read group %s in %s with sufficient confidence", group_name, path)
-        return ""
-    return max(candidates, key=lambda candidate: candidate[0])[1].strip()
 
 
 def get_active_schedule_text(group_name: str, target_date: Optional[datetime.date] = None) -> str:
