@@ -678,7 +678,7 @@ def _ocr_schedule_group(path: str, modified_at: float, group_name: str) -> str:
         if not combined:
             return ""
         buffer = io.StringIO()
-        writer = csv.DictWriter(buffer, fieldnames=fields, delimiter="\t", quoting=csv.QUOTE_NONE)
+        writer = csv.DictWriter(buffer, fieldnames=fields, delimiter="\t", quoting=csv.QUOTE_NONE, quotechar=None)
         writer.writeheader()
         writer.writerows(combined)
         # A failed table reconstruction must never silently return raw OCR.
