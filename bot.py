@@ -29,7 +29,7 @@ import database as db
 import keyboards as kb
 import gdrive_sync
 import schedule_review
-import gemini_schedule
+import schedule_review as gemini_schedule
 
 
 class AsyncDatabase:
