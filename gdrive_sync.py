@@ -450,6 +450,94 @@ def _normalise_group_label(value: str) -> str:
     return re.sub(r"[^A-ZА-Я0-9]", "", value)
 
 
+def _format_schedule_ocr(tsv_text: str, image_width: int) -> str:
+    """Turn Tesseract word coordinates into compact lesson/subject/teacher rows.
+
+    The replacement sheets place lesson numbers, subjects and teachers in
+    neighboring columns. Reading the TSV positions avoids flattening those
+    columns into the noisy text seen in the old diagnostic output.
+    """
+    words_by_line = {}
+    try:
+        for word in csv.DictReader(io.StringIO(tsv_text), delimiter="\t"):
+            if word.get("level") != "5" or not word.get("text", "").strip():
+                continue
+            left = int(word.get("left", 0))
+            top = int(word.get("top", 0))
+            width = int(word.get("width", 0))
+            height = int(word.get("height", 0))
+            key = (word.get("block_num"), word.get("par_num"), word.get("line_num"))
+            words_by_line.setdefault(key, []).append(
+                (left, top + height / 2, width, height, word["text"].strip())
+            )
+    except (TypeError, ValueError, KeyError):
+        return ""
+
+    if not words_by_line or image_width <= 0:
+        return ""
+
+    # Tesseract can split cells into separate lines. Rejoin lines whose word
+    # centers are at the same height, then sort each row from left to right.
+    lines = []
+    for words in words_by_line.values():
+        center = sum(word[1] for word in words) / len(words)
+        lines.append((center, words))
+    lines.sort(key=lambda item: item[0])
+    row_groups = []
+    for center, words in lines:
+        tolerance = max(5, min(12, sum(word[3] for word in words) / len(words) * 0.55))
+        if row_groups and center - row_groups[-1][0] <= tolerance:
+            row_groups[-1][1].extend(words)
+            previous_center, previous_words = row_groups[-1]
+            row_groups[-1] = (sum(word[1] for word in previous_words) / len(previous_words), previous_words)
+        else:
+            row_groups.append((center, list(words)))
+
+    lesson_pattern = re.compile(r"^\d{1,2}(?:[,.]\d{1,2}|[-–]\d{1,2})?$")
+    records = []
+    current_lesson = ""
+    for _center, words in row_groups:
+        cells = {"lesson": [], "subject": [], "teacher": []}
+        for left, _y, _width, _height, text in sorted(words, key=lambda word: word[0]):
+            x = left / image_width
+            if 0.17 <= x < 0.245:
+                cells["lesson"].append(text)
+            elif 0.245 <= x < 0.63:
+                cells["subject"].append(text)
+            elif 0.63 <= x < 0.85:
+                cells["teacher"].append(text)
+
+        lesson_text = " ".join(cells["lesson"]).strip(" .:|-")
+        lesson_text = re.sub(r"\s+", "", lesson_text)
+        if lesson_text and lesson_pattern.fullmatch(lesson_text):
+            parts = re.fullmatch(r"(\d{1,2})[,.](\d{1,2})", lesson_text)
+            if parts and int(parts.group(2)) == int(parts.group(1)) + 1:
+                current_lesson = f"{parts.group(1)}-{parts.group(2)}"
+            else:
+                current_lesson = lesson_text.replace("–", "-").replace(".", ",")
+
+        subject = " ".join(cells["subject"]).strip()
+        teacher = " ".join(cells["teacher"]).strip()
+        if subject and current_lesson:
+            # A wrapped subject may occupy another visual row without a
+            # teacher. Join it to the previous unfinished subject.
+            if not teacher and records and records[-1][0] == current_lesson and not records[-1][2]:
+                records[-1][1] = f"{records[-1][1]} {subject}".strip()
+            else:
+                records.append([current_lesson, subject, teacher])
+        elif teacher and records and records[-1][0] == current_lesson and not records[-1][2]:
+            records[-1][2] = teacher
+
+    formatted = []
+    for lesson, subject, teacher in records:
+        subject = re.sub(r"\s+", " ", subject).strip(" |:;\t")
+        teacher = re.sub(r"\s+", " ", teacher).strip(" |:;\t")
+        if not subject:
+            continue
+        formatted.append(f"{lesson} {subject}" + (f" ({teacher})" if teacher else ""))
+    return "\n".join(formatted)
+
+
 @functools.lru_cache(maxsize=32)
 def _schedule_group_markers(path: str, modified_at: float) -> Tuple[int, int, Tuple[Tuple[str, int], ...]]:
     """Finds group labels and their vertical positions so table pages can be cropped per group."""
@@ -580,7 +668,10 @@ def _ocr_schedule_group(path: str, modified_at: float, group_name: str) -> str:
                     key = (row.get("block_num"), row.get("par_num"), row.get("line_num"))
                     lines.setdefault(key, []).append(row["text"].strip())
                 text = "\n".join(" ".join(line) for line in lines.values())
-                candidates.append((confidence, text))
+                formatted = _format_schedule_ocr(
+                    result.stdout.decode("utf-8", errors="replace"), crop.width
+                )
+                candidates.append((confidence, formatted or text))
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         logger.warning("Could not OCR group %s in %s: %s", group_name, path, error)
         return ""
