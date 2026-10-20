@@ -396,6 +396,9 @@ def admin_panel_kb(pending_materials_count: int = 0, pending_users_count: int = 
         InlineKeyboardButton(text="🧪 Режим тестирования групп", callback_data="adm_test_mode")
     ])
     kb.append([
+        InlineKeyboardButton(text="🔎 Проверить распознавание расписания", callback_data="adm_ocr_mode")
+    ])
+    kb.append([
         InlineKeyboardButton(text="📅 Опубликовать расписание для всех", callback_data="adm_sched_publish_all")
     ])
     kb.append([
@@ -418,6 +421,19 @@ def admin_test_groups_kb(groups: List[str]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=group, callback_data=f"adm_test_preview_{group}")] for group in groups]
     rows.append([InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_ocr_groups_kb(groups: List[str]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=group, callback_data=f"adm_ocr_group_{group}")] for group in groups]
+    rows.append([InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_ocr_result_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔎 Проверить другую группу", callback_data="adm_ocr_mode")],
+        [InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")],
+    ])
 
 
 def admin_test_preview_kb(group_name: str) -> InlineKeyboardMarkup:

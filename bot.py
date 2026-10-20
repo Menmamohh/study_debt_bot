@@ -867,6 +867,117 @@ async def cb_admin_test_mode(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "adm_ocr_mode")
+async def cb_admin_ocr_mode(callback: CallbackQuery):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Проверка доступна только администратору в личном чате.", show_alert=True)
+        return
+    text = (
+        "🔎 <b>Проверка распознавания расписания</b>\n\n"
+        "Выбери группу. Бот на сервере прочитает ближайший лист замен, покажет найденный текст и исходные фото. "
+        "Этот результат увидишь только ты; студентам он не отправляется."
+    )
+    await show_user_screen(callback, text, reply_markup=kb.admin_ocr_groups_kb(db.COLLEGE_GROUPS))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_ocr_group_"))
+async def cb_admin_ocr_group(callback: CallbackQuery):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Проверка доступна только администратору в личном чате.", show_alert=True)
+        return
+    group_name = callback.data.removeprefix("adm_ocr_group_")
+    if group_name not in db.COLLEGE_GROUPS:
+        await callback.answer("Неизвестная группа.", show_alert=True)
+        return
+
+    await callback.answer("Распознаю лист на сервере. Это может занять до минуты на каждую страницу.")
+    await show_user_screen(
+        callback,
+        f"⏳ Проверяю распознавание для <b>{html.escape(group_name)}</b> на сервере…",
+        reply_markup=kb.admin_ocr_result_kb(),
+    )
+    target_date = gdrive_sync.get_target_study_date()[0]
+    files = await asyncio.to_thread(
+        db.get_latest_gdrive_schedule_files,
+        doc_type="replacement",
+        min_date=target_date.isoformat(),
+    )
+    files = [item for item in files if item.get("local_path") and os.path.isfile(item["local_path"])]
+    if not files:
+        await show_user_screen(
+            callback,
+            "📄 Не нашёл сохранённый лист замен для ближайшей учебной даты. Сначала обнови расписание с Google Диска.",
+            reply_markup=kb.admin_ocr_result_kb(),
+        )
+        return
+
+    pages = []
+    for item in files:
+        path = item["local_path"]
+        modified_at = os.path.getmtime(path)
+        width, height, markers = await asyncio.to_thread(
+            gdrive_sync._schedule_group_markers, path, modified_at
+        )
+        text = await asyncio.to_thread(gdrive_sync._ocr_schedule_group, path, modified_at, group_name)
+        detected = ", ".join(name for name, _ in markers) or "группы не найдены"
+        if not width or not height:
+            recognized = "⚠️ Не удалось обработать страницу: проверь серверный журнал и попробуй ещё раз."
+        elif group_name not in {name for name, _ in markers}:
+            recognized = "⚠️ Эта группа не найдена в распознанных заголовках страницы."
+        elif text:
+            recognized = html.escape(text)
+        else:
+            recognized = "⚠️ Заголовок группы найден, но текст расписания прочитать не удалось."
+        pages.append((path, item, width, height, detected, recognized))
+
+    target = files[0].get("schedule_date") or target_date.isoformat()
+    lines = [
+        f"🔎 <b>Проверка OCR · {html.escape(group_name)} · {html.escape(target)}</b>",
+        "Результат виден только администратору и не публикуется студентам.",
+        "",
+    ]
+    for index, (_, item, width, height, detected, recognized) in enumerate(pages, start=1):
+        lines.extend([
+            f"<b>Страница {index} из {len(pages)}</b> · {html.escape(item.get('filename') or 'лист')}",
+            f"Размер: {width} × {height} · Найдены группы: {html.escape(detected)}",
+            "<b>Распознанный текст:</b>",
+            recognized,
+            "",
+        ])
+    result = "\n".join(lines)
+    if len(result) > 3900:
+        result = result[:3850] + "…\n\n<i>Текст сокращён для сообщения Telegram.</i>"
+    await show_user_screen(callback, result, reply_markup=kb.admin_ocr_result_kb())
+
+    # Keep sent photo IDs in the tracked menu history so menu navigation cleans them up.
+    for start in range(0, len(pages), 10):
+        batch = pages[start:start + 10]
+        try:
+            if len(batch) == 1:
+                sent = [await callback.bot.send_photo(
+                    chat_id=callback.from_user.id,
+                    photo=FSInputFile(batch[0][0]),
+                    caption=f"Исходный лист замен · {batch[0][1].get('schedule_date') or target}",
+                )]
+            else:
+                sent = await callback.bot.send_media_group(
+                    chat_id=callback.from_user.id,
+                    media=[InputMediaPhoto(
+                        media=FSInputFile(path),
+                        caption=f"Исходные листы замен · {target}" if offset == 0 else None,
+                    ) for offset, (path, *_rest) in enumerate(batch)],
+                )
+            for photo_message in sent:
+                await adb.set_ui_message_id(callback.from_user.id, photo_message.message_id)
+        except Exception as error:
+            logger.warning("Could not send source images for OCR check: %s", error)
+            await callback.bot.send_message(
+                chat_id=callback.from_user.id,
+                text="Не получилось прикрепить исходное фото. Распознанный текст и список найденных групп показаны выше.",
+            )
+
+
 @dp.callback_query(F.data.startswith("adm_test_preview_"))
 async def cb_admin_test_preview(callback: CallbackQuery):
     if not is_admin(callback.from_user) or callback.message.chat.type != "private":
