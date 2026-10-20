@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import urllib.error
-import gemini_schedule as gemini
+import schedule_review as gemini
 
 
 class GeminiTests(unittest.TestCase):
