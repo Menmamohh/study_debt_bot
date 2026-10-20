@@ -2809,7 +2809,14 @@ async def send_schedule_review(bot, chat_id, draft):
 
 
 async def prepare_and_notify_schedule_reviews(bot):
-    await asyncio.to_thread(schedule_review.prepare_reviews)
+    try:
+        await asyncio.to_thread(schedule_review.prepare_reviews)
+    except schedule_review.GeminiError as error:
+        if ADMIN_ID:
+            sent = await bot.send_message(chat_id=ADMIN_ID,
+                text="⚠️ Черновики Gemini не подготовлены: " + html.escape(str(error)), parse_mode="HTML")
+            await adb.set_ui_message_id(ADMIN_ID, sent.message_id)
+        return
     if not ADMIN_ID:
         return
     for draft in await asyncio.to_thread(schedule_review.pending_reviews, True):
