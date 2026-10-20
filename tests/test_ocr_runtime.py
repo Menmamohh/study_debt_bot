@@ -85,3 +85,22 @@ class OcrRuntimeTests(unittest.TestCase):
         self.assertIn('4 Основы автоматизации производства (Чванькова Н.В.)', result)
         self.assertIn('5-6 Физическая культура и здоровье', result)
         self.assertNotIn('Заместитель', result)
+
+    def test_column_pipeline_preserves_quotes_from_real_ocr(self):
+        import csv
+        import io
+        fixture = Path(__file__).parent / 'fixtures' / 'schedule_tt36.tsv'
+        rows = list(csv.DictReader(io.StringIO(fixture.read_text()), delimiter='\t', quoting=csv.QUOTE_NONE))
+        results = []
+        for column, left in enumerate((158, 200, 533), start=1):
+            selected = [dict(row) for row in rows if row['block_num'] == str(column)]
+            for row in selected:
+                row['left'] = str(int(row['left']) - left * 4 + 20)
+                row['top'] = str(int(row['top']) + 20)
+            text = '\t'.join(rows[0]) + '\n' + ''.join('\t'.join(row.values()) + '\n' for row in selected)
+            results.append(subprocess.CompletedProcess([], 0, text.encode(), b''))
+        with patch.object(sync, '_schedule_group_markers', return_value=(850, 815, (('ТТ-36', 464),))), \
+                patch.object(sync.subprocess, 'run', side_effect=results):
+            result = sync._ocr_schedule_group(str(self.image), 1, 'ТТ-36')
+        self.assertEqual(len(result.splitlines()), 6)
+        self.assertIn('3 Охрана окружающей среды и энергосбережения (Чкалова А.В.)', result)
