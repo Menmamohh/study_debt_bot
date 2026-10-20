@@ -1680,12 +1680,11 @@ async def cb_admin_users_list(callback: CallbackQuery):
             text += f"{i}. <b>{s_name}</b> [<code>{s_grp}</code>]{uname}\n"
         text += "\n<i>Студенты получают уведомления при обновлении расписания.</i>"
         
-    await callback.message.edit_text(
-        text, 
-        parse_mode="HTML", 
+    await safe_edit_message(
+        callback,
+        text,
         reply_markup=kb.admin_verified_users_page_kb(page, total, ADMIN_PAGE_SIZE)
     )
-    await callback.answer()
 
 # =========================================================================
 # --- АКТУАЛЬНОЕ ОПЕРАТИВНОЕ РАСПИСАНИЕ ПО ГРУППАМ (ПЯТНАШКА) ---
