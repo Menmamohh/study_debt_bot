@@ -21,9 +21,9 @@ class OcrRuntimeTests(unittest.TestCase):
                + '5\t1\t1\t1\t1\t100\t90\tТТ-36\n'.encode())
         with patch.object(sync.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, tsv, b'')) as run:
             text = sync._ocr_schedule_group(str(self.image), 0, 'ТТ-36')
-        self.assertEqual(text, 'ТТ-36')
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual([call.kwargs['timeout'] for call in run.call_args_list], [60, 60])
+        self.assertEqual(text, '')
+        self.assertEqual(run.call_count, 4)
+        self.assertEqual([call.kwargs['timeout'] for call in run.call_args_list], [60, 60, 60, 60])
 
     def test_detection_timeout_is_handled(self):
         with patch.object(sync.subprocess, 'run', side_effect=subprocess.TimeoutExpired('tesseract', 60)):
@@ -51,6 +51,7 @@ class OcrRuntimeTests(unittest.TestCase):
         with patch.object(sync.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, tsv, b'')) as run:
             self.assertEqual(sync._ocr_schedule_group(str(self.image), 0, 'ТТ-36'), '')
         self.assertEqual(run.call_count, 1)
+
     def test_tsv_is_formatted_as_lesson_subject_and_teacher(self):
         header = 'level\tpage_num\tblock_num\tpar_num\tline_num\tleft\ttop\twidth\theight\tconf\ttext\n'
         entries = [
@@ -74,3 +75,13 @@ class OcrRuntimeTests(unittest.TestCase):
             '6-7 Дизайн мебели (Чернышев)\n'
             '6-7 Экономика (Шенок)',
         )
+
+    def test_real_photo_recognition_rows(self):
+        fixture = Path(__file__).parent / 'fixtures' / 'schedule_tt36.tsv'
+        result = sync._format_schedule_ocr(fixture.read_text(), 3400)
+        self.assertEqual(len(result.splitlines()), 6)
+        self.assertIn('0-1 Сняты', result)
+        self.assertIn('3 Охрана окружающей среды и энергосбережения (Чкалова А.В.)', result)
+        self.assertIn('4 Основы автоматизации производства (Чванькова Н.В.)', result)
+        self.assertIn('5-6 Физическая культура и здоровье', result)
+        self.assertNotIn('Заместитель', result)
