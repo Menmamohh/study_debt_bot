@@ -37,6 +37,9 @@ def prepare_reviews():
         user_groups = {item['group_name'] for item in db.get_verified_user_groups()
                        if item['group_name'] in db.COLLEGE_GROUPS}
         for date, sources in by_date.items():
+            if configured():
+                _prepare_gemini_date(date, sources, user_groups)
+                continue
             fingerprint = hashlib.sha256(json.dumps(sources, sort_keys=True).encode()).hexdigest()
             groups = set(user_groups)
             for photo in sources:
@@ -62,6 +65,42 @@ def prepare_reviews():
                                  (group, date))
                     conn.execute('INSERT OR IGNORE INTO schedule_reviews (group_name,schedule_date,fingerprint,sources,body) VALUES (?,?,?,?,?)',
                                  (group, date, fingerprint, json.dumps(sources, ensure_ascii=False), body))
+
+
+def _prepare_gemini_date(date, sources, user_groups):
+    # Content hashes survive restarts and detect a replaced file at the same path.
+    content = [{'caption': photo['caption'],
+                'sha256': hashlib.sha256(Path(photo['source']).read_bytes()).hexdigest()}
+               for photo in sources]
+    fingerprint = 'gemini-v1:' + hashlib.sha256(json.dumps(
+        sorted(content, key=lambda item: (item['caption'], item['sha256'])), sort_keys=True
+    ).encode()).hexdigest()
+    with db.get_connection() as conn:
+        conn.execute('CREATE TABLE IF NOT EXISTS schedule_gemini_batches '
+                     '(fingerprint TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+        cached = conn.execute('SELECT payload FROM schedule_gemini_batches WHERE fingerprint=?',
+                              (fingerprint,)).fetchone()
+        # New input invalidates old buttons/publication even if the API fails.
+        conn.execute("UPDATE schedule_reviews SET status='superseded' WHERE schedule_date=? "
+                     "AND fingerprint<>? AND status IN ('draft','published')", (date, fingerprint))
+    if cached:
+        texts = json.loads(cached['payload'])
+    else:
+        check_connection()
+        result = read_schedule([photo['source'] for photo in sources], None)
+        texts = result['groups']
+        with db.get_connection() as conn:
+            conn.execute('INSERT OR IGNORE INTO schedule_gemini_batches VALUES (?,?)',
+                         (fingerprint, json.dumps(texts, ensure_ascii=False)))
+    for group in sorted(set(texts) | set(user_groups)):
+        body = texts.get(group, '')
+        with db.get_connection() as conn:
+            conn.execute("UPDATE schedule_reviews SET status='draft',notified=0 WHERE group_name=? "
+                         "AND schedule_date=? AND fingerprint=? AND status='superseded'",
+                         (group, date, fingerprint))
+            conn.execute('INSERT OR IGNORE INTO schedule_reviews '
+                         '(group_name,schedule_date,fingerprint,sources,body) VALUES (?,?,?,?,?)',
+                         (group, date, fingerprint, json.dumps(sources, ensure_ascii=False), body))
 
 
 def pending_reviews(unnotified=False):
@@ -262,6 +301,14 @@ def read_schedule(paths, group):
         'subgroup:string|null,cancelled:boolean,uncertainties:array строк}, '
         'uncertainties:array строк. Никакого Markdown.'
     )
+    if group is None:
+        prompt += (
+            '\nРежим всех групп: извлеки ВСЕ группы со ВСЕХ переданных страниц. '
+            'Вместо результата одной группы верни {"groups":[объекты групп],"uncertainties":[]}. '
+            'Каждый объект группы содержит group_name, group_found=true, lessons и uncertainties '
+            'по схеме выше. Не пропускай группы. Допустимые названия: '
+            + ', '.join(db.COLLEGE_GROUPS)
+        )
     parts = [{'text': prompt}]
     size = 0
     for path in paths:
@@ -290,4 +337,26 @@ def read_schedule(paths, group):
         data = json.loads(text)
     except (KeyError, IndexError, TypeError, ValueError):
         raise GeminiError('Gemini не вернул полный JSON-ответ. Попробуй повторить проверку.') from None
+    if group is None:
+        if not isinstance(data, dict) or not isinstance(data.get('groups'), list) or not data['groups']:
+            raise GeminiError('Gemini не вернул группы. Черновики не созданы.')
+        global_warnings = data.get('uncertainties', [])
+        if not isinstance(global_warnings, list) or any(not isinstance(w, str) for w in global_warnings):
+            raise GeminiError('Gemini вернул некорректные замечания к листам.')
+        texts = {}
+        for item in data['groups']:
+            if not isinstance(item, dict):
+                raise GeminiError('Gemini вернул некорректную группу.')
+            name = item.get('group_name')
+            if not isinstance(name, str) or name not in db.COLLEGE_GROUPS or name in texts:
+                raise GeminiError('Gemini вернул неизвестную или повторную группу. Нужна повторная проверка.')
+            if item.get('group_found') is not True:
+                raise GeminiError('Gemini не подтвердил наличие группы на листе.')
+            warnings = item.get('uncertainties', [])
+            if not isinstance(warnings, list):
+                raise GeminiError('Gemini вернул некорректные замечания к группе.')
+            item['uncertainties'] = warnings + global_warnings
+            formatted = format_result(item)
+            texts[name] = formatted if item['lessons'] else ''
+        return {'model': model, 'groups': texts}
     return {'model': model, 'text': format_result(data)}
