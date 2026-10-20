@@ -29,6 +29,7 @@ import database as db
 import keyboards as kb
 import gdrive_sync
 import schedule_review
+import gemini_schedule
 
 
 class AsyncDatabase:
@@ -881,6 +882,35 @@ async def cb_admin_ocr_mode(callback: CallbackQuery):
     await callback.answer()
 
 
+async def show_gemini_schedule_check(callback, files, group_name):
+    try:
+        result = await asyncio.to_thread(
+            gemini_schedule.read_schedule, [item["local_path"] for item in files], group_name
+        )
+    except gemini_schedule.GeminiError as error:
+        await show_user_screen(callback, "⚠️ " + html.escape(str(error)), reply_markup=kb.admin_ocr_result_kb())
+        return
+    except OSError:
+        await show_user_screen(callback, "⚠️ Не удалось открыть исходные фото. Обнови файлы с Google Диска.",
+                               reply_markup=kb.admin_ocr_result_kb())
+        return
+    date = files[0].get("schedule_date") or "дата не указана"
+    await show_user_screen(
+        callback,
+        f"📅 <b>Замены · {html.escape(group_name)} · {html.escape(date)}</b>\n\n"
+        + html.escape(result["text"])
+        + f"\n\n<i>Проверка Gemini · {html.escape(result['model'])}. Сверь с фото. Студентам не публикуется.</i>",
+        reply_markup=kb.admin_ocr_result_kb(),
+    )
+    for item in files:
+        try:
+            sent = await callback.bot.send_photo(chat_id=callback.from_user.id,
+                photo=FSInputFile(item["local_path"]), caption="Исходный лист для проверки Gemini")
+            await adb.set_ui_message_id(callback.from_user.id, sent.message_id)
+        except Exception:
+            logger.warning("Could not attach Gemini schedule source photo")
+
+
 @dp.callback_query(F.data.startswith("adm_ocr_group_"))
 async def cb_admin_ocr_group(callback: CallbackQuery):
     if not is_admin(callback.from_user) or callback.message.chat.type != "private":
@@ -908,6 +938,10 @@ async def cb_admin_ocr_group(callback: CallbackQuery):
             "📄 Не нашёл сохранённые листы замен. Сначала обнови расписание с Google Диска.",
             reply_markup=kb.admin_ocr_result_kb(),
         )
+        return
+
+    if gemini_schedule.configured():
+        await show_gemini_schedule_check(callback, files, group_name)
         return
 
     pages = []
