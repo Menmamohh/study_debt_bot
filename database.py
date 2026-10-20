@@ -1,4 +1,5 @@
 import sqlite3
+import uuid
 import hashlib
 import json
 import os
@@ -180,6 +181,19 @@ def init_db():
                 body_text TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 resolved_at TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS feedback_replies (
+                token TEXT PRIMARY KEY,
+                report_id INTEGER NOT NULL,
+                admin_id INTEGER NOT NULL,
+                recipient_id INTEGER NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'draft',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                sent_at TEXT,
+                telegram_message_id INTEGER
             )
         """)
         cursor.executescript("""
@@ -1774,3 +1788,62 @@ def get_verified_group_page(group_name: str, page: int, page_size: int = 10) -> 
             ORDER BY user_id LIMIT ? OFFSET ?
         """, (group_name, page_size, page * page_size)).fetchall()
         return {'total': total, 'page': page, 'users': [dict(row) for row in rows]}
+
+
+def cancel_feedback_reply_drafts(admin_id: int):
+    with get_connection() as conn:
+        conn.execute("UPDATE feedback_replies SET status = 'cancelled' WHERE admin_id = ? AND status = 'draft'", (admin_id,))
+
+
+def create_feedback_reply(report_id: int, admin_id: int) -> Optional[Dict]:
+    token = uuid.uuid4().hex
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        report = conn.execute("SELECT * FROM feedback_reports WHERE id = ? AND resolved_at IS NULL", (report_id,)).fetchone()
+        if report is None:
+            return None
+        conn.execute("UPDATE feedback_replies SET status = 'cancelled' WHERE admin_id = ? AND status = 'draft'", (admin_id,))
+        conn.execute("INSERT INTO feedback_replies (token, report_id, admin_id, recipient_id) VALUES (?, ?, ?, ?)",
+                     (token, report_id, admin_id, report['user_id']))
+    return get_feedback_reply(token, admin_id)
+
+
+def get_feedback_reply(token: str, admin_id: int) -> Optional[Dict]:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM feedback_replies WHERE token = ? AND admin_id = ?", (token, admin_id)).fetchone()
+        return dict(row) if row else None
+
+
+def prepare_feedback_reply(token: str, admin_id: int, body: str) -> bool:
+    with get_connection() as conn:
+        return conn.execute("UPDATE feedback_replies SET body = ? WHERE token = ? AND admin_id = ? AND status = 'draft'",
+                            (body, token, admin_id)).rowcount == 1
+
+
+def claim_feedback_reply(token: str, admin_id: int) -> Optional[Dict]:
+    # Commit the claim BEFORE contacting Telegram: even a crash cannot replay it.
+    with get_connection() as conn:
+        changed = conn.execute("""UPDATE feedback_replies SET status = 'sending'
+            WHERE token = ? AND admin_id = ? AND status = 'draft' AND body != ''
+            AND EXISTS (SELECT 1 FROM feedback_reports r WHERE r.id = feedback_replies.report_id
+                AND r.user_id = feedback_replies.recipient_id AND r.resolved_at IS NULL)""", (token, admin_id)).rowcount
+    return get_feedback_reply(token, admin_id) if changed else None
+
+
+def finish_feedback_reply(token: str, status: str, message_id: Optional[int] = None):
+    if status not in {'sent', 'failed', 'unknown'}:
+        raise ValueError('Invalid delivery status')
+    with get_connection() as conn:
+        conn.execute("""UPDATE feedback_replies SET status = ?, telegram_message_id = ?,
+            sent_at = CASE WHEN ? = 'sent' THEN CURRENT_TIMESTAMP ELSE NULL END
+            WHERE token = ? AND status = 'sending'""", (status, message_id, status, token))
+
+
+def get_feedback_reply_history(report_id: int, page: int = 0, page_size: int = 3) -> Dict:
+    with get_connection() as conn:
+        conn.execute('BEGIN')
+        total = conn.execute("SELECT COUNT(*) FROM feedback_replies WHERE report_id = ? AND status = 'sent'", (report_id,)).fetchone()[0]
+        page = min(max(0, page), max(0, (total - 1) // page_size))
+        rows = conn.execute("""SELECT body, sent_at FROM feedback_replies WHERE report_id = ? AND status = 'sent'
+            ORDER BY sent_at DESC, rowid DESC LIMIT ? OFFSET ?""", (report_id, page_size, page * page_size)).fetchall()
+        return {'total': total, 'page': page, 'replies': [dict(row) for row in rows]}

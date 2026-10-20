@@ -445,6 +445,7 @@ def admin_feedback_queue_kb(reports: List[Dict], page: int, total: int, page_siz
 
 def admin_feedback_item_kb(report_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Ответить", callback_data=f"fbr_start_{report_id}")],
         [InlineKeyboardButton(text="📎 Открыть исходное сообщение", callback_data=f"adm_feedback_copy_{report_id}")],
         [InlineKeyboardButton(text="✅ Закрыть отчёт", callback_data=f"adm_feedback_resolve_{report_id}")],
         [InlineKeyboardButton(text="🔙 К отчётам", callback_data="adm_feedback_queue")],
@@ -677,3 +678,13 @@ def admin_subject_materials_delete_kb(subject_name: str, materials: List[Dict]) 
         InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")
     ])
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def feedback_reply_kb(token: str, preview: bool = False, can_send: bool = True):
+    rows = []
+    if preview:
+        if can_send:
+            rows.append([InlineKeyboardButton(text="📨 Отправить", callback_data=f"fbr_send_{token}")])
+        rows.append([InlineKeyboardButton(text="✏️ Изменить", callback_data=f"fbr_edit_{token}")])
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data=f"fbr_cancel_{token}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

@@ -18,7 +18,7 @@ except ImportError:
     pass
 
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -289,6 +289,8 @@ class Form(StatesGroup):
     waiting_for_group_confirmation = State()
     waiting_for_student_name = State()
     waiting_for_feedback = State()
+    waiting_for_feedback_reply = State()
+    waiting_for_feedback_reply_preview = State()
     waiting_for_broadcast = State()
 
 async def check_user_access(user) -> tuple[bool, str]:
@@ -677,6 +679,16 @@ class VerificationMiddleware(BaseMiddleware):
 
     async def __call__(self, handler, event, data):
         user = getattr(event, "from_user", None)
+        state = data.get('state')
+        if user and state:
+            state_data = await state.get_data()
+            if state_data.get('feedback_reply_token'):
+                leaving = (isinstance(event, CallbackQuery) and not (event.data or '').startswith('fbr_'))
+                leaving = leaving or (isinstance(event, Message) and bool(event.text) and
+                    (event.text.startswith('/') or event.text.strip().lower() in {'начать', '🚀 начать', 'старт', 'start', 'меню', 'главное меню'}))
+                if leaving:
+                    await adb.cancel_feedback_reply_drafts(user.id)
+                    await state.clear()
         if isinstance(event, CallbackQuery) and event.message and event.message.chat.type != "private":
             callback_data = event.data or ""
             private_prefixes = (
@@ -950,17 +962,150 @@ async def cb_admin_feedback_detail(callback: CallbackQuery):
     if not report or report.get("resolved_at"):
         await callback.answer("Открытый отчёт не найден.", show_alert=True)
         return
-    body = html.escape((report.get("body_text") or "Вложение без текста")[:3000])
-    label = html.escape(report.get("user_label") or str(report["user_id"]))
-    group = html.escape(report.get("student_group") or "не выбрана")
-    text = (
-        f"🐞 <b>Отчёт об ошибке №{report_id}</b>\n\n"
-        f"👤 {label} · ID <code>{report['user_id']}</code>\n"
-        f"🎓 Группа: <b>{group}</b>\n"
-        f"🕒 {html.escape(str(report.get('created_at') or ''))}\n\n{body}"
-    )
-    await show_user_screen(callback, text, reply_markup=kb.admin_feedback_item_kb(report_id))
-    await callback.answer()
+    await show_feedback_detail(callback, report_id)
+
+
+async def show_feedback_detail(target, report_id: int, page: int = 0, notice: str = ''):
+    report = await adb.get_feedback_report(report_id)
+    if not report:
+        await show_user_screen(target, 'Отчёт не найден.', reply_markup=kb.back_to_menu_kb())
+        return
+    history = await adb.get_feedback_reply_history(report_id, page)
+    esc = lambda value, size: html.escape(str(value or '')[:size])
+    text = (f"🐞 <b>Отчёт об ошибке №{report_id}</b>\n\n"
+            f"👤 {esc(report.get('user_label') or report['user_id'], 100)} · ID <code>{report['user_id']}</code>\n"
+            f"🎓 {esc(report.get('student_group') or 'не выбрана', 40)}\n\n"
+            f"{esc(report.get('body_text') or 'Вложение без текста', 800)}")
+    if notice:
+        text = html.escape(notice) + '\n\n' + text
+    text += f"\n\n<b>Отправленные ответы: {history['total']}</b>"
+    for reply in history['replies']:
+        date = datetime.datetime.fromisoformat(reply['sent_at']).replace(tzinfo=datetime.timezone.utc).astimezone(ZoneInfo('Europe/Minsk'))
+        text += f"\n\n{date:%d.%m.%Y %H:%M} (Минск)\n{esc(reply['body'], 600)}"
+        if len(reply['body']) > 600:
+            text += '…'
+    markup = kb.admin_feedback_item_kb(report_id)
+    controls = kb._page_controls(f'fbh_{report_id}', history['page'], history['total'], 3)
+    if controls:
+        markup.inline_keyboard.insert(0, controls)
+    await show_user_screen(target, text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.regexp(r'^fbh_\d+_\d+$'))
+async def cb_feedback_history(callback: CallbackQuery):
+    if not is_admin(callback.from_user) or callback.message.chat.type != 'private':
+        await callback.answer('Доступ только администратору.', show_alert=True)
+        return
+    _, report_id, page = callback.data.split('_')
+    await show_feedback_detail(callback, int(report_id), int(page))
+
+
+@dp.callback_query(F.data.regexp(r'^fbr_start_\d+$'))
+async def cb_feedback_reply_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user) or callback.message.chat.type != 'private':
+        await callback.answer('Доступ только администратору.', show_alert=True)
+        return
+    await state.clear()
+    reply = await adb.create_feedback_reply(int(callback.data.rsplit('_', 1)[1]), callback.from_user.id)
+    if not reply:
+        await callback.answer('Открытый отчёт не найден.', show_alert=True)
+        return
+    await state.update_data(feedback_reply_token=reply['token'])
+    await state.set_state(Form.waiting_for_feedback_reply)
+    report = await adb.get_feedback_report(reply['report_id'])
+    label = html.escape(str(report.get('user_label') or reply['recipient_id'])[:100])
+    await safe_edit_message(callback, f"💬 Ответ на обращение №{reply['report_id']}\nПолучатель: {label}\n\nВведи текст ответа (до 3500 символов).",
+                            reply_markup=kb.feedback_reply_kb(reply['token']))
+
+
+@dp.message(Form.waiting_for_feedback_reply)
+@dp.message(Form.waiting_for_feedback_reply_preview)
+async def process_feedback_reply(message: Message, state: FSMContext):
+    if not is_admin(message.from_user) or message.chat.type != 'private':
+        return
+    if message.text and (message.text.startswith('/') or message.text.strip().lower() in {'начать', '🚀 начать', 'старт', 'start', 'меню', 'главное меню'}):
+        await adb.cancel_feedback_reply_drafts(message.from_user.id)
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    if (await state.get_state()) != Form.waiting_for_feedback_reply.state:
+        await show_user_screen(message, 'Для изменения ответа нажми «Изменить» в предпросмотре.',
+                               reply_markup=kb.feedback_reply_kb((await state.get_data()).get('feedback_reply_token', ''), True))
+        return
+    body = (message.text or '').strip()
+    data = await state.get_data()
+    token = data.get('feedback_reply_token', '')
+    reply = await adb.get_feedback_reply(token, message.from_user.id)
+    report = await adb.get_feedback_report(reply['report_id']) if reply else None
+    if not reply or reply['status'] != 'draft' or not report or report.get('resolved_at'):
+        await state.clear()
+        await show_user_screen(message, 'Черновик устарел. Открой отчёт заново.', reply_markup=kb.back_to_menu_kb())
+        return
+    if not body or len(body) > 3500 or body.startswith('/'):
+        await show_user_screen(message, 'Отправь текст от 1 до 3500 символов.', reply_markup=kb.feedback_reply_kb(token))
+        return
+    if not await adb.prepare_feedback_reply(token, message.from_user.id, body):
+        return
+    await state.set_state(Form.waiting_for_feedback_reply_preview)
+    label = html.escape(str(report.get('user_label') or reply['recipient_id'])[:100])
+    await show_user_screen(message, f"<b>Предпросмотр ответа №{reply['report_id']}</b>\nПолучатель: {label} · ID {reply['recipient_id']}\n\n{html.escape(body)}",
+                           reply_markup=kb.feedback_reply_kb(token, True))
+
+
+@dp.callback_query(F.data.regexp(r'^fbr_(send|edit|cancel)_[a-f0-9]{32}$'))
+async def cb_feedback_reply_action(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if not is_admin(callback.from_user) or callback.message.chat.type != 'private':
+        await callback.answer('Доступ только администратору.', show_alert=True)
+        return
+    _, action, token = callback.data.split('_')
+    data = await state.get_data()
+    reply = await adb.get_feedback_reply(token, callback.from_user.id)
+    if data.get('feedback_reply_token') != token or not reply:
+        await callback.answer('Черновик устарел. Открой отчёт заново.', show_alert=True)
+        return
+    if action == 'cancel':
+        await adb.cancel_feedback_reply_drafts(callback.from_user.id)
+        await state.clear()
+        await show_feedback_detail(callback, reply['report_id'], notice='Ответ отменён.')
+        return
+    if action == 'edit':
+        if reply['status'] in {'sending', 'sent'}:
+            await callback.answer('Отправка уже началась или завершена.', show_alert=True)
+            return
+        fresh = await adb.create_feedback_reply(reply['report_id'], callback.from_user.id)
+        if not fresh:
+            await callback.answer('Открытый отчёт не найден.', show_alert=True)
+            return
+        await state.update_data(feedback_reply_token=fresh['token'])
+        await state.set_state(Form.waiting_for_feedback_reply)
+        await safe_edit_message(callback, 'Введи новый текст ответа. Предыдущий предпросмотр больше не действует.', reply_markup=kb.feedback_reply_kb(fresh['token']))
+        return
+    if await state.get_state() != Form.waiting_for_feedback_reply_preview.state:
+        await callback.answer('Сначала подготовь предпросмотр.', show_alert=True)
+        return
+    claimed = await adb.claim_feedback_reply(token, callback.from_user.id)
+    if not claimed:
+        await callback.answer('Ответ уже обрабатывается либо отчёт закрыт или удалён.', show_alert=True)
+        return
+    await callback.answer('Отправляю…')
+    try:
+        sent = await bot.send_message(chat_id=claimed['recipient_id'],
+            text=f"Ответ администратора на обращение №{claimed['report_id']}\n\n{claimed['body']}", parse_mode=None)
+    except (TelegramForbiddenError, TelegramBadRequest, TelegramRetryAfter):
+        await adb.finish_feedback_reply(token, 'failed')
+        await safe_edit_message(callback, 'Ответ не доставлен: Telegram отклонил отправку. Можно изменить текст или отменить ответ.',
+                                reply_markup=kb.feedback_reply_kb(token, True, False))
+        return
+    except Exception:
+        await adb.finish_feedback_reply(token, 'unknown')
+        logger.exception('Uncertain feedback reply delivery for report %s', claimed['report_id'])
+        await safe_edit_message(callback, 'Не удалось подтвердить доставку. Ответ мог дойти. Автоматического повтора не будет. Перед новым ответом проверь доставку; повтор может создать дубликат.',
+                                reply_markup=kb.feedback_reply_kb(token, True, False))
+        return
+    await adb.finish_feedback_reply(token, 'sent', sent.message_id)
+    if (await state.get_data()).get('feedback_reply_token') == token:
+        await state.clear()
+        await show_feedback_detail(callback, claimed['report_id'], notice='✅ Ответ отправлен. Отчёт остаётся открытым.')
 
 
 @dp.callback_query(F.data == "adm_broadcast_start")
