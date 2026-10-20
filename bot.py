@@ -930,27 +930,17 @@ async def cb_admin_ocr_group(callback: CallbackQuery):
         pages.append((path, item, width, height, detected, recognized))
 
     target = files[0].get("schedule_date") or "дата не указана"
-    lines = [
-        f"🔎 <b>Проверка OCR · {html.escape(group_name)} · {html.escape(target)}</b>",
-        "Результат виден только администратору и не публикуется студентам.",
-        "",
-    ]
-    ocr_text_limit = max(1, 1200 // len(pages))
-    for index, (_, item, width, height, detected, recognized) in enumerate(pages, start=1):
-        truncated = len(recognized) > ocr_text_limit
-        recognized = html.escape(recognized[:ocr_text_limit])
-        if truncated:
-            recognized += "… <i>(сокращено)</i>"
-        lines.extend([
-            f"<b>Страница {index} из {len(pages)}</b> · {html.escape((item.get('filename') or 'лист')[:100])}",
-            f"Размер: {width} × {height} · Найдены группы: {html.escape(detected[:120])}",
-            "<b>Распознанный текст:</b>",
-            recognized,
-            "",
-        ])
+    matching_pages = [page for page in pages if group_name in page[4].split(", ")]
+    if matching_pages:
+        pages = matching_pages
+    lines = [f"📅 <b>Замены · {html.escape(group_name)} · {html.escape(target)}</b>", ""]
+    for _, _, width, height, _, recognized in pages:
+        if recognized.startswith("⚠️"):
+            lines.append("⚠️ Не удалось собрать строки уроков. Сверь исходное фото.")
+        else:
+            lines.append(html.escape(recognized[:2800]))
+    lines.extend(["", "<i>Проверка для администратора. Сверь текст с фото перед публикацией.</i>"])
     result = "\n".join(lines)
-    if len(result) > 3900:
-        result = result[:3850] + "…\n\n<i>Текст сокращён для сообщения Telegram.</i>"
     await show_user_screen(callback, result, reply_markup=kb.admin_ocr_result_kb())
 
     # Показываем оригиналы после результата и учитываем их в общей уборке
