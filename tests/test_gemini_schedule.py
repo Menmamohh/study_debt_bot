@@ -49,3 +49,40 @@ class GeminiTests(unittest.TestCase):
             with patch.dict(os.environ, {'GEMINI_API_KEY': 'test-secret'}), \
                     patch.object(gemini.urllib.request, 'urlopen', return_value=io.BytesIO(json.dumps(reply).encode())):
                 with self.assertRaises(gemini.GeminiError): gemini.read_schedule([path], 'ТТ-36')
+
+    def test_network_failures_are_distinct_and_do_not_echo_secrets(self):
+        import socket
+        import ssl
+        request = gemini.urllib.request.Request('https://example.invalid')
+        cases = [(urllib.error.URLError(socket.gaierror('secret')), 'DNS'),
+                 (urllib.error.URLError(ssl.SSLCertVerificationError('secret')), 'TLS'),
+                 (urllib.error.URLError(TimeoutError('secret')), 'ожидания'),
+                 (TimeoutError('secret'), '20 с'),
+                 (urllib.error.URLError('secret'), 'соединение')]
+        for exception, expected in cases:
+            with self.subTest(expected=expected), patch.object(gemini.urllib.request, 'urlopen', side_effect=exception):
+                with self.assertRaises(gemini.GeminiError) as error:
+                    gemini._gemini_json_request(request, 'Проверка', 20)
+                self.assertIn(expected, str(error.exception))
+                self.assertNotIn('secret', str(error.exception))
+        with patch.object(gemini.urllib.request, 'urlopen', return_value=io.BytesIO(b'not json secret')):
+            with self.assertRaisesRegex(gemini.GeminiError, 'некорректный JSON'):
+                gemini._gemini_json_request(request, 'Проверка', 20)
+
+    def test_preflight_sends_no_photos_and_checks_model(self):
+        with patch.dict(os.environ, {'GEMINI_API_KEY': 'secret'}), patch.object(
+                gemini.urllib.request, 'urlopen', return_value=io.BytesIO(
+                    b'{"supportedGenerationMethods":["generateContent"]}')) as send:
+            self.assertTrue(gemini.check_connection())
+            request = send.call_args.args[0]
+            self.assertEqual(request.get_method(), 'GET')
+            self.assertIsNone(request.data)
+            self.assertNotIn('secret', request.full_url)
+
+    def test_invalid_key_is_reported_without_remote_message(self):
+        body = json.dumps({'error': {'message': 'secret', 'details': [{'reason': 'API_KEY_INVALID'}]}}).encode()
+        error = urllib.error.HTTPError('url', 400, 'secret', {}, io.BytesIO(body))
+        with patch.object(gemini.urllib.request, 'urlopen', side_effect=error):
+            with self.assertRaisesRegex(gemini.GeminiError, 'недействителен') as result:
+                gemini._gemini_json_request(gemini.urllib.request.Request('https://example.invalid'), 'Доступ', 20)
+            self.assertNotIn('secret', str(result.exception))
