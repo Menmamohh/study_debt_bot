@@ -471,12 +471,25 @@ def admin_material_queue_page_kb(materials: List[Dict], page: int, total: int, p
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def admin_verified_users_page_kb(page: int, total: int, page_size: int = 10) -> InlineKeyboardMarkup:
-    rows = []
-    controls = _page_controls("adm_users_list", page, total, page_size)
+def admin_verified_groups_kb(groups: List[Dict], page: int, page_size: int = 10) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        text=f"{group['group_name'] or 'Без группы'} · {group['total']}",
+        callback_data=f"vug_{group['token']}_0",
+    )] for group in groups[page * page_size:(page + 1) * page_size]]
+    controls = _page_controls("vuc", page, len(groups), page_size)
     if controls:
         rows.append(controls)
-    rows.append([InlineKeyboardButton(text="🔙 В админ-панель", callback_data="admin_panel")])
+    rows.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_verified_users_page_kb(token: str, page: int, total: int, page_size: int = 10) -> InlineKeyboardMarkup:
+    rows = []
+    controls = _page_controls(f"vug_{token}", page, total, page_size)
+    if controls:
+        rows.append(controls)
+    rows.append([InlineKeyboardButton(text="🔙 Назад к группам", callback_data="adm_users_list")])
+    rows.append([InlineKeyboardButton(text="👑 В админку", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
