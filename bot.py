@@ -2774,7 +2774,7 @@ async def send_schedule_review(bot, chat_id, draft):
     await bot.send_message(
         chat_id=chat_id,
         text=(f"📝 <b>Черновик замен — {html.escape(draft['group_name'])}, {draft['schedule_date']}</b>\n\n"
-              f"{body}\n\nСверь группу, дату, пары и кабинеты с фото. Студенты увидят текст после публикации."),
+              f"{body}\n\nСверь группу, дату, номера уроков, предметы и преподавателей с фото. Студенты увидят текст после публикации."),
         parse_mode="HTML", reply_markup=schedule_review_kb(draft['id']))
 
 
