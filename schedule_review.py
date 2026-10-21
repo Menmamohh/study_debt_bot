@@ -132,6 +132,11 @@ def finish_review(review_id, publish):
                               + ("AND trim(body)<>''" if publish else ''),
                               ('published' if publish else 'skipped', review_id,
                                gdrive_sync.get_target_study_date()[0].isoformat()))
+        if result.rowcount == 1 and publish:
+            row = conn.execute('SELECT * FROM schedule_reviews WHERE id=?', (review_id,)).fetchone()
+            enqueue_delivery_in_transaction(conn, f'review:{review_id}',
+                f"📅 Опубликованы проверенные замены для {row['group_name']} на {row['schedule_date']}.",
+                f"sr_view_{review_id}", row['group_name'])
         return result.rowcount == 1
 
 
@@ -362,3 +367,50 @@ def read_schedule(paths, group):
             texts[name] = formatted if item['lessons'] else ''
         return {'model': model, 'groups': texts}
     return {'model': model, 'text': format_result(data)}
+
+
+def screen_id(chat_id, kind='queue', message_id=None):
+    key = f'schedule_{kind}_screen:{chat_id}'
+    with db.get_connection() as conn:
+        if message_id is not None:
+            conn.execute('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                         (key, str(message_id)))
+        row = conn.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+        return int(row['value']) if row else None
+
+
+def enqueue_delivery(event_key, body, callback_data, group=None):
+    with db.get_connection() as conn:
+        enqueue_delivery_in_transaction(conn, event_key, body, callback_data, group)
+
+
+def enqueue_delivery_in_transaction(conn, event_key, body, callback_data, group=None):
+    conn.execute("INSERT OR IGNORE INTO schedule_deliveries (event_key,user_id,body,callback_data) "
+                 "SELECT ?,user_id,?,? FROM users WHERE status='approved' "
+                 + ("AND student_group=?" if group else ''),
+                 (event_key,body,callback_data,group) if group else (event_key,body,callback_data))
+
+
+def pending_deliveries():
+    with db.get_connection() as conn:
+        return [dict(row) for row in conn.execute(
+            "SELECT d.* FROM schedule_deliveries d JOIN users u ON u.user_id=d.user_id "
+            "WHERE d.sent=0 AND u.status='approved' AND (d.event_key NOT LIKE 'review:%' OR EXISTS "
+            "(SELECT 1 FROM schedule_reviews r WHERE d.event_key='review:' || r.id AND r.status='published' "
+            "AND NOT EXISTS (SELECT 1 FROM schedule_reviews n WHERE n.group_name=r.group_name "
+            "AND n.schedule_date=r.schedule_date AND n.id>r.id))) "
+            "ORDER BY d.event_key,d.user_id")]
+
+
+def delivery_sent(event_key, user_id):
+    with db.get_connection() as conn:
+        conn.execute('UPDATE schedule_deliveries SET sent=1 WHERE event_key=? AND user_id=?', (event_key,user_id))
+
+
+def next_approved_schedule(group, date):
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT r.* FROM schedule_reviews r WHERE group_name=? AND schedule_date>=? "
+            "AND status='published' AND NOT EXISTS (SELECT 1 FROM schedule_reviews newer WHERE "
+            "newer.group_name=r.group_name AND newer.schedule_date=r.schedule_date AND newer.id>r.id) "
+            "ORDER BY schedule_date,id LIMIT 1", (group,date.isoformat())).fetchone()
+        return dict(row) if row else None

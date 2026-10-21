@@ -218,6 +218,10 @@ def init_db():
                 UNIQUE(group_name, schedule_date, fingerprint)
             )
         """)
+        cursor.execute("""CREATE TABLE IF NOT EXISTS schedule_deliveries (
+            event_key TEXT NOT NULL, user_id INTEGER NOT NULL, body TEXT NOT NULL,
+            callback_data TEXT NOT NULL, sent INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(event_key, user_id))""")
         cursor.executescript("""
             CREATE INDEX IF NOT EXISTS idx_subjects_user ON subjects(user_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_user_subject ON tasks(user_id, subject_id);

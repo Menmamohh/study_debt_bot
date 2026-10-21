@@ -124,6 +124,8 @@ class ScheduleReviewTests(unittest.TestCase):
 
     def test_publication_notifies_once(self):
         draft = self.prepare()
+        db.add_user_request(123, "student", "Student", "Student", "ТТ-36")
+        db.set_user_status(123, "approved")
         callback = SimpleNamespace(from_user=SimpleNamespace(id=10),
                                    message=SimpleNamespace(chat=SimpleNamespace(type='private'),
                                                            edit_reply_markup=AsyncMock(), answer=AsyncMock()),
@@ -131,7 +133,7 @@ class ScheduleReviewTests(unittest.TestCase):
                                    data=f"sr_publish_{draft['id']}")
         state = SimpleNamespace(clear=AsyncMock())
         with patch.object(bot, 'is_admin', return_value=True), \
-             patch.object(bot.adb, 'get_verified_users_by_group', AsyncMock(return_value=[{'user_id': 123}])):
+             patch.object(bot, 'update_review_screen', AsyncMock()):
             asyncio.run(bot.cb_schedule_review_action(callback, state))
             asyncio.run(bot.cb_schedule_review_action(callback, state))
         self.assertEqual(callback.bot.send_message.await_count, 1)
@@ -139,13 +141,13 @@ class ScheduleReviewTests(unittest.TestCase):
     def test_empty_queue_uses_tracked_interface_screen(self):
         callback = SimpleNamespace(from_user=SimpleNamespace(id=10),
                                    message=SimpleNamespace(chat=SimpleNamespace(type='private')),
-                                   answer=AsyncMock())
+                                   bot=SimpleNamespace(), answer=AsyncMock())
         with patch.object(bot, 'is_admin', return_value=True), \
              patch.object(review, 'pending_reviews', return_value=[]), \
-             patch.object(bot, 'show_user_screen', AsyncMock()) as show:
+             patch.object(bot, 'update_review_screen', AsyncMock()) as show:
             asyncio.run(bot.cb_schedule_review_queue(callback))
-        self.assertEqual(show.call_args.args[1], 'Черновиков на проверку нет.')
-        self.assertIsNotNone(show.call_args.kwargs['reply_markup'])
+        self.assertIn('Все черновики обработаны', show.call_args.args[2])
+        self.assertIsNotNone(show.call_args.args[3])
 
     def test_gemini_batch_is_cached_across_restart_and_manual_edits_survive(self):
         with patch.object(review, 'configured', return_value=True), \
