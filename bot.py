@@ -697,7 +697,7 @@ class VerificationMiddleware(BaseMiddleware):
             private_prefixes = (
                 "open_sub_", "toggle_t_", "view_mat_", "dl_mat_", "add_task_prompt_",
                 "confirm_del_sub_", "del_sub_", "b_sub_", "quick_", "upload_mat_",
-                "set_mat_type_", "save_text_mat_", "show_all_debts_", "adm_",
+                "set_mat_type_", "save_text_mat_", "show_all_debts_", "adm_", "important_close_",
             )
             private_callbacks = {
                 "main_menu", "debts_hub", "show_all_debts", "list_subjects",
@@ -1265,11 +1265,12 @@ async def cb_admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
     if callback.message.chat.type != "private":
         await callback.answer("Открой личный чат с ботом для отправки объявления.", show_alert=True)
         return
+    await state.clear()
     await state.set_state(Form.waiting_for_broadcast)
     text = (
         "📢 <b>Новое объявление</b>\n\n"
         "Отправь текст или фотографию с подписью. Перед публикацией покажу предпросмотр и попрошу подтвердить.\n\n"
-        "После отправки у подтверждённых пользователей появится пункт «Уведомление» в главном меню. Для отмены нажми «Главное меню»."
+        "Обычное объявление появится в уведомлениях. Важное придёт отдельным сообщением и заменит главное меню до нажатия «Закрыть». Тип выберешь на предпросмотре. Для отмены нажми «Главное меню»."
     )
     await show_user_screen(callback, text, reply_markup=kb.back_to_menu_kb())
 
@@ -1291,16 +1292,20 @@ async def process_broadcast_draft(message: Message, state: FSMContext):
         announcement_chat_id=message.chat.id,
         announcement_message_id=message.message_id,
         announcement_is_photo=bool(message.photo),
+        announcement_photo_file_id=message.photo[-1].file_id if message.photo else None,
+        announcement_important=False,
         announcement_text=message.caption or message.text or "",
     )
-    safe_text = html.escape(message.caption or message.text or "")
+    preview_text = message.caption or message.text or ""
+    safe_text = html.escape(preview_text[:500]) + ("…" if len(preview_text) > 500 else "")
     preview = "📢 <b>Предпросмотр объявления</b>\n\n"
     if message.photo:
         preview += "🖼️ <i>К объявлению приложена фотография.</i>\n"
     preview += safe_text or "<i>Без текста</i>"
-    preview += "\n\nОтправить всем подтверждённым пользователям?"
+    preview += "\n\nТип: обычное — только раздел уведомлений.\nОпубликовать для всех подтверждённых пользователей?"
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Отправить всем", callback_data="adm_broadcast_send")],
+        [InlineKeyboardButton(text="🔔 Обычное / ❗ Важное", callback_data="adm_broadcast_type")],
+        [InlineKeyboardButton(text="✅ Опубликовать", callback_data="adm_broadcast_send")],
         [InlineKeyboardButton(text="❌ Отменить", callback_data="adm_broadcast_cancel")],
     ])
     await show_user_screen(message, preview, reply_markup=markup)
@@ -1316,42 +1321,118 @@ async def cb_admin_broadcast_cancel(callback: CallbackQuery, state: FSMContext, 
     await callback.answer("Рассылка отменена.")
 
 
+@dp.callback_query(F.data == "adm_broadcast_type")
+async def cb_admin_broadcast_type(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Доступ только администратору в личном чате.", show_alert=True)
+        return
+    draft = await state.get_data()
+    if not draft.get("announcement_message_id"):
+        await callback.answer("Черновик устарел. Создай объявление заново.", show_alert=True)
+        return
+    important = not draft.get("announcement_important", False)
+    await state.update_data(announcement_important=important)
+    label = "❗ Важное — отдельное сообщение и показ вместо меню до закрытия." if important else "🔔 Обычное — только раздел уведомлений."
+    preview = "📢 <b>Предпросмотр объявления</b>\n\n" + html.escape((draft.get("announcement_text") or "Без текста")[:500]) + ("…" if len(draft.get("announcement_text", "")) > 500 else "")
+    if draft.get("announcement_is_photo"):
+        preview += "\n🖼️ С фотографией."
+    preview += "\n\n" + label + "\nОпубликовать для всех подтверждённых пользователей?"
+    await show_user_screen(callback, preview, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔔 Обычное / ❗ Важное", callback_data="adm_broadcast_type")],
+        [InlineKeyboardButton(text="✅ Опубликовать", callback_data="adm_broadcast_send")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="adm_broadcast_cancel")],
+    ]))
+
+
+broadcast_publish_lock = None
+
+
+async def send_important_announcement(bot, user_id, announcement, notify=False):
+    kwargs = dict(chat_id=user_id, reply_markup=kb.important_announcement_kb(announcement["id"]),
+                  parse_mode=None, disable_notification=not notify)
+    if announcement.get("photo_file_id"):
+        return await bot.send_photo(photo=announcement["photo_file_id"], caption=announcement["body"] or None, **kwargs)
+    return await bot.send_message(text=announcement["body"], **kwargs)
+
+
+async def show_important_announcement(target, user_id):
+    announcement = await adb.get_unread_announcement(user_id, important=True)
+    if not announcement:
+        return False
+    # Send the announcement itself: never reuse a menu photo as its background.
+    sent = await send_important_announcement(target.bot, user_id, announcement)
+    await adb.set_ui_message_id(user_id, sent.message_id)
+    await cleanup_user_ui_messages(target.bot, user_id, keep_message_id=sent.message_id)
+    if isinstance(target, CallbackQuery):
+        await target.answer()
+    return True
+
+
 @dp.callback_query(F.data == "adm_broadcast_send")
 async def cb_admin_broadcast_send(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    if not is_admin(callback.from_user):
-        await callback.answer("Доступ только для администратора.", show_alert=True)
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Доступ только администратору в личном чате.", show_alert=True)
         return
+    # Create the lock inside the running event loop (also supports Python 3.9).
+    global broadcast_publish_lock
+    if broadcast_publish_lock is None:
+        broadcast_publish_lock = asyncio.Lock()
+    # Claim the draft before network calls so repeated taps cannot publish twice.
+    async with broadcast_publish_lock:
+        draft = await state.get_data()
+        if not draft.get("announcement_message_id"):
+            await callback.answer("Черновик уже отправлен или отменён.", show_alert=True)
+            return
+        important = bool(draft.get("announcement_important"))
+        announcement_id = await adb.publish_announcement(
+            draft["announcement_chat_id"], draft["announcement_message_id"],
+            important=important, body=draft.get("announcement_text", ""),
+            photo_file_id=draft.get("announcement_photo_file_id"),
+        )
+        await state.clear()
+    await callback.answer("Объявление опубликовано.")
+    await safe_edit_message(callback, "📢 <b>Объявление опубликовано. Доставляю…</b>")
+    users = await adb.get_verified_users()
+    sent_count = failed_count = 0
+    if important:
+        announcement = dict(id=announcement_id, body=draft.get("announcement_text", ""),
+                            photo_file_id=draft.get("announcement_photo_file_id"))
+        for recipient in users:
+            if recipient["user_id"] == callback.from_user.id:
+                continue
+            try:
+                try:
+                    sent = await send_important_announcement(bot, recipient["user_id"], announcement, notify=True)
+                except TelegramRetryAfter as error:
+                    await asyncio.sleep(error.retry_after)
+                    sent = await send_important_announcement(bot, recipient["user_id"], announcement, notify=True)
+                await adb.set_ui_message_id(recipient["user_id"], sent.message_id)
+                await cleanup_user_ui_messages(bot, recipient["user_id"], keep_message_id=sent.message_id)
+                sent_count += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                failed_count += 1
+                logger.exception("Important announcement %s delivery failed for %s", announcement_id, recipient["user_id"])
+        details = f"Доставлено: <b>{sent_count}</b>. Не удалось доставить: <b>{failed_count}</b>.\nВажный анонс будет показан в главном меню до закрытия."
+    else:
+        details = "Обычный анонс доступен в разделе «Уведомление». Отдельных сообщений не отправлено."
+    await safe_edit_message(callback, "✅ <b>Объявление опубликовано</b>\n\n" + details,
+        reply_markup=kb.admin_panel_kb(await adb.count_pending_materials(), await adb.count_pending_users(), await adb.count_open_feedback_reports()))
+
+
+@dp.callback_query(F.data.startswith("important_close_"))
+async def cb_important_announcement_close(callback: CallbackQuery, state: FSMContext):
     if callback.message.chat.type != "private":
         await callback.answer("Открой личный чат с ботом.", show_alert=True)
         return
-    draft = await state.get_data()
-    source_chat_id = draft.get("announcement_chat_id")
-    source_message_id = draft.get("announcement_message_id")
-    if not source_chat_id or not source_message_id:
-        await state.clear()
-        await callback.answer("Черновик не найден. Создай объявление заново.", show_alert=True)
-        await show_admin_panel(callback, callback.from_user, bot, is_callback=True)
+    try:
+        announcement_id = int(callback.data[len("important_close_"):])
+    except ValueError:
+        await callback.answer("Некорректное объявление.", show_alert=True)
         return
+    await adb.close_important_announcement(callback.from_user.id, announcement_id)
+    await cb_main_menu(callback, state)
 
-    await state.clear()
-    await callback.message.edit_text("📢 <b>Публикую объявление в разделе уведомлений…</b>", parse_mode="HTML", reply_markup=None)
-    await adb.publish_announcement(source_chat_id, source_message_id)
-    users = await adb.get_verified_users()
-    recipient_count = sum(1 for recipient in users if recipient["user_id"] != callback.from_user.id)
-
-    report = (
-        "✅ <b>Объявление опубликовано</b>\n\n"
-        f"Уведомление появится в главном меню у <b>{recipient_count}</b> подтверждённых пользователей.\n"
-        "Оно будет отображаться, пока пользователь его не откроет."
-    )
-    await callback.message.edit_text(
-        report,
-        parse_mode="HTML",
-        reply_markup=kb.admin_panel_kb(
-            await adb.count_pending_materials(), await adb.count_pending_users(), await adb.count_open_feedback_reports()
-        ),
-    )
-    await callback.answer()
 
 @dp.callback_query(F.data == "admin_review_queue")
 @dp.callback_query(F.data.startswith("admin_review_queue_"))
@@ -1488,6 +1569,8 @@ async def cmd_start(message: Message, state: FSMContext):
     student_group = user_record.get("student_group") if user_record else None
     pending_count = (await adb.count_pending_materials() + await adb.count_pending_users()) if is_adm else 0
     has_study = await user_has_study_features(message.from_user, user_record)
+    if is_verified and await show_important_announcement(message, user_id):
+        return
     has_unread_notification = bool(await adb.get_unread_announcement(user_id)) if is_verified else False
 
     # Автоматически загружаем предметы семестра для поддерживаемых групп.
@@ -1603,6 +1686,8 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
     verification_pending = bool(user_record and user_record.get("status") == "pending")
     student_group = user_record.get("student_group") if user_record else None
     pending_count = (await adb.count_pending_materials() + await adb.count_pending_users()) if is_adm else 0
+    if is_verified and await show_important_announcement(callback, user_id):
+        return
     has_unread_notification = bool(await adb.get_unread_announcement(user_id)) if is_verified else False
     
     markup = kb.main_menu_kb(

@@ -722,3 +722,9 @@ def study_back_kb(callback_data: str = "list_subjects", label: str = "🔙 К м
         [InlineKeyboardButton(text=label, callback_data=callback_data)],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
+
+
+def important_announcement_kb(announcement_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✖️ Закрыть", callback_data=f"important_close_{announcement_id}")],
+    ])

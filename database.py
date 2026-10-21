@@ -161,6 +161,14 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        announcement_columns = {row[1] for row in cursor.execute("PRAGMA table_info(announcements)")}
+        for name, definition in (
+            ("important", "INTEGER NOT NULL DEFAULT 0"),
+            ("body", "TEXT NOT NULL DEFAULT ''"),
+            ("photo_file_id", "TEXT"),
+        ):
+            if name not in announcement_columns:
+                cursor.execute(f"ALTER TABLE announcements ADD COLUMN {name} {definition}")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS announcement_reads (
                 user_id INTEGER NOT NULL,
@@ -1042,28 +1050,40 @@ def get_preview_subject_names_for_group(group_name: str) -> List[str]:
             seen.add(name.lower())
     return names
 
-def publish_announcement(source_chat_id: int, source_message_id: int) -> int:
-    """Persists an admin broadcast as the current in-menu notification."""
+def publish_announcement(source_chat_id: int, source_message_id: int,
+                         important: bool = False, body: str = "", photo_file_id=None) -> int:
+    """Store ordinary notifications or important announcements without changing old rows."""
     with get_connection() as conn:
         cursor = conn.execute(
-            "INSERT INTO announcements (source_chat_id, source_message_id) VALUES (?, ?)",
-            (source_chat_id, source_message_id),
+            "INSERT INTO announcements (source_chat_id, source_message_id, important, body, photo_file_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (source_chat_id, source_message_id, int(important), body, photo_file_id),
         )
         conn.commit()
         return int(cursor.lastrowid)
 
-def get_unread_announcement(user_id: int) -> Optional[Dict]:
-    """Returns the oldest announcement not yet opened by the user."""
+
+def get_unread_announcement(user_id: int, important: bool = False) -> Optional[Dict]:
+    """Important announcements remain unread until explicitly closed."""
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT a.id, a.source_chat_id, a.source_message_id, a.created_at "
-            "FROM announcements AS a "
+            "SELECT a.* FROM announcements AS a "
             "LEFT JOIN announcement_reads AS r "
             "ON r.announcement_id = a.id AND r.user_id = ? "
-            "WHERE r.announcement_id IS NULL ORDER BY a.id ASC LIMIT 1",
-            (user_id,),
+            "WHERE r.announcement_id IS NULL AND a.important = ? ORDER BY a.id ASC LIMIT 1",
+            (user_id, int(important)),
         ).fetchone()
         return dict(row) if row else None
+
+
+def close_important_announcement(user_id: int, announcement_id: int):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO announcement_reads (user_id, announcement_id) "
+            "SELECT ?, id FROM announcements WHERE id = ? AND important = 1",
+            (user_id, announcement_id),
+        )
+        conn.commit()
 
 def mark_announcement_read(user_id: int, announcement_id: int):
     with get_connection() as conn:
