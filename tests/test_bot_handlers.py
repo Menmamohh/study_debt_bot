@@ -103,7 +103,7 @@ class BotHandlerTests(unittest.TestCase):
 
         asyncio.run(bot.cb_admin_review_queue(FakeCallback(), bot=object()))
 
-        self.assertIn("Панель администратора", rendered["text"])
+        self.assertIn("Админка › Материалы", rendered["text"])
         self.assertEqual(rendered["answer"], ("Очередь загружена!",))
 
     def test_admin_panel_is_not_opened_in_a_group_chat(self):

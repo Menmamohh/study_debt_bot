@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
@@ -296,6 +297,7 @@ class Form(StatesGroup):
     waiting_for_feedback_reply = State()
     waiting_for_feedback_reply_preview = State()
     waiting_for_broadcast = State()
+    waiting_for_group_notice = State()
 
 async def check_user_access(user) -> tuple[bool, str]:
     if is_admin(user):
@@ -504,7 +506,7 @@ async def render_admin_verification_queue(bot: Bot, page: int = 0, recreate: boo
         pending_users = await adb.get_pending_users(ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
 
     if pending_users:
-        lines = [f"👥 <b>Очередь верификации: {total}</b> · страница {page + 1}", ""]
+        lines = [f"<b>Админка › Студенты › Заявки: {total}</b> · страница {page + 1}", ""]
         for index, user in enumerate(pending_users, page * ADMIN_PAGE_SIZE + 1):
             name = html.escape(user.get("student_name") or user.get("tg_name") or "Студент")
             group = html.escape(user.get("student_group") or "")
@@ -513,10 +515,10 @@ async def render_admin_verification_queue(bot: Bot, page: int = 0, recreate: boo
         text = "\n".join(lines)
         markup = kb.admin_user_queue_page_kb(pending_users, page, total, ADMIN_PAGE_SIZE)
     else:
-        text = "👥 <b>Очередь верификации пуста.</b>\nНовые заявки появятся здесь."
+        text = "<b>Админка › Студенты › Заявки</b>\n\nОчередь пуста.\nНовые заявки появятся здесь."
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Обновить очередь", callback_data="adm_users_queue")],
-            [InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_panel")],
+            *kb.admin_back_rows("students"),
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
         ])
 
@@ -684,6 +686,27 @@ class VerificationMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user = getattr(event, "from_user", None)
         state = data.get('state')
+        if isinstance(event, CallbackQuery):
+            action = event.data or ""
+            if action.startswith(("adm_", "admin_", "vug_", "vuc_", "sr_", "fbr_", "fbh_")):
+                if not user or not is_admin(user) or not event.message or event.message.chat.type != "private":
+                    await event.answer("Доступ только администратору в личном чате.", show_alert=True)
+                    return None
+                # Leaving a form through any administrative menu cancels its input.
+                navigation = {
+                    "admin_panel", "adm_users_queue", "adm_users_list", "admin_review_queue",
+                    "adm_feedback_queue", "adm_test_mode", "adm_ocr_mode", "adm_manage_materials",
+                    "adm_schedule_groups", "adm_gdrive_sync", "sr_queue", "adm_sched_publish_all",
+                    "adm_group_notice_start", "adm_notice_cancel",
+                }
+                if state and (action in navigation or action.startswith((
+                    "adm_section_", "adm_sched_edit_", "adm_users_queue_", "adm_users_list_",
+                    "admin_review_queue_", "adm_feedback_queue_", "vuc_", "vug_",
+                ))):
+                    if action not in {"adm_notice_cancel"}:
+                        await adb.cancel_feedback_reply_drafts(user.id)
+                    if action not in {"adm_notice_edit"}:
+                        await state.clear()
         if user and state:
             state_data = await state.get_data()
             if state_data.get('feedback_reply_token'):
@@ -816,43 +839,61 @@ async def show_admin_panel(message_or_callback, user, bot: Bot, is_callback: boo
         pending_feedback_count=pending_feedback_count,
     )
     
-    markup.inline_keyboard.insert(0, [InlineKeyboardButton(text="📝 Черновики замен", callback_data="sr_queue")])
-
-    status_lines = []
-    if pending_users_count > 0:
-        status_lines.append(f"👥 <b>Заявок на вход (верификация):</b> <b>{pending_users_count}</b> шт.")
-    if pending_mat_count > 0:
-        status_lines.append(f"📋 <b>Материалов на проверке:</b> <b>{pending_mat_count}</b> шт.")
-    if pending_feedback_count > 0:
-        status_lines.append(f"🐞 <b>Новых отчётов об ошибках:</b> <b>{pending_feedback_count}</b> шт.")
-        
-    if not status_lines:
-        text = (
-            f"👑 <b>Панель администратора (@{ADMIN_USERNAME})</b>\n\n"
-            f"🎉 <b>Все заявки проверены!</b> Очередь пуста.\n\n"
-            f"Здесь ты можешь управлять доступом студентов, расписанием и базой знаний."
-        )
-    else:
-        text = (
-            f"👑 <b>Панель администратора (@{ADMIN_USERNAME})</b>\n\n"
-            + "\n".join(status_lines) + "\n\n"
-            f"Выбери раздел для управления 👇"
-        )
+    text = (
+        "<b>Админка</b>\n\n"
+        "Требуют внимания:\n"
+        f"Заявки студентов: <b>{pending_users_count}</b>\n"
+        f"Материалы на проверке: <b>{pending_mat_count}</b>\n"
+        f"Открытые обращения: <b>{pending_feedback_count}</b>\n\n"
+        "Выбери раздел."
+    )
     await show_user_screen(message_or_callback, text, reply_markup=markup)
         
 @dp.message(Command("admin"))
-async def cmd_admin(message: Message, bot: Bot):
+async def cmd_admin(message: Message, bot: Bot, state: FSMContext = None):
     if is_admin(message.from_user) and message.chat.type != "private":
         await message.answer("Админ-панель доступна только в личном чате с ботом.")
         return
+    if state and is_admin(message.from_user):
+        await state.clear()
     await show_admin_panel(message, message.from_user, bot, is_callback=False)
 
 @dp.callback_query(F.data == "admin_panel")
-async def cb_admin_panel(callback: CallbackQuery, bot: Bot):
+async def cb_admin_panel(callback: CallbackQuery, bot: Bot, state: FSMContext = None):
     if is_admin(callback.from_user) and callback.message.chat.type != "private":
         await callback.answer("Открой личный чат с ботом, чтобы пользоваться админ-панелью.", show_alert=True)
         return
+    if state and is_admin(callback.from_user):
+        await state.clear()
     await show_admin_panel(callback, callback.from_user, bot, is_callback=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_section_") | (F.data == "adm_schedule_groups"))
+async def cb_admin_section(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user) or not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Доступ только администратору в личном чате.", show_alert=True)
+        return
+    section = callback.data.removeprefix("adm_section_")
+    if callback.data == "adm_schedule_groups":
+        await state.clear()
+        await show_user_screen(callback, "📅 <b>Админка › Расписание › Группы</b>\n\nВыбери группу для просмотра, редактирования и истории расписания.",
+                               reply_markup=kb.admin_schedule_groups_kb(db.COLLEGE_GROUPS))
+    elif section not in kb.ADMIN_SECTIONS:
+        await callback.answer("Раздел устарел. Открой админку заново.", show_alert=True)
+        return
+    else:
+        await state.clear()
+        descriptions = {
+            "students": "Проверяй заявки на вход и просматривай подтверждённых студентов по группам.",
+            "schedule": "Обновляй листы, проверяй черновики и управляй публикациями по группам.",
+            "notifications": "Создай обычное или важное объявление для всех подтверждённых студентов. Перед публикацией будет предпросмотр.",
+            "materials": "Проверяй новые материалы и управляй базой знаний.",
+            "feedback": "Просматривай отчёты об ошибках и отвечай студентам.",
+            "tools": "Просматривай интерфейс групп и проверяй распознавание расписания.",
+        }
+        await show_user_screen(callback, f"<b>Админка › {kb.ADMIN_SECTIONS[section]}</b>\n\n{descriptions[section]}",
+                               reply_markup=kb.admin_section_kb(section))
     await callback.answer()
 
 
@@ -862,7 +903,7 @@ async def cb_admin_test_mode(callback: CallbackQuery):
         await callback.answer("Режим доступен только администратору в личном чате.", show_alert=True)
         return
     text = (
-        "🧪 <b>Тестовый просмотр групп</b>\n\n"
+        "<b>Админка › Проверки › Просмотр групп</b>\n\n"
         "Выбери группу, чтобы посмотреть её предметы, число опубликованных материалов и расписание. "
         "Личные долги и прогресс студентов не отображаются и не изменяются."
     )
@@ -876,7 +917,7 @@ async def cb_admin_ocr_mode(callback: CallbackQuery):
         await callback.answer("Проверка доступна только администратору в личном чате.", show_alert=True)
         return
     text = (
-        "🔎 <b>Проверка распознавания расписания</b>\n\n"
+        "<b>Админка › Проверки › Распознавание</b>\n\n"
         "Выбери группу. Бот на сервере прочитает самый свежий сохранённый лист замен, покажет его дату, найденный текст и исходные фото. "
         "Этот результат увидишь только ты; студентам он не отправляется."
     )
@@ -1049,12 +1090,10 @@ async def _show_feedback_queue(callback: CallbackQuery, page: int = 0):
     total = await adb.count_open_feedback_reports()
     reports = await adb.get_open_feedback_reports(ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
     if not reports:
-        text = "🐞 <b>Новых отчётов об ошибках нет.</b>"
-        markup = kb.admin_panel_kb(
-            await adb.count_pending_materials(), await adb.count_pending_users(), total
-        )
+        text = "<b>Админка › Обращения</b>\n\nНовых отчётов об ошибках нет."
+        markup = kb.admin_section_kb("feedback")
     else:
-        text = f"🐞 <b>Отчёты об ошибках: {total}</b> · страница {page + 1}\n\nВыбери отчёт для просмотра."
+        text = f"<b>Админка › Обращения: {total}</b> · страница {page + 1}\n\nВыбери отчёт для просмотра."
         markup = kb.admin_feedback_queue_kb(reports, page, total, ADMIN_PAGE_SIZE)
     await show_user_screen(callback, text, reply_markup=markup)
 
@@ -1360,9 +1399,164 @@ async def cb_admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
     text = (
         "📢 <b>Новое объявление</b>\n\n"
         "Отправь текст или фотографию с подписью. Перед публикацией покажу предпросмотр и попрошу подтвердить.\n\n"
-        "Обычное объявление появится в уведомлениях. Важное придёт отдельным сообщением и заменит главное меню до нажатия «Закрыть». Тип выберешь на предпросмотре. Для отмены нажми «Главное меню»."
+        "Обычное объявление появится в уведомлениях. Важное придёт отдельным сообщением и заменит главное меню до нажатия «Закрыть». Тип выберешь на предпросмотре. Для отмены вернись в админку."
     )
-    await show_user_screen(callback, text, reply_markup=kb.back_to_menu_kb())
+    await show_user_screen(callback, text, reply_markup=kb.admin_section_kb("notifications"))
+
+
+@dp.callback_query(F.data == "adm_group_notice_start")
+async def cb_admin_group_notice_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Доступ только администратору в личном чате.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(group_notice_token=uuid.uuid4().hex)
+    await show_user_screen(callback, "<b>Админка › Уведомления › Выбор группы</b>\n\n"
+                           "Выбери одну учебную группу.",
+                           reply_markup=kb.admin_notice_groups_kb(db.COLLEGE_GROUPS))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_notice_group_"))
+async def cb_admin_group_notice_select(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Доступ только администратору в личном чате.", show_alert=True)
+        return
+    group = callback.data.removeprefix("adm_notice_group_")
+    if group not in db.COLLEGE_GROUPS:
+        await callback.answer("Неизвестная группа. Открой список заново.", show_alert=True)
+        return
+    recipients = await adb.get_verified_users_by_group(group)
+    if not recipients:
+        await callback.answer(f"В группе {group} нет подтверждённых получателей.", show_alert=True)
+        return
+    data = await state.get_data()
+    token = data.get("group_notice_token")
+    if not token:
+        await callback.answer("Сценарий устарел. Начни заново из админки.", show_alert=True)
+        return
+    await state.update_data(group_notice_group=group, group_notice_recipients=[u["user_id"] for u in recipients])
+    await state.set_state(Form.waiting_for_group_notice)
+    await show_user_screen(callback, f"<b>Админка › Уведомления › {html.escape(group)}</b>\n\n"
+                           f"Получателей: <b>{len(recipients)}</b> подтверждённых студентов.\n\n"
+                           "Отправь текст уведомления одним сообщением. Для отмены вернись в админку.",
+                           reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                               [InlineKeyboardButton(text="Отмена", callback_data="adm_notice_cancel")],
+                               *kb.admin_back_rows("notifications"),
+                           ]))
+    await callback.answer()
+
+
+@dp.message(Form.waiting_for_group_notice)
+async def process_group_notice_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user) or message.chat.type != "private":
+        await state.clear()
+        return
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    group = data.get("group_notice_group")
+    token = data.get("group_notice_token")
+    if group not in db.COLLEGE_GROUPS or not token:
+        await state.clear()
+        await show_user_screen(message, "Сценарий устарел. Открой уведомления заново.",
+                               reply_markup=kb.admin_section_kb("notifications"))
+        return
+    if not text or len(text) > 4000:
+        await show_user_screen(message, "Отправь текст длиной от 1 до 4000 символов.",
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                   [InlineKeyboardButton(text="Отмена", callback_data="adm_notice_cancel")],
+                                   *kb.admin_back_rows("notifications"),
+                               ]))
+        return
+    recipients = await adb.get_verified_users_by_group(group)
+    await state.update_data(group_notice_body=text, group_notice_recipients=[u["user_id"] for u in recipients])
+    await state.set_state(Form.waiting_for_group_notice)
+    await show_user_screen(message, f"<b>Админка › Уведомления › Предпросмотр</b>\n\n"
+                           f"Группа: <b>{html.escape(group)}</b>\n"
+                           f"Получателей: <b>{len(recipients)}</b> подтверждённых студентов.\n\n"
+                           f"{html.escape(text)}\n\nОтправить это уведомление?",
+                           reply_markup=kb.admin_notice_confirm_kb())
+
+
+@dp.callback_query(F.data == "adm_notice_edit")
+async def cb_admin_group_notice_edit(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Доступ только администратору в личном чате.", show_alert=True)
+        return
+    data = await state.get_data()
+    if not data.get("group_notice_token") or not data.get("group_notice_group"):
+        await callback.answer("Черновик устарел. Начни заново.", show_alert=True)
+        return
+    await state.set_state(Form.waiting_for_group_notice)
+    await show_user_screen(callback, f"<b>Админка › Уведомления › {html.escape(data['group_notice_group'])}</b>\n\n"
+                           "Отправь исправленный текст.",
+                           reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                               [InlineKeyboardButton(text="Отмена", callback_data="adm_notice_cancel")],
+                               *kb.admin_back_rows("notifications"),
+                           ]))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "adm_notice_cancel")
+async def cb_admin_group_notice_cancel(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Доступ только администратору в личном чате.", show_alert=True)
+        return
+    await state.clear()
+    await show_user_screen(callback, "<b>Админка › Уведомления</b>\n\nОтправка отменена.",
+                           reply_markup=kb.admin_section_kb("notifications"))
+    await callback.answer("Отменено")
+
+
+group_notice_publish_lock = None
+
+
+@dp.callback_query(F.data == "adm_notice_send")
+async def cb_admin_group_notice_send(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if not is_admin(callback.from_user) or callback.message.chat.type != "private":
+        await callback.answer("Доступ только администратору в личном чате.", show_alert=True)
+        return
+    global group_notice_publish_lock
+    if group_notice_publish_lock is None:
+        group_notice_publish_lock = asyncio.Lock()
+    async with group_notice_publish_lock:
+        data = await state.get_data()
+        group, body, token = (data.get("group_notice_group"), data.get("group_notice_body"),
+                              data.get("group_notice_token"))
+        if group not in db.COLLEGE_GROUPS or not body or not token:
+            await callback.answer("Черновик уже отправлен или устарел.", show_alert=True)
+            return
+        recipients = await adb.get_verified_users_by_group(group)
+        recipient_ids = {u["user_id"] for u in recipients}
+        if not recipient_ids:
+            await callback.answer("Подтверждённых получателей больше нет.", show_alert=True)
+            return
+        await state.clear()
+    await callback.answer("Начинаю отправку")
+    await safe_edit_message(callback, f"📨 Отправляю уведомление группе {html.escape(group)}…")
+    sent = failed = 0
+    for user_id in recipient_ids:
+        try:
+            try:
+                await bot.send_message(chat_id=user_id, text=body, parse_mode=None,
+                                       disable_notification=False)
+            except TelegramRetryAfter as error:
+                await asyncio.sleep(error.retry_after)
+                await bot.send_message(chat_id=user_id, text=body, parse_mode=None,
+                                       disable_notification=False)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+            logger.warning("Group notification delivery failed for user %s", user_id)
+    await safe_edit_message(callback, f"✅ <b>Уведомление отправлено</b>\n\n"
+                            f"Группа: <b>{html.escape(group)}</b>\n"
+                            f"Успешно: <b>{sent}</b>\nНе удалось: <b>{failed}</b>",
+                            reply_markup=kb.admin_section_kb("notifications"))
 
 
 @dp.message(Form.waiting_for_broadcast)
@@ -1375,7 +1569,7 @@ async def process_broadcast_draft(message: Message, state: FSMContext):
         await cmd_start(message, state)
         return
     if not (message.text or message.photo):
-        await show_user_screen(message, "⚠️ Отправь текст объявления или фотографию с подписью.", reply_markup=kb.back_to_menu_kb())
+        await show_user_screen(message, "⚠️ Отправь текст объявления или фотографию с подписью.", reply_markup=kb.admin_section_kb("notifications"))
         return
 
     await state.update_data(
@@ -1407,7 +1601,7 @@ async def cb_admin_broadcast_cancel(callback: CallbackQuery, state: FSMContext, 
         await callback.answer("Доступ только для администратора.", show_alert=True)
         return
     await state.clear()
-    await show_admin_panel(callback, callback.from_user, bot, is_callback=True)
+    await show_user_screen(callback, "<b>Админка › Уведомления</b>\n\nРассылка отменена.", reply_markup=kb.admin_section_kb("notifications"))
     await callback.answer("Рассылка отменена.")
 
 
@@ -1537,12 +1731,10 @@ async def cb_admin_review_queue(callback: CallbackQuery, bot: Bot):
     total = await adb.count_pending_materials()
     materials = await adb.get_pending_materials(ADMIN_PAGE_SIZE, page * ADMIN_PAGE_SIZE)
     if not materials:
-        text = "👑 <b>Панель администратора</b>\n\n📋 Очередь материалов пуста."
-        markup = kb.admin_panel_kb(
-            await adb.count_pending_materials(), await adb.count_pending_users(), await adb.count_open_feedback_reports()
-        )
+        text = "<b>Админка › Материалы</b>\n\n📋 Очередь материалов пуста."
+        markup = kb.admin_section_kb("materials")
     else:
-        lines = [f"📋 <b>Материалы на проверке: {total}</b> · страница {page + 1}", ""]
+        lines = [f"<b>Админка › Материалы › На проверке: {total}</b> · страница {page + 1}", ""]
         for index, material in enumerate(materials, page * ADMIN_PAGE_SIZE + 1):
             title = html.escape((material.get("title") or "Без названия")[:90])
             subject = html.escape((material.get("subject_name") or "")[:40])
@@ -2165,10 +2357,10 @@ async def cb_admin_users_list(callback: CallbackQuery):
     groups = await adb.get_verified_user_groups()
     page = min(max(0, page), max(0, (len(groups) - 1) // ADMIN_PAGE_SIZE))
     if not groups:
-        text = "👥 <b>Верифицированных студентов пока нет.</b>"
+        text = "<b>Админка › Студенты › Группы</b>\n\nПодтверждённых студентов пока нет."
     else:
         text = (
-            "👥 <b>Верифицированные студенты по группам</b>\n\n"
+            "<b>Админка › Студенты › Группы</b>\n\n"
             f"Всего: <b>{sum(group['total'] for group in groups)}</b> · групп: <b>{len(groups)}</b>\n"
             f"Страница {page + 1} из {(len(groups) - 1) // ADMIN_PAGE_SIZE + 1}\n\n"
             "Выбери группу:"
@@ -2489,9 +2681,10 @@ async def cb_schedule_history(callback: CallbackQuery, state: FSMContext):
         if not is_admin(callback.from_user) or callback.message.chat.type != "private":
             await callback.answer("Удалять старое расписание может только администратор в личном чате.", show_alert=True)
             return
-        deleted = selected and await adb.delete_old_schedule_version(version_id)
-        await callback.answer("Старое расписание удалено." if deleted else "Расписание уже удалено или является актуальным.", show_alert=True)
-        await render_group_schedule_view(callback, callback.from_user, group, is_callback=True)
+        if not selected or selected == versions[0]:
+            await callback.answer("Расписание уже удалено или является актуальным.", show_alert=True)
+            return
+        await confirm_schedule_removal(callback, state, group, selected, version_id)
         return
     await callback.answer()
     await render_group_schedule_view(callback, callback.from_user, group, is_callback=True,
@@ -2890,7 +3083,7 @@ async def process_group_schedule_input(message: Message, state: FSMContext, bot:
     await render_group_schedule_view(message, message.from_user, target_group, is_callback=False, bot=bot, notice=confirm_text)
 
 @dp.callback_query(F.data.startswith("adm_sched_clear_"))
-async def cb_admin_sched_clear(callback: CallbackQuery):
+async def cb_admin_sched_clear(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user):
         await callback.answer("⛔ Доступ только для @Menmamoh!", show_alert=True)
         return
@@ -2902,9 +3095,61 @@ async def cb_admin_sched_clear(callback: CallbackQuery):
     if target_group not in {*db.COLLEGE_GROUPS, "ALL"}:
         await callback.answer("Неизвестная группа расписания.", show_alert=True)
         return
-    await adb.clear_group_schedule(target_group)
-    await callback.answer(f"Расписание для {target_group} очищено!", show_alert=True)
-    await render_group_schedule_view(callback, callback.from_user, target_group, is_callback=True)
+    current = await adb.get_group_schedule(target_group)
+    await confirm_schedule_removal(callback, state, target_group, current)
+
+
+async def confirm_schedule_removal(callback, state, group, snapshot, version_id=None):
+    token = uuid.uuid4().hex
+    await state.clear()
+    await state.update_data(admin_removal={"token": token, "group": group,
+                                         "snapshot": snapshot, "version_id": version_id})
+    action = "Удалить выбранную старую версию" if version_id else "Очистить опубликованное расписание"
+    version_label = f"Версия: №{version_id}\n" if version_id else ""
+    await show_user_screen(callback, f"<b>Админка › Расписание › Подтверждение</b>\n\n"
+                           f"Группа: <b>{html.escape(group)}</b>\n{version_label}{action}?\n"
+                           "Продолжай только если уверен в выборе.",
+                           reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                               [InlineKeyboardButton(text="Подтвердить", callback_data=f"adm_remove_{token}")],
+                               [InlineKeyboardButton(text="Отмена", callback_data=f"sched_view_{group}")],
+                               *kb.admin_back_rows("schedule"),
+                           ]))
+    await callback.answer()
+
+
+admin_removal_lock = None
+
+
+@dp.callback_query(F.data.startswith("adm_remove_"))
+async def cb_admin_schedule_removal(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user) or not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Доступ только администратору в личном чате.", show_alert=True)
+        return
+    global admin_removal_lock
+    if admin_removal_lock is None:
+        admin_removal_lock = asyncio.Lock()
+    async with admin_removal_lock:
+        draft = (await state.get_data()).get("admin_removal")
+        if not draft or callback.data != f"adm_remove_{draft['token']}":
+            await callback.answer("Подтверждение устарело. Открой расписание заново.", show_alert=True)
+            return
+        await state.clear()
+        group, version_id = draft['group'], draft['version_id']
+        if version_id:
+            versions = await adb.get_schedule_versions(group)
+            current = next((item for item in versions if item['id'] == version_id), None)
+        else:
+            current = await adb.get_group_schedule(group)
+        if current != draft['snapshot']:
+            await callback.answer("Расписание изменилось. Проверь его и подтверди действие заново.", show_alert=True)
+            return
+        if version_id:
+            changed = await adb.delete_old_schedule_version(version_id)
+        else:
+            await adb.clear_group_schedule(group)
+            changed = True
+    await callback.answer("Действие выполнено." if changed else "Эта версия уже недоступна.", show_alert=True)
+    await render_group_schedule_view(callback, callback.from_user, group, is_callback=True)
 
 @dp.callback_query(F.data == "adm_gdrive_sync")
 async def cb_admin_gdrive_sync(callback: CallbackQuery, bot: Bot):
@@ -2919,7 +3164,7 @@ async def cb_admin_gdrive_sync(callback: CallbackQuery, bot: Bot):
     status_msg = await callback.message.answer(
         "🔄 <i>Подключаюсь к Google Диску колледжа и проверяю свежие замены...</i>", 
         parse_mode="HTML",
-        reply_markup=kb.back_to_menu_kb(),
+        reply_markup=kb.admin_section_kb("schedule"),
     )
     # Treat the sync progress/report as the user's current screen too. Otherwise
     # it survives menu cleanup and remains as a permanent extra message below it.
@@ -2938,7 +3183,7 @@ async def cb_admin_gdrive_sync(callback: CallbackQuery, bot: Bot):
         await status_msg.edit_text(
             f"⚠️ <b>Ошибка при синхронизации с Google Диском:</b>\n{res.get('error')}",
             parse_mode="HTML",
-            reply_markup=kb.back_to_menu_kb(),
+            reply_markup=kb.admin_section_kb("schedule"),
         )
         return
 
@@ -2962,7 +3207,7 @@ async def cb_admin_gdrive_sync(callback: CallbackQuery, bot: Bot):
     )
     await status_msg.edit_text(report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Черновики замен", callback_data="sr_queue")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+        *kb.admin_back_rows("schedule"),
     ]))
     await notify_synced_schedule(bot, res)
     await prepare_and_notify_schedule_reviews(bot)
@@ -2976,7 +3221,7 @@ def schedule_review_kb(review_id, photo_count=0):
     ]
     for index in range(photo_count):
         rows.append([InlineKeyboardButton(text=f"📸 Исходный лист {index + 1}", callback_data=f"sr_photo_{review_id}_{index}")])
-    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
+    rows.extend(kb.admin_back_rows("schedule"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -3037,7 +3282,7 @@ async def show_next_schedule_review(bot, chat_id, notice=''):
         await send_schedule_review(bot, chat_id, drafts[0], len(drafts), notice)
     else:
         await update_review_screen(bot, chat_id, (html.escape(notice) + "\n\n" if notice else '') +
-            "✅ Все черновики обработаны.", kb.back_to_menu_kb())
+            "✅ Все черновики обработаны.", kb.admin_section_kb("schedule"))
 
 
 async def prepare_and_notify_schedule_reviews(bot):
@@ -3047,7 +3292,7 @@ async def prepare_and_notify_schedule_reviews(bot):
         logger.warning("Draft preparation failed: %s", error)
         if ADMIN_ID:
             await update_review_screen(bot, ADMIN_ID, "⚠️ Черновики Gemini не подготовлены: " + html.escape(str(error)),
-                                       kb.back_to_menu_kb())
+                                       kb.admin_section_kb("schedule"))
         return
     if ADMIN_ID:
         drafts = await asyncio.to_thread(schedule_review.pending_reviews, True)
@@ -3186,7 +3431,7 @@ async def process_schedule_review_edit(message: Message, state: FSMContext):
     data = await state.get_data()
     review_id = data.get('schedule_review_id')
     if not message.text or not message.text.strip() or len(message.text.strip()) > schedule_review.MAX_BODY:
-        await update_review_screen(message.bot, message.chat.id, f"Отправь текст от 1 до {schedule_review.MAX_BODY} символов.", kb.back_to_menu_kb())
+        await update_review_screen(message.bot, message.chat.id, f"Отправь текст от 1 до {schedule_review.MAX_BODY} символов.", kb.admin_section_kb("schedule"))
         return
     saved = await asyncio.to_thread(schedule_review.edit_review, review_id, message.text)
     await state.clear()
@@ -3659,14 +3904,14 @@ async def cb_admin_manage_materials(callback: CallbackQuery):
     total_mats = sum(counts_map.values())
     if total_mats == 0:
         text = (
-            "🗄️ <b>Управление базой знаний (Удаление неактуального)</b>\n\n"
+            "<b>Админка › Материалы › База знаний</b>\n\n"
             "В базе сейчас <b>нет опубликованных материалов</b>.\n\n"
             "Когда студенты добавят методички или решения и они будут одобрены, "
             "здесь появится список предметов для быстрого удаления устаревших файлов."
         )
     else:
         text = (
-            "🗄️ <b>Управление базой знаний (Удаление неактуального)</b>\n\n"
+            "<b>Админка › Материалы › База знаний</b>\n\n"
             f"Всего в базе проверенных материалов: <b>{total_mats}</b> шт.\n\n"
             "Выбери предмет, чтобы просмотреть опубликованные материалы и удалить устаревшие 👇"
         )
@@ -3695,9 +3940,7 @@ async def cb_admin_sub_mats(callback: CallbackQuery):
         text = f"В предмете <b>«{safe_name}»</b> сейчас нет опубликованных материалов."
         await callback.message.edit_text(
             text, parse_mode="HTML",
-            reply_markup=kb.admin_panel_kb(
-                await adb.count_pending_materials(), await adb.count_pending_users(), await adb.count_open_feedback_reports()
-            ),
+            reply_markup=kb.admin_materials_subjects_kb([]),
         )
         await callback.answer()
         return
@@ -4638,6 +4881,14 @@ async def gdrive_sync_background_loop(bot: Bot):
         await asyncio.sleep(1800)
 
 # --- Точка входа ---
+@dp.callback_query(F.data.startswith(("adm_", "admin_", "vug_", "vuc_", "sr_")))
+async def cb_stale_admin_button(callback: CallbackQuery):
+    if not is_admin(callback.from_user) or not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Доступ только администратору в личном чате.", show_alert=True)
+        return
+    await callback.answer("Кнопка устарела. Открой /admin и выбери действие заново.", show_alert=True)
+
+
 async def main():
     global ADMIN_ID
     await adb.init_db()

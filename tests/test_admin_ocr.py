@@ -20,7 +20,7 @@ class AdminOcrTests(unittest.TestCase):
         bot.ADMIN_ID = self.original_admin_id
 
     def test_admin_panel_has_ocr_check_and_group_selector(self):
-        panel = kb.admin_panel_kb()
+        panel = kb.admin_section_kb("tools")
         self.assertTrue(any(button.callback_data == "adm_ocr_mode"
                             for row in panel.inline_keyboard for button in row))
         selector = kb.admin_ocr_groups_kb(db.COLLEGE_GROUPS)

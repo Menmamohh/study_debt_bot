@@ -121,9 +121,9 @@ def schedule_view_kb(
         kb.append([
             InlineKeyboardButton(text="🔄 Синхронизация с Google Диском", callback_data="adm_gdrive_sync")
         ])
-    kb.append([
-        InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")
-    ])
+    if is_admin_user:
+        kb.extend(admin_back_rows("schedule"))
+    kb.append([InlineKeyboardButton(text="Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def schedule_version_kb(group_name: str, older_id: Optional[int], version_id: int,
@@ -139,6 +139,8 @@ def schedule_version_kb(group_name: str, older_id: Optional[int], version_id: in
         rows.append([InlineKeyboardButton(text="✏️ Опубликовать расписание",
                                           callback_data=f"adm_sched_edit_{group_name}")])
         rows.append([InlineKeyboardButton(text="🔄 Синхронизация с Google Диском", callback_data="adm_gdrive_sync")])
+    if is_admin_user:
+        rows.extend(admin_back_rows("schedule"))
     rows.extend([
         [InlineKeyboardButton(text="🔔 Расписание звонков", callback_data="sched_bells")],
         [InlineKeyboardButton(text="👥 Выбрать группу", callback_data="sched_choose_group")],
@@ -378,61 +380,87 @@ def rejected_user_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🐞 Сообщить об ошибке", callback_data="feedback_start")],
     ])
 
+ADMIN_SECTIONS = {
+    "students": "Студенты", "schedule": "Расписание",
+    "notifications": "Уведомления", "materials": "Материалы",
+    "feedback": "Обращения", "tools": "Проверки",
+}
+
+
+def admin_back_rows(section: str) -> list:
+    return [[InlineKeyboardButton(text="Назад", callback_data=f"adm_section_{section}"),
+             InlineKeyboardButton(text="В админку", callback_data="admin_panel")]]
+
+
 def admin_panel_kb(pending_materials_count: int = 0, pending_users_count: int = 0, pending_feedback_count: int = 0) -> InlineKeyboardMarkup:
-    kb = []
-    if pending_users_count > 0:
-        kb.append([
-            InlineKeyboardButton(text=f"👥 Заявки на вход ({pending_users_count})", callback_data="adm_users_queue")
-        ])
-    if pending_materials_count > 0:
-        kb.append([
-            InlineKeyboardButton(text=f"📋 Заявки на материалы ({pending_materials_count})", callback_data="admin_review_queue")
-        ])
-    if pending_feedback_count > 0:
-        kb.append([
-            InlineKeyboardButton(text=f"🐞 Отчёты об ошибках ({pending_feedback_count})", callback_data="adm_feedback_queue")
-        ])
-    kb.append([
-        InlineKeyboardButton(text="🧪 Режим тестирования групп", callback_data="adm_test_mode")
+    def badge(count):
+        return f" · {count}" if count else ""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Студенты" + badge(pending_users_count), callback_data="adm_section_students"),
+         InlineKeyboardButton(text="📅 Расписание", callback_data="adm_section_schedule")],
+        [InlineKeyboardButton(text="📢 Уведомления", callback_data="adm_section_notifications"),
+         InlineKeyboardButton(text="📚 Материалы" + badge(pending_materials_count), callback_data="adm_section_materials")],
+        [InlineKeyboardButton(text="💬 Обращения" + badge(pending_feedback_count), callback_data="adm_section_feedback")],
+        [InlineKeyboardButton(text="🛠 Проверки", callback_data="adm_section_tools")],
+        [InlineKeyboardButton(text="Обновить", callback_data="admin_panel"),
+         InlineKeyboardButton(text="Главное меню", callback_data="main_menu")],
     ])
-    kb.append([
-        InlineKeyboardButton(text="🔎 Проверить распознавание расписания", callback_data="adm_ocr_mode")
+
+
+def admin_section_kb(section: str) -> InlineKeyboardMarkup:
+    actions = {
+        "students": [("Заявки на вход", "adm_users_queue"), ("Студенты по группам", "adm_users_list")],
+        "schedule": [("Обновить с Google Диска", "adm_gdrive_sync"), ("Черновики замен", "sr_queue"),
+                     ("Расписание по группам", "adm_schedule_groups"), ("Опубликовать для всех", "adm_sched_publish_all")],
+        "notifications": [("Уведомление группе", "adm_group_notice_start"),
+                          ("Объявление всем", "adm_broadcast_start")],
+        "materials": [("Материалы на проверке", "admin_review_queue"), ("База знаний", "adm_manage_materials")],
+        "feedback": [("Отчёты и переписка", "adm_feedback_queue")],
+        "tools": [("Просмотр групп", "adm_test_mode"), ("Проверка распознавания", "adm_ocr_mode")],
+    }
+    rows = [[InlineKeyboardButton(text=label, callback_data=data)] for label, data in actions[section]]
+    rows.append([InlineKeyboardButton(text="Назад · В админку", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_schedule_groups_kb(groups: List[str]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=group, callback_data=f"sched_view_{group}")] for group in groups]
+    rows.insert(0, [InlineKeyboardButton(text="Общие листы", callback_data="sched_view_ALL")])
+    return InlineKeyboardMarkup(inline_keyboard=rows + admin_back_rows("schedule"))
+
+
+def admin_notice_groups_kb(groups: List[str]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=group, callback_data=f"adm_notice_group_{group}")]
+            for group in groups]
+    rows.extend(admin_back_rows("notifications"))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_notice_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Отправить", callback_data="adm_notice_send")],
+        [InlineKeyboardButton(text="Изменить текст", callback_data="adm_notice_edit")],
+        [InlineKeyboardButton(text="Изменить группу", callback_data="adm_group_notice_start")],
+        [InlineKeyboardButton(text="Отмена", callback_data="adm_notice_cancel")],
     ])
-    kb.append([
-        InlineKeyboardButton(text="📅 Опубликовать расписание для всех", callback_data="adm_sched_publish_all")
-    ])
-    kb.append([
-        InlineKeyboardButton(text="📢 Отправить объявление всем", callback_data="adm_broadcast_start")
-    ])
-    kb.append([
-        InlineKeyboardButton(text="👥 Список верифицированных студентов", callback_data="adm_users_list")
-    ])
-    kb.append([
-        InlineKeyboardButton(text="🗄️ База знаний (удалить неактуальное)", callback_data="adm_manage_materials")
-    ])
-    kb.append([
-        InlineKeyboardButton(text="🔄 Обновить статус", callback_data="admin_panel"),
-        InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
 def admin_test_groups_kb(groups: List[str]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=group, callback_data=f"adm_test_preview_{group}")] for group in groups]
-    rows.append([InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")])
+    rows.extend(admin_back_rows("tools"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_ocr_groups_kb(groups: List[str]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=group, callback_data=f"adm_ocr_group_{group}")] for group in groups]
-    rows.append([InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")])
+    rows.extend(admin_back_rows("tools"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_ocr_result_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔎 Проверить другую группу", callback_data="adm_ocr_mode")],
-        [InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")],
+        *admin_back_rows("tools"),
     ])
 
 
@@ -440,7 +468,7 @@ def admin_test_preview_kb(group_name: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📅 Посмотреть расписание", callback_data=f"sched_view_{group_name}")],
         [InlineKeyboardButton(text="👥 Выбрать другую группу", callback_data="adm_test_mode")],
-        [InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")],
+        *admin_back_rows("tools"),
     ])
 
 
@@ -452,7 +480,7 @@ def admin_feedback_queue_kb(reports: List[Dict], page: int, total: int, page_siz
     controls = _page_controls("adm_feedback_queue", page, total, page_size)
     if controls:
         rows.append(controls)
-    rows.append([InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")])
+    rows.extend(admin_back_rows("feedback"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -461,7 +489,8 @@ def admin_feedback_item_kb(report_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💬 Ответить", callback_data=f"fbr_start_{report_id}")],
         [InlineKeyboardButton(text="📎 Открыть исходное сообщение", callback_data=f"adm_feedback_copy_{report_id}")],
         [InlineKeyboardButton(text="✅ Закрыть отчёт", callback_data=f"adm_feedback_resolve_{report_id}")],
-        [InlineKeyboardButton(text="🔙 К отчётам", callback_data="adm_feedback_queue")],
+        [InlineKeyboardButton(text="Назад · К отчётам", callback_data="adm_feedback_queue"),
+         InlineKeyboardButton(text="В админку", callback_data="admin_panel")],
     ])
 
 
@@ -486,7 +515,7 @@ def admin_user_queue_page_kb(users: List[Dict], page: int, total: int, page_size
     controls = _page_controls("adm_users_queue", page, total, page_size)
     if controls:
         rows.append(controls)
-    rows.append([InlineKeyboardButton(text="🔙 В админ-панель", callback_data="admin_panel")])
+    rows.extend(admin_back_rows("students"))
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -502,7 +531,7 @@ def admin_material_queue_page_kb(materials: List[Dict], page: int, total: int, p
     controls = _page_controls("admin_review_queue", page, total, page_size)
     if controls:
         rows.append(controls)
-    rows.append([InlineKeyboardButton(text="🔙 В админ-панель", callback_data="admin_panel")])
+    rows.extend(admin_back_rows("materials"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -514,7 +543,7 @@ def admin_verified_groups_kb(groups: List[Dict], page: int, page_size: int = 10)
     controls = _page_controls("vuc", page, len(groups), page_size)
     if controls:
         rows.append(controls)
-    rows.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+    rows.extend(admin_back_rows("students"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -524,7 +553,7 @@ def admin_verified_users_page_kb(token: str, page: int, total: int, page_size: i
     if controls:
         rows.append(controls)
     rows.append([InlineKeyboardButton(text="🔙 Назад к группам", callback_data="adm_users_list")])
-    rows.append([InlineKeyboardButton(text="👑 В админку", callback_data="admin_panel")])
+    rows.append([InlineKeyboardButton(text="В админку", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -683,9 +712,7 @@ def admin_materials_subjects_kb(subjects_with_counts: List[Dict]) -> InlineKeybo
             kb.append([
                 InlineKeyboardButton(text=_short_label(f"📁 {name} ({cnt} шт.)"), callback_data=f"adm_sub_mats_{subject_callback_token(name)}")
             ])
-    kb.append([
-        InlineKeyboardButton(text="🔙 Назад в админку", callback_data="admin_panel")
-    ])
+    kb.extend(admin_back_rows("materials"))
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def admin_subject_materials_delete_kb(subject_name: str, materials: List[Dict]) -> InlineKeyboardMarkup:
@@ -702,7 +729,7 @@ def admin_subject_materials_delete_kb(subject_name: str, materials: List[Dict]) 
         ])
     kb.append([
         InlineKeyboardButton(text="🔙 К выбору предмета", callback_data="adm_manage_materials"),
-        InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")
+        InlineKeyboardButton(text="В админку", callback_data="admin_panel")
     ])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
