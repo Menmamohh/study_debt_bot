@@ -728,3 +728,10 @@ def important_announcement_kb(announcement_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✖️ Закрыть", callback_data=f"important_close_{announcement_id}")],
     ])
+
+
+def student_feedback_reply_kb(report_id: int, composing: bool = False) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="Отмена" if composing else "💬 Ответить",
+             callback_data=f"fsr_cancel_{report_id}" if composing else f"fsr_start_{report_id}")]]
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

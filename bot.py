@@ -292,6 +292,7 @@ class Form(StatesGroup):
     waiting_for_group_confirmation = State()
     waiting_for_student_name = State()
     waiting_for_feedback = State()
+    waiting_for_student_feedback_reply = State()
     waiting_for_feedback_reply = State()
     waiting_for_feedback_reply_preview = State()
     waiting_for_broadcast = State()
@@ -697,7 +698,7 @@ class VerificationMiddleware(BaseMiddleware):
             private_prefixes = (
                 "open_sub_", "toggle_t_", "view_mat_", "dl_mat_", "add_task_prompt_",
                 "confirm_del_sub_", "del_sub_", "b_sub_", "quick_", "upload_mat_",
-                "set_mat_type_", "save_text_mat_", "show_all_debts_", "adm_", "important_close_", "sr_",
+                "set_mat_type_", "save_text_mat_", "show_all_debts_", "adm_", "important_close_", "sr_", "fsr_", "fbphoto_",
             )
             private_callbacks = {
                 "main_menu", "debts_hub", "show_all_debts", "list_subjects",
@@ -713,7 +714,7 @@ class VerificationMiddleware(BaseMiddleware):
 
         if isinstance(event, CallbackQuery):
             callback_data = event.data or ""
-            if callback_data in {"main_menu", "start_verify_flow", "feedback_start"} or callback_data.startswith("grp_"):
+            if callback_data in {"main_menu", "start_verify_flow", "feedback_start"} or callback_data.startswith(("grp_", "fsr_")):
                 return await handler(event, data)
         elif isinstance(event, Message):
             if event.text:
@@ -725,6 +726,7 @@ class VerificationMiddleware(BaseMiddleware):
             if state and await state.get_state() in {
                 Form.waiting_for_custom_group.state,
                 Form.waiting_for_feedback.state,
+                Form.waiting_for_student_feedback_reply.state,
             }:
                 return await handler(event, data)
 
@@ -1127,13 +1129,20 @@ async def show_feedback_detail(target, report_id: int, page: int = 0, notice: st
             f"{esc(report.get('body_text') or 'Вложение без текста', 800)}")
     if notice:
         text = html.escape(notice) + '\n\n' + text
-    text += f"\n\n<b>Отправленные ответы: {history['total']}</b>"
+    text += f"\n\n<b>Переписка: {history['total']}</b>"
     for reply in history['replies']:
         date = datetime.datetime.fromisoformat(reply['sent_at']).replace(tzinfo=datetime.timezone.utc).astimezone(ZoneInfo('Europe/Minsk'))
-        text += f"\n\n{date:%d.%m.%Y %H:%M} (Минск)\n{esc(reply['body'], 600)}"
+        author = "Студент" if reply.get("author") == "student" else "Администратор"
+        text += f"\n\n{author} · {date:%d.%m.%Y %H:%M} (Минск)\n{esc(reply['body'], 600)}"
+        if reply.get("photo_file_id"):
+            text += "\n📸 Приложена фотография"
         if len(reply['body']) > 600:
             text += '…'
     markup = kb.admin_feedback_item_kb(report_id)
+    for reply in history['replies']:
+        if reply.get('photo_file_id'):
+            markup.inline_keyboard.insert(0, [InlineKeyboardButton(text="📸 Фото из ответа студента",
+                callback_data=f"fbphoto_{reply['message_id']}")])
     controls = kb._page_controls(f'fbh_{report_id}', history['page'], history['total'], 3)
     if controls:
         markup.inline_keyboard.insert(0, controls)
@@ -1239,7 +1248,8 @@ async def cb_feedback_reply_action(callback: CallbackQuery, state: FSMContext, b
     await callback.answer('Отправляю…')
     try:
         sent = await bot.send_message(chat_id=claimed['recipient_id'],
-            text=f"Ответ администратора на обращение №{claimed['report_id']}\n\n{claimed['body']}", parse_mode=None)
+            text=f"Ответ администратора на обращение №{claimed['report_id']}\n\n{claimed['body']}", parse_mode=None,
+            reply_markup=kb.student_feedback_reply_kb(claimed['report_id']))
     except (TelegramForbiddenError, TelegramBadRequest, TelegramRetryAfter):
         await adb.finish_feedback_reply(token, 'failed')
         await safe_edit_message(callback, 'Ответ не доставлен: Telegram отклонил отправку. Можно изменить текст или отменить ответ.',
@@ -1255,6 +1265,86 @@ async def cb_feedback_reply_action(callback: CallbackQuery, state: FSMContext, b
     if (await state.get_data()).get('feedback_reply_token') == token:
         await state.clear()
         await show_feedback_detail(callback, claimed['report_id'], notice='✅ Ответ отправлен. Отчёт остаётся открытым.')
+
+
+@dp.callback_query(F.data.regexp(r'^fsr_(start|cancel)_\d+$'))
+async def cb_student_feedback_reply(callback: CallbackQuery, state: FSMContext):
+    if callback.message.chat.type != 'private':
+        await callback.answer('Открой личный чат с ботом.', show_alert=True)
+        return
+    _, action, raw_id = callback.data.split('_')
+    report_id = int(raw_id)
+    if not await adb.can_student_reply(report_id, callback.from_user.id):
+        await callback.answer('Обращение закрыто или недоступно.', show_alert=True)
+        return
+    await state.clear()
+    if action == 'cancel':
+        await show_user_screen(callback, f'Ответ на обращение №{report_id} отменён.',
+                               reply_markup=kb.student_feedback_reply_kb(report_id))
+        return
+    await state.update_data(student_feedback_report_id=report_id)
+    await state.set_state(Form.waiting_for_student_feedback_reply)
+    await show_user_screen(callback, f'💬 Ответ на обращение №{report_id}\n\nОтправь текст (до 3500 символов) или фотографию с подписью. Сообщение сохранится в этом же обращении.',
+                           reply_markup=kb.student_feedback_reply_kb(report_id, composing=True))
+
+
+@dp.message(Form.waiting_for_student_feedback_reply)
+async def process_student_feedback_reply(message: Message, state: FSMContext, bot: Bot):
+    if message.chat.type != 'private':
+        return
+    if message.text and (message.text.startswith('/') or message.text.strip().lower() in {'меню', 'главное меню', 'start', 'старт'}):
+        await state.clear()
+        await cmd_start(message, state)
+        return
+    data = await state.get_data()
+    report_id = data.get('student_feedback_report_id')
+    if not report_id or not await adb.can_student_reply(report_id, message.from_user.id):
+        await state.clear()
+        await show_user_screen(message, 'Обращение закрыто или недоступно.', reply_markup=kb.back_to_menu_kb())
+        return
+    body = (message.text or message.caption or '').strip()
+    photo = message.photo[-1].file_id if message.photo else None
+    if (not body and not photo) or len(body) > 3500 or (not message.text and not message.photo):
+        await show_user_screen(message, 'Пришли текст до 3500 символов или фотографию с подписью.',
+                               reply_markup=kb.student_feedback_reply_kb(report_id, composing=True))
+        return
+    result = await adb.save_student_feedback_reply(report_id, message.from_user.id, message.chat.id,
+                                                  message.message_id, body, photo)
+    if result == 'duplicate':
+        return
+    if result != 'saved':
+        await state.clear()
+        await show_user_screen(message, 'Не удалось добавить ответ: обращение закрыто или недоступно.', reply_markup=kb.back_to_menu_kb())
+        return
+    await state.clear()
+    # The message is already in the admin queue even if Telegram rejects the alert.
+    admin_id = await adb.get_admin_id() or ADMIN_ID
+    if admin_id:
+        try:
+            await bot.send_message(chat_id=admin_id, text=f'💬 Новое сообщение студента в обращении №{report_id}.',
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Открыть переписку", callback_data=f"adm_feedback_{report_id}")]]))
+        except Exception:
+            logger.exception('Could not notify admin of student reply in report %s', report_id)
+    await show_user_screen(message, f'✅ Ответ сохранён в обращении №{report_id}. Администратор увидит его в переписке.',
+                           reply_markup=kb.student_feedback_reply_kb(report_id))
+
+
+@dp.callback_query(F.data.regexp(r'^fbphoto_\d+$'))
+async def cb_feedback_student_photo(callback: CallbackQuery, bot: Bot):
+    if not is_admin(callback.from_user) or callback.message.chat.type != 'private':
+        await callback.answer('Доступ только администратору.', show_alert=True)
+        return
+    item = await adb.get_feedback_student_message(int(callback.data.split('_')[1]))
+    if not item or not item.get('photo_file_id'):
+        await callback.answer('Фотография не найдена.', show_alert=True)
+        return
+    await callback.answer()
+    sent = await bot.send_photo(chat_id=callback.from_user.id, photo=item['photo_file_id'],
+        caption=f"Фото к обращению №{item['report_id']}\n\n{item['body'][:900]}", parse_mode=None,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="К переписке", callback_data=f"adm_feedback_{item['report_id']}")]]))
+    await adb.set_ui_message_id(callback.from_user.id, sent.message_id)
 
 
 @dp.callback_query(F.data == "adm_broadcast_start")

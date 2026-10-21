@@ -191,6 +191,17 @@ def init_db():
                 resolved_at TIMESTAMP
             )
         """)
+        cursor.execute("""CREATE TABLE IF NOT EXISTS feedback_student_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id INTEGER NOT NULL REFERENCES feedback_reports(id),
+            user_id INTEGER NOT NULL,
+            source_chat_id INTEGER NOT NULL,
+            source_message_id INTEGER NOT NULL,
+            body TEXT NOT NULL DEFAULT '',
+            photo_file_id TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+            UNIQUE(source_chat_id, source_message_id)
+        )""")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS feedback_replies (
                 token TEXT PRIMARY KEY,
@@ -1873,15 +1884,51 @@ def finish_feedback_reply(token: str, status: str, message_id: Optional[int] = N
         raise ValueError('Invalid delivery status')
     with get_connection() as conn:
         conn.execute("""UPDATE feedback_replies SET status = ?, telegram_message_id = ?,
-            sent_at = CASE WHEN ? = 'sent' THEN CURRENT_TIMESTAMP ELSE NULL END
+            sent_at = CASE WHEN ? = 'sent' THEN strftime('%Y-%m-%d %H:%M:%f','now') ELSE NULL END
             WHERE token = ? AND status = 'sending'""", (status, message_id, status, token))
 
 
 def get_feedback_reply_history(report_id: int, page: int = 0, page_size: int = 3) -> Dict:
     with get_connection() as conn:
         conn.execute('BEGIN')
-        total = conn.execute("SELECT COUNT(*) FROM feedback_replies WHERE report_id = ? AND status = 'sent'", (report_id,)).fetchone()[0]
+        query = """SELECT body, sent_at, 'admin' AS author, NULL AS photo_file_id, NULL AS message_id,
+                   rowid AS sort_id FROM feedback_replies WHERE report_id=? AND status='sent'
+                   UNION ALL
+                   SELECT body, created_at AS sent_at, 'student' AS author, photo_file_id,
+                   id AS message_id, id AS sort_id FROM feedback_student_messages WHERE report_id=?"""
+        total = conn.execute('SELECT COUNT(*) FROM (' + query + ')', (report_id,report_id)).fetchone()[0]
         page = min(max(0, page), max(0, (total - 1) // page_size))
-        rows = conn.execute("""SELECT body, sent_at FROM feedback_replies WHERE report_id = ? AND status = 'sent'
-            ORDER BY sent_at DESC, rowid DESC LIMIT ? OFFSET ?""", (report_id, page_size, page * page_size)).fetchall()
+        rows = conn.execute('SELECT * FROM (' + query + ') ORDER BY sent_at DESC, author DESC, sort_id DESC LIMIT ? OFFSET ?',
+                            (report_id, report_id, page_size, page * page_size)).fetchall()
         return {'total': total, 'page': page, 'replies': [dict(row) for row in rows]}
+
+
+def can_student_reply(report_id: int, user_id: int) -> bool:
+    with get_connection() as conn:
+        return conn.execute("""SELECT 1 FROM feedback_reports r WHERE r.id=? AND r.user_id=? AND r.resolved_at IS NULL
+            AND EXISTS (SELECT 1 FROM feedback_replies a WHERE a.report_id=r.id AND a.status='sent')""",
+            (report_id,user_id)).fetchone() is not None
+
+
+def save_student_feedback_reply(report_id: int, user_id: int, source_chat_id: int,
+                                source_message_id: int, body: str, photo_file_id=None) -> str:
+    body = (body or '').strip()
+    if not (body or photo_file_id) or len(body) > 3500 or source_chat_id != user_id:
+        return 'invalid'
+    with get_connection() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        allowed = conn.execute("""SELECT 1 FROM feedback_reports r WHERE r.id=? AND r.user_id=? AND r.resolved_at IS NULL
+            AND EXISTS (SELECT 1 FROM feedback_replies a WHERE a.report_id=r.id AND a.status='sent')""",
+            (report_id,user_id)).fetchone()
+        if not allowed:
+            return 'closed'
+        changed = conn.execute("""INSERT OR IGNORE INTO feedback_student_messages
+            (report_id,user_id,source_chat_id,source_message_id,body,photo_file_id) VALUES (?,?,?,?,?,?)""",
+            (report_id,user_id,source_chat_id,source_message_id,body,photo_file_id)).rowcount
+        return 'saved' if changed else 'duplicate'
+
+
+def get_feedback_student_message(message_id: int) -> Optional[Dict]:
+    with get_connection() as conn:
+        row = conn.execute('SELECT * FROM feedback_student_messages WHERE id=?',(message_id,)).fetchone()
+        return dict(row) if row else None
