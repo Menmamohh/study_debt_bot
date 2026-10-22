@@ -3406,7 +3406,7 @@ async def prepare_and_notify_schedule_reviews(bot, manual=False):
         if manual and ADMIN_ID:
             await update_review_screen(bot, ADMIN_ID,
                 "⏳ Повторно запрашиваю черновики по уже скачанным листам. "
-                "Это может занять несколько минут. При временном сбое бот выполнит ещё одну попытку. Готовые результаты сохраняются.",
+                "Листы обрабатываются по одному; успешные страницы сохраняются. Это может занять несколько минут. При временном сбое бот выполнит ещё одну попытку. Неполные черновики не публикуются.",
                 kb.admin_section_kb("schedule"))
         try:
             await asyncio.to_thread(schedule_review.prepare_reviews)

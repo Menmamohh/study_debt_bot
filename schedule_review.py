@@ -1,5 +1,6 @@
 """Persistent OCR drafts. Only an explicit admin action publishes their text."""
 import hashlib
+import logging
 import json
 import os
 import threading
@@ -10,6 +11,7 @@ import gdrive_sync
 
 _prepare_lock = threading.Lock()
 MAX_BODY = 2800
+logger = logging.getLogger(__name__)
 
 
 def get_review(review_id):
@@ -26,12 +28,17 @@ def prepare_reviews():
             return
         by_date = {}
         target_date = gdrive_sync.get_target_study_date()[0].isoformat()
+        for source in db.get_latest_gdrive_schedule_files(doc_type='replacement'):
+            if (source.get('schedule_date') or '') >= target_date and not os.path.isfile(source.get('local_path') or ''):
+                raise GeminiError('Один из актуальных листов не скачан. Обнови файлы с Google Диска; неполные черновики не созданы.')
         for photo in payload['photos']:
             caption = photo['caption']
             if not caption.startswith('Замены: '):
                 continue
             date = caption.split(': ', 1)[1].split(',', 1)[0]
-            if date >= target_date and os.path.isfile(photo['source']):
+            if date >= target_date:
+                if not os.path.isfile(photo['source']):
+                    raise GeminiError('Одна из страниц недоступна. Неполные черновики не созданы.')
                 by_date.setdefault(date, []).append(photo)
         # Include detected groups and groups with actual users. An unreadable
         # sheet still yields an editable empty draft for known student groups.
@@ -88,8 +95,10 @@ def _prepare_gemini_date(date, sources, user_groups):
         texts = json.loads(cached['payload'])
     else:
         check_connection()
-        result = read_schedule([photo['source'] for photo in sources], None)
-        texts = result['groups']
+        ordered_sources = sorted(sources, key=lambda photo: int(re.search(r'часть (\d+)', photo['caption']).group(1))
+                                 if re.search(r'часть (\d+)', photo['caption']) else 0)
+        texts = (_read_schedule_pages(ordered_sources, fingerprint) if len(ordered_sources) > 1
+                 else read_schedule([photo['source'] for photo in ordered_sources], None)['groups'])
         with db.get_connection() as conn:
             conn.execute('INSERT OR IGNORE INTO schedule_gemini_batches VALUES (?,?)',
                          (fingerprint, json.dumps(texts, ensure_ascii=False)))
@@ -102,6 +111,105 @@ def _prepare_gemini_date(date, sources, user_groups):
             conn.execute('INSERT OR IGNORE INTO schedule_reviews '
                          '(group_name,schedule_date,fingerprint,sources,body) VALUES (?,?,?,?,?)',
                          (group, date, fingerprint, json.dumps(sources, ensure_ascii=False), body))
+
+
+def _page_cache_get(key):
+    with db.get_connection() as conn:
+        conn.execute('CREATE TABLE IF NOT EXISTS schedule_gemini_pages '
+                     '(fingerprint TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+        row = conn.execute('SELECT payload FROM schedule_gemini_pages WHERE fingerprint=?', (key,)).fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row['payload'])
+    except (ValueError, TypeError):
+        raise GeminiError('Не удалось прочитать кэш страниц. Нужна проверка администратора.') from None
+
+
+def _page_cache_put(key, value):
+    with db.get_connection() as conn:
+        conn.execute('INSERT OR IGNORE INTO schedule_gemini_pages VALUES (?,?)',
+                     (key, json.dumps(value, ensure_ascii=False)))
+
+
+def _read_schedule_pages(sources, fingerprint):
+    """Cache page extraction, but expose no group draft until coverage is complete."""
+    paths = [photo['source'] for photo in sources]
+    parts = [re.search(r'часть (\d+)', photo['caption']) for photo in sources]
+    numbers = [int(part.group(1)) for part in parts if part]
+    ambiguous_order = len(numbers) != len(sources) or len(set(numbers)) != len(numbers)
+    if numbers and set(numbers) != set(range(min(numbers), max(numbers) + 1)):
+        raise GeminiError('Между пронумерованными листами пропущена страница. Обнови файлы с Google Диска; неполные черновики не созданы.')
+    model = os.environ.get('GEMINI_MODEL', 'gemini-3.8-flash').removeprefix('models/')
+    pages = []
+    for index, photo in enumerate(sources, 1):
+        identity = [model, index, len(sources), photo['caption'],
+                    hashlib.sha256(Path(photo['source']).read_bytes()).hexdigest()]
+        key = 'page-v1:' + hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+        try:
+            result = _page_cache_get(key)
+            if result is None:
+                result = read_schedule([photo['source']], None, page_context=(index, len(sources)))
+                _page_cache_put(key, result)
+            else:
+                logger.info('Gemini page cache hit index=%d total=%d', index, len(sources))
+            pages.append(result)
+        except GeminiError as error:
+            raise GeminiError(f'Страниц подготовлено: {len(pages)} из {len(sources)}. '
+                              'Успешные страницы сохранены. Неполные черновики не созданы. '
+                              + str(error)) from None
+
+    def contextual_read(group):
+        # A continuation/overlap cannot be resolved by comparing formatted strings.
+        # Keep all source pages together for this bounded fallback, and cache success.
+        identity = [model, fingerprint, group]
+        key = 'context-v1:' + hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+        cached = _page_cache_get(key)
+        if cached is not None:
+            return cached
+        logger.info('Gemini context reconciliation pages=%d scope=%s', len(paths),
+                    'document' if group is None else 'single-group')
+        result = read_schedule(paths, group)
+        if group is None:
+            texts = result['groups']
+        else:
+            if result.get('group_found') is not True:
+                raise GeminiError('Не удалось подтвердить продолжение группы. Нужна ручная проверка исходных листов.')
+            texts = {group: result['text']}
+        _page_cache_put(key, texts)
+        return texts
+
+    try:
+        if ambiguous_order or any(page['requires_context'] for page in pages):
+            return contextual_read(None)
+        fragments = {}
+        for page_index, page in enumerate(pages):
+            for group, item in page['structured_groups'].items():
+                fragments.setdefault(group, []).append((page_index, item))
+        texts = {}
+        for group, pieces in fragments.items():
+            seen = set()
+            overlap = False
+            lessons, warnings = [], []
+            for page_index, item in pieces:
+                # Preserve source page and row order, including valid repeated text.
+                page_numbers = {n for lesson in item['lessons'] for n in lesson['lesson_numbers']}
+                if seen & page_numbers:
+                    overlap = True
+                seen.update(page_numbers)
+                lessons.extend(item['lessons'])
+                warnings.extend(item.get('uncertainties', []))
+            if overlap:
+                texts.update(contextual_read(group))
+            else:
+                texts[group] = format_result({'group_found': True, 'lessons': lessons,
+                                             'uncertainties': warnings}) if lessons else ''
+        if not texts:
+            raise GeminiError('На обработанных страницах не подтверждены группы. Черновики не созданы.')
+        return texts
+    except GeminiError as error:
+        raise GeminiError('Страницы сохранены, но их объединение не завершено. '
+                          'Неполные черновики не созданы. ' + str(error)) from None
 
 
 def pending_reviews(unnotified=False):
@@ -226,15 +334,22 @@ def format_result(data):
 def _gemini_json_request(request, stage, timeout):
     """Retry a transient failure once, keeping TLS validation enabled."""
     for attempt in range(2):
+        started = time.monotonic()
         try:
-            return _gemini_json_request_once(request, stage, timeout)
+            result = _gemini_json_request_once(request, stage, timeout)
         except GeminiError as error:
+            logger.info("Gemini request stage=%s attempt=%d duration=%.2f outcome=%s",
+                        stage, attempt + 1, time.monotonic() - started, type(error).__name__)
             if not error.retryable:
                 raise
             if attempt == 1:
                 raise GeminiError(str(error) + ' Повторная попытка также не удалась. '
                                   'Можно повторно запросить черновики позже.') from None
             time.sleep(2)
+        else:
+            logger.info("Gemini request stage=%s attempt=%d duration=%.2f outcome=ok",
+                        stage, attempt + 1, time.monotonic() - started)
+            return result
 
 
 def _gemini_json_request_once(request, stage, timeout):
@@ -307,7 +422,7 @@ def check_connection():
     return model
 
 
-def read_schedule(paths, group):
+def read_schedule(paths, group, page_context=None):
     key = os.environ.get('GEMINI_API_KEY', '').strip()
     if not key:
         raise GeminiError('На сервере не задан GEMINI_API_KEY.')
@@ -337,6 +452,17 @@ def read_schedule(paths, group):
             'по схеме выше. Не пропускай группы. Допустимые названия: '
             + ', '.join(db.COLLEGE_GROUPS)
         )
+    if page_context is not None:
+        index, total = page_context
+        prompt += (f'\nСейчас передана только страница {index} из {total}. '
+                   'Извлеки только видимые строки, не додумывай продолжения. '
+                   'Добавь верхние поля coverage_complete:boolean и requires_context:boolean. '
+                   'coverage_complete=true только если все строки страницы учтены. '
+                   'requires_context=true, если есть строки без однозначного названия группы, '
+                   'без номера урока либо объединённая ячейка/продолжение обрезаны границей фото. '
+                   'В таком случае верни только целиком прочитанные группы; не приписывай '
+                   'остальные строки группе догадкой. Пустой groups допустим на странице без групп. '
+                   'Одинаковые строки не удаляй: разные уроки и подгруппы должны сохраниться.')
     parts = [{'text': prompt}]
     size = 0
     for path in paths:
@@ -356,6 +482,8 @@ def read_schedule(paths, group):
         data=json.dumps(payload).encode(),
         headers={'x-goog-api-key': key, 'Content-Type': 'application/json'},
     )
+    logger.info("Gemini images model=%s count=%d image_bytes=%d request_bytes=%d",
+                model, len(paths), size, len(request.data))
     result = _gemini_json_request(request, 'Распознавание фото', 90)
     try:
         candidate = result['candidates'][0]
@@ -366,12 +494,18 @@ def read_schedule(paths, group):
     except (KeyError, IndexError, TypeError, ValueError):
         raise GeminiError('Gemini не вернул полный JSON-ответ. Попробуй повторить проверку.') from None
     if group is None:
-        if not isinstance(data, dict) or not isinstance(data.get('groups'), list) or not data['groups']:
+        if not isinstance(data, dict) or not isinstance(data.get('groups'), list) or (not data['groups'] and page_context is None):
             raise GeminiError('Gemini не вернул группы. Черновики не созданы.')
+        if page_context is not None:
+            if type(data.get('coverage_complete')) is not bool or type(data.get('requires_context')) is not bool:
+                raise GeminiError('Gemini не подтвердил полноту страницы. Черновики не созданы.')
+            if not data['coverage_complete'] and not data['requires_context']:
+                raise GeminiError('Страница прочитана не полностью. Черновики не созданы.')
         global_warnings = data.get('uncertainties', [])
         if not isinstance(global_warnings, list) or any(not isinstance(w, str) for w in global_warnings):
             raise GeminiError('Gemini вернул некорректные замечания к листам.')
         texts = {}
+        structured = {}
         for item in data['groups']:
             if not isinstance(item, dict):
                 raise GeminiError('Gemini вернул некорректную группу.')
@@ -386,8 +520,10 @@ def read_schedule(paths, group):
             item['uncertainties'] = warnings + global_warnings
             formatted = format_result(item)
             texts[name] = formatted if item['lessons'] else ''
-        return {'model': model, 'groups': texts}
-    return {'model': model, 'text': format_result(data)}
+            structured[name] = item
+        return {'model': model, 'groups': texts, 'structured_groups': structured,
+                'requires_context': data.get('requires_context', False)}
+    return {'model': model, 'text': format_result(data), 'group_found': data['group_found']}
 
 
 def screen_id(chat_id, kind='queue', message_id=None):
