@@ -288,6 +288,7 @@ class Form(StatesGroup):
     waiting_for_material_file = State()
     waiting_for_schedule_pair = State()
     waiting_for_schedule_review = State()
+    waiting_for_schedule_audience = State()
     waiting_for_group_schedule = State()
     waiting_for_custom_group = State()
     waiting_for_group_confirmation = State()
@@ -2925,12 +2926,13 @@ async def cb_admin_sched_publish_all(callback: CallbackQuery, state: FSMContext)
         await callback.answer("Открой личный чат с ботом для публикации расписания.", show_alert=True)
         return
 
-    await state.update_data(target_group="ALL")
+    await state.clear()
+    await state.update_data(target_group="SELECT")
     await state.set_state(Form.waiting_for_group_schedule)
     text = (
-        "📅 <b>Публикация расписания для всех групп</b>\n\n"
+        "📅 <b>Публикация расписания</b>\n\n"
         "Отправь расписание одним сообщением: фотографией с подписью или текстом.\n"
-        "Оно появится в расписании у всех групп, а всем верифицированным студентам придёт уведомление.\n\n"
+        "Далее выбери группы и подтверди публикацию. До подтверждения рассылка не запускается.\n\n"
         "<i>Для отмены отправь /cancel.</i>"
     )
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -2973,7 +2975,7 @@ async def cb_admin_sched_edit(callback: CallbackQuery, state: FSMContext):
         f"<code>1. Технология отделки мебели (каб. 204)\n"
         f"2. Экономика организации (каб. 105)\n"
         f"3. Замена: ТПМ вместо дизайна (каб. 214)</code>\n\n"
-        f"📢 <i>Сразу после отправки бот автоматически разошлёт оповещение всем верифицированным студентам этой группы!</i>\n\n"
+        f"📢 <i>После загрузки бот покажет предпросмотр и запросит подтверждение публикации.</i>\n\n"
         f"<i>(или отправь /cancel для отмены)</i>"
     )
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -2989,6 +2991,41 @@ async def cb_admin_sched_edit(callback: CallbackQuery, state: FSMContext):
         await callback.bot.send_message(chat_id=callback.from_user.id, text=text, parse_mode="HTML", reply_markup=cancel_kb)
     await callback.answer()
 
+def schedule_publication_admin(callback):
+    return (is_admin(callback.from_user) and callback.message
+            and callback.message.chat.type == "private")
+
+
+async def schedule_publication_recipients(groups, all_groups, admin_id):
+    if all_groups:
+        users = await adb.get_verified_users()
+    else:
+        users = []
+        for group in groups:
+            users.extend(await adb.get_verified_users_by_group(group))
+    return list({user["user_id"]: user for user in users if user["user_id"] != admin_id}.values())
+
+
+async def show_schedule_publication_preview(target, state, admin_id):
+    data = await state.get_data()
+    groups = data.get("schedule_groups", [])
+    all_groups = data.get("schedule_all", False)
+    recipients = await schedule_publication_recipients(groups, all_groups, admin_id)
+    scope = "Все группы" if all_groups else ", ".join(groups) or "Не выбраны"
+    raw_body = data.get("schedule_body", "")
+    body = html.escape(raw_body[:2200]) + ("…" if len(raw_body) > 2200 else "")
+    text = ("📅 <b>Предпросмотр публикации</b>\n\n"
+            f"Группы: <b>{html.escape(scope)}</b>\n"
+            f"Получателей: <b>{len(recipients)}</b>\n"
+            f"Фотографий: <b>{len(data.get('schedule_photos', []))}</b>\n\n"
+            + (body if body else "Расписание на фото."))
+    if not recipients:
+        text += "\n\nНет получателей. Выбери группы с подтверждёнными студентами."
+    await show_user_screen(target, text, reply_markup=kb.schedule_publication_kb(
+        db.COLLEGE_GROUPS, groups, all_groups, data["schedule_token"],
+        can_publish=bool(recipients) and bool(groups or all_groups)))
+
+
 @dp.message(Form.waiting_for_group_schedule)
 async def process_group_schedule_input(message: Message, state: FSMContext, bot: Bot,
                                        schedule_album: Optional[List[Message]] = None):
@@ -2998,58 +3035,105 @@ async def process_group_schedule_input(message: Message, state: FSMContext, bot:
         await state.clear()
         await cmd_start(message, state)
         return
-        
     data = await state.get_data()
     target_group = data.get("target_group")
-    if target_group not in {*db.COLLEGE_GROUPS, "ALL"}:
+    if target_group not in {*db.COLLEGE_GROUPS, "ALL", "SELECT"}:
         await state.clear()
-        await show_user_screen(message, "⚠️ Сеанс редактирования расписания завершён. Открой редактирование заново.", reply_markup=kb.back_to_menu_kb())
+        await show_user_screen(message, "Сеанс завершён. Начни публикацию заново.", reply_markup=kb.back_to_menu_kb())
         return
-    
     messages = schedule_album or [message]
-    photo_file_ids = [item.photo[-1].file_id for item in messages if item.photo]
-    photo_file_id = photo_file_ids[0] if photo_file_ids else None
-    raw_text = "\n\n".join((item.caption if item.photo else item.text).strip()
-                            for item in messages if (item.caption if item.photo else item.text))
-    
-    if not photo_file_id and not raw_text:
-        await show_user_screen(message, "⚠️ Отправь фотографию расписания или текстовое сообщение:", reply_markup=kb.back_to_menu_kb())
+    photos = [item.photo[-1].file_id for item in messages if item.photo]
+    body = "\n\n".join((item.caption if item.photo else item.text).strip()
+                          for item in messages if (item.caption if item.photo else item.text))
+    if not photos and not body:
+        await show_user_screen(message, "Отправь фото или текст расписания.", reply_markup=kb.back_to_menu_kb())
         return
-        
-    title = f"Замена / Расписание ({target_group})"
-    admin_tag = f"@{message.from_user.username or ADMIN_USERNAME}"
-    
-    await asyncio.get_running_loop().run_in_executor(None, gdrive_sync.preserve_existing_schedule)
-    changed = await adb.set_group_schedule(
-        group_name=target_group,
-        schedule_text=raw_text,
-        title=title,
-        photo_file_id=photo_file_id,
-        updated_by=admin_tag,
-        photo_file_ids=photo_file_ids,
-    )
-    await state.clear()
-    if not changed:
-        await render_group_schedule_view(message, message.from_user, target_group, bot=bot,
-                                         notice="Это расписание уже опубликовано.")
-        return
-    
-    # Автоматическая рассылка верифицированным студентам
-    safe_target_group = html.escape(target_group)
-    if target_group == "ALL":
-        broadcast_header = "📢 <b>Опубликовано новое расписание для всех групп!</b> 🎓\n\n"
-    else:
-        broadcast_header = f"📢 <b>Новое расписание для группы {safe_target_group}!</b> 🎓\n\n"
+    await state.update_data(schedule_body=body, schedule_photos=photos,
+                            schedule_groups=[target_group] if target_group in db.COLLEGE_GROUPS else [],
+                            schedule_all=False, schedule_token=uuid.uuid4().hex[:12])
+    await state.set_state(Form.waiting_for_schedule_audience)
+    if photos:
+        if len(photos) > 1:
+            await bot.send_media_group(chat_id=message.chat.id, media=[InputMediaPhoto(media=p) for p in photos])
+        else:
+            await bot.send_photo(chat_id=message.chat.id, photo=photos[0])
+    await show_schedule_publication_preview(message, state, message.from_user.id)
 
-    broadcast_body = (
-        f"{broadcast_header}"
-        "Расписание обновлено. Открой бота, чтобы посмотреть текст и фотографии листа."
-    )
-    broadcast_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"📅 Расписание ({target_group})", callback_data=f"sched_view_{target_group}")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
-    ])
-    
+
+schedule_publication_lock = None
+
+
+@dp.callback_query(F.data.startswith("adm_pub_"))
+async def cb_schedule_publication(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    if not schedule_publication_admin(callback):
+        await callback.answer("Только для администратора в личном чате.", show_alert=True)
+        return
+    global schedule_publication_lock
+    if schedule_publication_lock is None:
+        schedule_publication_lock = asyncio.Lock()
+    async with schedule_publication_lock:
+        parts = callback.data.split("_")
+        data = await state.get_data()
+        if (len(parts) < 4 or parts[3] != data.get("schedule_token")
+                or await state.get_state() != Form.waiting_for_schedule_audience.state):
+            await callback.answer("Эта публикация завершена или отменена.", show_alert=True)
+            return
+        action = parts[2]
+        if action == "cancel":
+            await state.clear()
+            await show_user_screen(callback, "Публикация отменена.", reply_markup=kb.admin_section_kb("schedule"))
+            return
+        groups = list(data.get("schedule_groups", []))
+        all_groups = data.get("schedule_all", False)
+        if action == "group" and len(parts) == 5 and parts[4] in db.COLLEGE_GROUPS:
+            group = parts[4]
+            if group in groups:
+                groups.remove(group)
+            else:
+                groups.append(group)
+            await state.update_data(schedule_groups=groups, schedule_all=False)
+        elif action == "all":
+            await state.update_data(schedule_all=not all_groups, schedule_groups=[])
+        elif action == "send":
+            if not groups and not all_groups:
+                await callback.answer("Выбери хотя бы одну группу.", show_alert=True)
+                return
+            recipients = await schedule_publication_recipients(groups, all_groups, callback.from_user.id)
+            if not recipients:
+                await show_schedule_publication_preview(callback, state, callback.from_user.id)
+                return
+            # Consume the token before the first external side effect.
+            await state.clear()
+            await callback.answer("Публикую расписание…")
+            await publish_selected_schedule(callback, bot, data, recipients)
+            return
+        else:
+            await callback.answer("Неизвестное действие.", show_alert=True)
+            return
+        await show_schedule_publication_preview(callback, state, callback.from_user.id)
+
+
+async def publish_selected_schedule(callback, bot, data, recipients):
+    all_groups = data.get("schedule_all", False)
+    groups = data.get("schedule_groups", [])
+    photo_file_ids = data.get("schedule_photos", [])
+    photo_file_id = photo_file_ids[0] if photo_file_ids else None
+    changed_groups = []
+    await asyncio.get_running_loop().run_in_executor(None, gdrive_sync.preserve_existing_schedule)
+    for group in (["ALL"] if all_groups else groups):
+        changed = await adb.set_group_schedule(group_name=group,
+            schedule_text=data.get("schedule_body", ""), title=f"Замена / Расписание ({group})",
+            photo_file_id=photo_file_id, photo_file_ids=photo_file_ids,
+            updated_by=f"@{callback.from_user.username or ADMIN_USERNAME}")
+        if changed:
+            changed_groups.append(group)
+    if not changed_groups:
+        await show_user_screen(callback, "Это расписание уже опубликовано. Повторная рассылка не запущена.",
+                               reply_markup=kb.admin_section_kb("schedule"))
+        return
+    recipients = [u for u in recipients if all_groups or u.get("student_group") in changed_groups]
+    scope = "всех групп" if all_groups else ", ".join(groups)
+    broadcast_body = f"📅 Расписание обновлено для {scope}. Открой бота, чтобы посмотреть текст и фотографии листа."
     sent_count = 0
     failed_count = 0
     semaphore = asyncio.Semaphore(8)
@@ -3057,8 +3141,10 @@ async def process_group_schedule_input(message: Message, state: FSMContext, bot:
     loop = asyncio.get_running_loop()
     last_send_at = 0.0
 
-    async def send_update(user_id: int) -> bool:
+    async def send_update(user: Dict) -> bool:
         nonlocal last_send_at
+        user_id = user["user_id"]
+        broadcast_kb = kb.schedule_publication_link_kb("ALL" if all_groups else user["student_group"])
         async with semaphore:
             async with send_lock:
                 delay = 0.05 - (loop.time() - last_send_at)
@@ -3089,37 +3175,20 @@ async def process_group_schedule_input(message: Message, state: FSMContext, bot:
                     if attempt == 0:
                         await asyncio.sleep(error.retry_after)
                     else:
-                        logger.warning("Schedule broadcast rate-limited for user %s", user_id)
+                        logger.warning("Schedule publication rate-limited")
                 except Exception:
-                    logger.exception("Could not broadcast schedule update to user %s", user_id)
+                    logger.warning("Schedule publication delivery failed")
                     break
         return False
 
-    offset = 0
-    batch_size = 200
-    while True:
-        if target_group == "ALL":
-            target_users = await adb.get_verified_users(batch_size, offset)
-        else:
-            target_users = await adb.get_verified_users_by_group(target_group, batch_size, offset)
-        if not target_users:
-            break
-        user_ids = [user["user_id"] for user in target_users if user["user_id"] != message.from_user.id]
-        results = await asyncio.gather(*(send_update(user_id) for user_id in user_ids))
-        sent_count += sum(results)
-        failed_count += len(results) - sum(results)
-        offset += len(target_users)
 
-    info_str = (
-        f"📢 Доставлено: <b>{sent_count}</b>; ошибок отправки: <b>{failed_count}</b>."
-        if sent_count or failed_count
-        else ("📢 Пока нет других верифицированных студентов." if target_group == "ALL"
-              else f"📢 В группе {safe_target_group} пока нет других верифицированных студентов.")
-    )
-    published_scope = "всех групп" if target_group == "ALL" else f"группы {safe_target_group}"
-    confirm_text = f"✅ <b>Расписание для {published_scope} успешно обновлено!</b>\n{info_str}"
-    # Отображаем обновленный экран расписания
-    await render_group_schedule_view(message, message.from_user, target_group, is_callback=False, bot=bot, notice=confirm_text)
+    results = await asyncio.gather(*(send_update(user) for user in recipients))
+    sent_count = sum(results)
+    failed_count = len(results) - sent_count
+    await show_user_screen(callback,
+        f"✅ Расписание опубликовано: {html.escape(scope)}.\n"
+        f"Доставлено: <b>{sent_count}</b>; ошибок отправки: <b>{failed_count}</b>.",
+        reply_markup=kb.admin_section_kb("schedule"))
 
 @dp.callback_query(F.data.startswith("adm_sched_clear_"))
 async def cb_admin_sched_clear(callback: CallbackQuery, state: FSMContext):

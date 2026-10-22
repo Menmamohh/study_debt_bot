@@ -116,9 +116,13 @@ class ScheduleHistoryTests(unittest.TestCase):
             self.assertFalse(middleware.pending)
         asyncio.run(scenario())
 
-    def test_manual_album_saved_and_broadcast_as_album(self):
+    def test_manual_album_waits_for_confirmation_and_keeps_caption(self):
         async def scenario():
-            state = SimpleNamespace(clear=AsyncMock(), get_data=AsyncMock(return_value={"target_group": "ALL"}))
+            from aiogram.fsm.context import FSMContext
+            from aiogram.fsm.storage.base import StorageKey
+            from aiogram.fsm.storage.memory import MemoryStorage
+            state = FSMContext(MemoryStorage(), StorageKey(bot_id=1, chat_id=1, user_id=1))
+            await state.update_data(target_group="SELECT")
             def message(number, caption=None):
                 return SimpleNamespace(photo=[SimpleNamespace(file_id=f"photo{number}")], caption=caption,
                                        text=None, chat=SimpleNamespace(type="private", id=1),
@@ -126,14 +130,15 @@ class ScheduleHistoryTests(unittest.TestCase):
             album = [message(1), message(2, "Caption on second photo"), message(3)]
             sender = SimpleNamespace(send_media_group=AsyncMock(), send_message=AsyncMock())
             with patch.object(bot, "is_admin", return_value=True), \
-                    patch.object(bot.adb, "get_verified_users", AsyncMock(side_effect=[[{"user_id": 2}], []])), \
-                    patch.object(bot, "render_group_schedule_view", AsyncMock()):
+                    patch.object(bot, "show_user_screen", AsyncMock()):
                 await bot.process_group_schedule_input(album[0], state, sender, schedule_album=album)
-            payload = db.get_schedule_versions("ALL")[0]["payload"]
-            self.assertEqual(payload["schedule_text"], "Caption on second photo")
-            self.assertEqual([photo["source"] for photo in payload["photos"]], ["photo1", "photo2", "photo3"])
+            payload = await state.get_data()
+            self.assertEqual(payload["schedule_body"], "Caption on second photo")
+            self.assertEqual(payload["schedule_photos"], ["photo1", "photo2", "photo3"])
+            self.assertFalse(payload["schedule_all"])
+            self.assertEqual(db.get_schedule_versions("ALL"), [])
             self.assertEqual(len(sender.send_media_group.call_args.kwargs["media"]), 3)
-            self.assertEqual(sender.send_media_group.await_count, 1)
+            self.assertEqual(sender.send_media_group.await_count, 1)  # Admin preview only.
         asyncio.run(scenario())
 
     def test_view_old_version_is_local_and_sends_all_photos(self):

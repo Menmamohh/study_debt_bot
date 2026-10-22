@@ -412,7 +412,7 @@ def admin_section_kb(section: str) -> InlineKeyboardMarkup:
     actions = {
         "students": [("Заявки на вход", "adm_users_queue"), ("Студенты по группам", "adm_users_list")],
         "schedule": [("Обновить с Google Диска", "adm_gdrive_sync"), ("Черновики замен", "sr_queue"),
-                     ("Расписание по группам", "adm_schedule_groups"), ("Опубликовать для всех", "adm_sched_publish_all")],
+                     ("Расписание по группам", "adm_schedule_groups"), ("Опубликовать расписание", "adm_sched_publish_all")],
         "notifications": [("Уведомление группе", "adm_group_notice_start"),
                           ("Объявление всем", "adm_broadcast_start")],
         "materials": [("Материалы на проверке", "admin_review_queue"), ("База знаний", "adm_manage_materials")],
@@ -774,3 +774,21 @@ def student_feedback_reply_kb(report_id: int, composing: bool = False) -> Inline
              callback_data=f"fsr_cancel_{report_id}" if composing else f"fsr_start_{report_id}")]]
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def schedule_publication_kb(groups, selected, all_groups, token, can_publish=False):
+    rows = [[InlineKeyboardButton(text=("✓ " if group in selected else "") + group,
+                callback_data=f"adm_pub_group_{token}_{group}")] for group in groups]
+    rows.append([InlineKeyboardButton(text=("✓ " if all_groups else "") + "Все группы",
+                                     callback_data=f"adm_pub_all_{token}")])
+    if can_publish:
+        rows.append([InlineKeyboardButton(text="Опубликовать", callback_data=f"adm_pub_send_{token}")])
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data=f"adm_pub_cancel_{token}"),
+                 InlineKeyboardButton(text="В админку", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def schedule_publication_link_kb(group):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Открыть расписание", callback_data=f"sched_view_{group}")],
+        [InlineKeyboardButton(text="Главное меню", callback_data="main_menu")]])

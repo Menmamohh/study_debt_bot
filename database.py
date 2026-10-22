@@ -1539,11 +1539,15 @@ def get_all_group_schedules() -> List[Dict]:
         cursor.execute("SELECT * FROM group_schedules ORDER BY group_name ASC")
         return [dict(r) for r in cursor.fetchall()]
 
-def get_verified_users_by_group(group_name: str) -> List[Dict]:
+def get_verified_users_by_group(group_name: str, limit: Optional[int] = None, offset: int = 0) -> List[Dict]:
     """Возвращает верифицированных студентов конкретной группы"""
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE status = 'approved' AND student_group = ?", (group_name,))
+        query = "SELECT * FROM users WHERE status = 'approved' AND student_group = ? ORDER BY user_id"
+        if limit is None:
+            cursor.execute(query, (group_name,))
+        else:
+            cursor.execute(query + " LIMIT ? OFFSET ?", (group_name, max(1, int(limit)), max(0, int(offset))))
         return [dict(r) for r in cursor.fetchall()]
 
 def update_user_group(user_id: int, new_group: str):
