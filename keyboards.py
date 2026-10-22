@@ -401,7 +401,8 @@ def admin_panel_kb(pending_materials_count: int = 0, pending_users_count: int = 
         [InlineKeyboardButton(text="📢 Уведомления", callback_data="adm_section_notifications"),
          InlineKeyboardButton(text="📚 Материалы" + badge(pending_materials_count), callback_data="adm_section_materials")],
         [InlineKeyboardButton(text="💬 Обращения" + badge(pending_feedback_count), callback_data="adm_section_feedback")],
-        [InlineKeyboardButton(text="🛠 Проверки", callback_data="adm_section_tools")],
+        [InlineKeyboardButton(text="🛠 Проверки", callback_data="adm_section_tools"),
+         InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats_7")],
         [InlineKeyboardButton(text="Обновить", callback_data="admin_panel"),
          InlineKeyboardButton(text="Главное меню", callback_data="main_menu")],
     ])
@@ -421,6 +422,17 @@ def admin_section_kb(section: str) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=label, callback_data=data)] for label, data in actions[section]]
     rows.append([InlineKeyboardButton(text="Назад · В админку", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_stats_kb(days: int, show_groups: bool = False) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="7 дней" if days != 7 else "✓ 7 дней", callback_data="adm_stats_7"),
+         InlineKeyboardButton(text="30 дней" if days != 30 else "✓ 30 дней", callback_data="adm_stats_30")],
+        [InlineKeyboardButton(text="Скрыть группы" if show_groups else "По группам",
+                              callback_data=f"adm_stats_groups_{days}" if not show_groups else f"adm_stats_{days}")],
+        [InlineKeyboardButton(text="Обновить", callback_data=f"adm_stats_{days}"),
+         InlineKeyboardButton(text="В админку", callback_data="admin_panel")],
+    ])
 
 
 def admin_schedule_groups_kb(groups: List[str]) -> InlineKeyboardMarkup:
