@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 
 import database as db
 import gdrive_sync
@@ -163,6 +164,10 @@ from pathlib import Path
 class GeminiError(Exception):
     """Safe message suitable for the admin screen (never includes credentials)."""
 
+    def __init__(self, message, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
+
 
 def configured():
     return bool(os.environ.get('GEMINI_API_KEY', '').strip())
@@ -219,6 +224,20 @@ def format_result(data):
 
 
 def _gemini_json_request(request, stage, timeout):
+    """Retry a transient failure once, keeping TLS validation enabled."""
+    for attempt in range(2):
+        try:
+            return _gemini_json_request_once(request, stage, timeout)
+        except GeminiError as error:
+            if not error.retryable:
+                raise
+            if attempt == 1:
+                raise GeminiError(str(error) + ' Повторная попытка также не удалась. '
+                                  'Можно повторно запросить черновики позже.') from None
+            time.sleep(2)
+
+
+def _gemini_json_request_once(request, stage, timeout):
     """Return JSON with safe, distinct diagnostics; never echo a remote message."""
     import ssl
     import certifi
@@ -246,7 +265,8 @@ def _gemini_json_request(request, stage, timeout):
                 messages[error.code] = 'Gemini API не включён в проекте Google.'
         except (ValueError, AttributeError, TypeError, OSError):
             pass
-        raise GeminiError(f'{stage}: HTTP {error.code}. ' + messages.get(error.code, 'Сбой сервиса Gemini.')) from None
+        raise GeminiError(f'{stage}: HTTP {error.code}. ' + messages.get(error.code, 'Сбой сервиса Gemini.'),
+                          retryable=error.code in {500, 502, 503, 504}) from None
     except urllib.error.URLError as error:
         reason = error.reason
         if isinstance(reason, ssl.SSLCertVerificationError):
@@ -259,13 +279,14 @@ def _gemini_json_request(request, stage, timeout):
             message = f'истекло время ожидания соединения ({timeout} с).'
         else:
             message = 'не удалось установить соединение с Google. Проверь сеть сервера.'
-        raise GeminiError(f'{stage}: {message}') from None
+        raise GeminiError(f'{stage}: {message}', retryable=not isinstance(
+            reason, ssl.SSLError)) from None
     except (socket.timeout, TimeoutError):
-        raise GeminiError(f'{stage}: Google не ответил за {timeout} с.') from None
+        raise GeminiError(f'{stage}: Google не ответил за {timeout} с.', retryable=True) from None
     except ssl.SSLError:
         raise GeminiError(f'{stage}: ошибка защищённого соединения HTTPS (TLS).') from None
     except OSError:
-        raise GeminiError(f'{stage}: соединение с Google прервалось.') from None
+        raise GeminiError(f'{stage}: соединение с Google прервалось.', retryable=True) from None
 
 
 def check_connection():

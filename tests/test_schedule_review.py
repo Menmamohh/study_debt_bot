@@ -165,8 +165,14 @@ class ScheduleReviewTests(unittest.TestCase):
             review.prepare_reviews()
             self.assertEqual(read.call_count, 1)
             self.assertEqual(review.get_review(draft['id'])['body'], 'Исправлено вручную')
+            self.assertTrue(review.finish_review(draft['id'], True))
+            review.prepare_reviews()
+            published = review.get_review(draft['id'])
+            self.assertEqual(published['status'], 'published')
+            self.assertEqual(published['body'], 'Исправлено вручную')
+            self.assertEqual(read.call_count, 1)
             markers.assert_not_called()
-            self.assertIsNone(review.approved_schedule('ТТ-36', self.date))
+            self.assertEqual(review.approved_schedule('ТТ-36', self.date)['body'], 'Исправлено вручную')
 
     def test_gemini_new_content_at_same_path_invalidates_old_publication_and_retries_failure(self):
         with patch.object(review, 'configured', return_value=True), \

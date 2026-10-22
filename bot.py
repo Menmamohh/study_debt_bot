@@ -3393,21 +3393,51 @@ async def show_next_schedule_review(bot, chat_id, notice=''):
             "✅ Все черновики обработаны.", kb.admin_section_kb("schedule"))
 
 
-async def prepare_and_notify_schedule_reviews(bot):
-    try:
-        await asyncio.to_thread(schedule_review.prepare_reviews)
-    except schedule_review.GeminiError as error:
-        logger.warning("Draft preparation failed: %s", error)
+schedule_prepare_lock = None
+
+
+async def prepare_and_notify_schedule_reviews(bot, manual=False):
+    global schedule_prepare_lock
+    if schedule_prepare_lock is None:
+        schedule_prepare_lock = asyncio.Lock()
+    if schedule_prepare_lock.locked():
+        return False
+    async with schedule_prepare_lock:
+        if manual and ADMIN_ID:
+            await update_review_screen(bot, ADMIN_ID,
+                "⏳ Повторно запрашиваю черновики по уже скачанным листам. "
+                "Это может занять несколько минут. При временном сбое бот выполнит ещё одну попытку. Готовые результаты сохраняются.",
+                kb.admin_section_kb("schedule"))
+        try:
+            await asyncio.to_thread(schedule_review.prepare_reviews)
+        except schedule_review.GeminiError as error:
+            logger.warning("Draft preparation failed: %s", error)
+            if ADMIN_ID:
+                await update_review_screen(bot, ADMIN_ID,
+                    "⚠️ Черновики Gemini не подготовлены: " + html.escape(str(error)),
+                    kb.admin_section_kb("schedule"))
+            return False
         if ADMIN_ID:
-            await update_review_screen(bot, ADMIN_ID, "⚠️ Черновики Gemini не подготовлены: " + html.escape(str(error)),
-                                       kb.admin_section_kb("schedule"))
+            drafts = await asyncio.to_thread(schedule_review.pending_reviews, True)
+            if drafts or manual:
+                await show_next_schedule_review(bot, ADMIN_ID)
+                for draft in drafts:
+                    await asyncio.to_thread(schedule_review.mark_notified, draft['id'])
+        return True
+
+
+@dp.callback_query(F.data == "adm_drafts_retry")
+async def cb_admin_drafts_retry(callback: CallbackQuery, state: FSMContext = None):
+    if not is_admin(callback.from_user) or not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Только для администратора в личном чате.", show_alert=True)
         return
-    if ADMIN_ID:
-        drafts = await asyncio.to_thread(schedule_review.pending_reviews, True)
-        if drafts:
-            await show_next_schedule_review(bot, ADMIN_ID)
-            for draft in drafts:
-                await asyncio.to_thread(schedule_review.mark_notified, draft['id'])
+    if schedule_prepare_lock is not None and schedule_prepare_lock.locked():
+        await callback.answer("Черновики уже запрашиваются. Дождись результата.", show_alert=True)
+        return
+    await callback.answer("Запрашиваю черновики…")
+    if state:
+        await state.clear()
+    await prepare_and_notify_schedule_reviews(callback.bot, manual=True)
 
 
 delivery_lock = None

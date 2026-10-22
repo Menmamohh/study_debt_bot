@@ -412,6 +412,7 @@ def admin_section_kb(section: str) -> InlineKeyboardMarkup:
     actions = {
         "students": [("Заявки на вход", "adm_users_queue"), ("Студенты по группам", "adm_users_list")],
         "schedule": [("Обновить с Google Диска", "adm_gdrive_sync"), ("Черновики замен", "sr_queue"),
+                     ("Повторно запросить черновики", "adm_drafts_retry"),
                      ("Расписание по группам", "adm_schedule_groups"), ("Опубликовать расписание", "adm_sched_publish_all")],
         "notifications": [("Уведомление группе", "adm_group_notice_start"),
                           ("Объявление всем", "adm_broadcast_start")],
