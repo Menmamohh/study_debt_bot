@@ -88,6 +88,16 @@ def init_db():
             )
         """)
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                student_group TEXT,
+                section TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_date_section ON usage_events(created_at, section)")
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS group_schedules (
                 group_name TEXT PRIMARY KEY,
                 title TEXT,
@@ -1632,6 +1642,44 @@ def get_verified_users(limit: Optional[int] = None, offset: int = 0) -> List[Dic
 def count_verified_users() -> int:
     with get_connection() as conn:
         return conn.execute("SELECT COUNT(*) FROM users WHERE status = 'approved'").fetchone()[0]
+
+def record_usage_event(user_id: int, section: str, student_group: Optional[str]):
+    """Stores one section open for an approved user; admin activity is excluded."""
+    allowed = {"schedule", "study", "materials", "useful", "profile"}
+    if section not in allowed:
+        return
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO usage_events (user_id, student_group, section)
+            SELECT ?, ?, ? WHERE EXISTS (
+                SELECT 1 FROM users WHERE user_id = ? AND status = 'approved'
+            )
+        """, (int(user_id), student_group, section, int(user_id)))
+
+def get_usage_stats(days: int = 7) -> Dict:
+    days = max(1, min(int(days), 30))
+    with get_connection() as conn:
+        active = conn.execute("""
+            SELECT COUNT(DISTINCT e.user_id) FROM usage_events e
+            JOIN users u ON u.user_id=e.user_id AND u.status='approved'
+            WHERE e.created_at >= datetime('now', ?)
+        """, (f"-{days} days",)).fetchone()[0]
+        sections = conn.execute("""
+            SELECT section, COUNT(*) AS opens FROM usage_events e
+            JOIN users u ON u.user_id=e.user_id AND u.status='approved'
+            WHERE e.created_at >= datetime('now', ?)
+            GROUP BY section ORDER BY opens DESC
+        """, (f"-{days} days",)).fetchall()
+        groups = conn.execute("""
+            SELECT COALESCE(NULLIF(e.student_group,''),'Не указана') AS group_name,
+                   COUNT(DISTINCT e.user_id) AS active
+            FROM usage_events e JOIN users u ON u.user_id=e.user_id AND u.status='approved'
+            WHERE e.created_at >= datetime('now', ?)
+            GROUP BY group_name ORDER BY active DESC, group_name
+        """, (f"-{days} days",)).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM users WHERE status='approved'").fetchone()[0]
+    return {"days": days, "active": active, "total": total,
+            "sections": [dict(row) for row in sections], "groups": [dict(row) for row in groups]}
 
 def ensure_admin_user(admin_id: int, username: str = "Menmamoh"):
     """Гарантирует approved-доступ администратору и сохраняет ему группу расписания."""
