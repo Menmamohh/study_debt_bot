@@ -275,6 +275,15 @@ def set_ui_message_id(user_id: int, message_id: int):
             VALUES (?, ?)
         """, (user_id, message_id))
 
+def track_ui_message_id(user_id: int, message_id: int):
+    """Remember a temporary notification without replacing the current menu."""
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO ui_message_history (user_id, message_id)
+            VALUES (?, ?)
+        """, (user_id, message_id))
+
+
 def clear_ui_message_id(user_id: int):
     """Forgets all tracked menu messages for a user."""
     with get_connection() as conn:

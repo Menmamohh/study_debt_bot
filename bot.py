@@ -4737,6 +4737,7 @@ async def cb_admin_approve(callback: CallbackQuery, bot: Bot):
         return
         
     await adb.set_material_status(mat_id, "approved")
+    await adb.track_ui_message_id(callback.message.chat.id, callback.message.message_id)
     
     # Редактируем сообщение у админа
     try:
@@ -4754,13 +4755,14 @@ async def cb_admin_approve(callback: CallbackQuery, bot: Bot):
     try:
         author_id = mat["user_id"]
         icon = "📖" if mat["material_type"] == "method" else "💡"
-        await bot.send_message(
+        sent = await bot.send_message(
             chat_id=author_id,
             text=f"🎉 <b>Сообщение от Менмы:</b>\n\n"
                  f"Твой материал {icon} <b>«{html.escape(mat['title'])}»</b> проверен и одобрен! 🔥\n"
                  f"Теперь он опубликован в боте и доступен всем студентам. Респект за помощь! 🤝",
             parse_mode="HTML"
         )
+        await adb.track_ui_message_id(author_id, sent.message_id)
     except Exception as e:
         logger.warning(f"Could not notify author {mat['user_id']}: {e}")
 
@@ -4777,6 +4779,7 @@ async def cb_admin_reject(callback: CallbackQuery, bot: Bot):
         return
         
     await adb.set_material_status(mat_id, "rejected")
+    await adb.track_ui_message_id(callback.message.chat.id, callback.message.message_id)
     
     # Редактируем сообщение у админа
     try:
@@ -4793,13 +4796,14 @@ async def cb_admin_reject(callback: CallbackQuery, bot: Bot):
     # Уведомляем автора
     try:
         author_id = mat["user_id"]
-        await bot.send_message(
+        sent = await bot.send_message(
             chat_id=author_id,
             text=f"❌ <b>Сообщение от Менмы:</b>\n\n"
                  f"Материал <b>«{html.escape(mat['title'])}»</b> был отклонен.\n"
                  f"Возможно файл некорректен или не относится к этой работе. Проверь и загрузи заново!",
             parse_mode="HTML"
         )
+        await adb.track_ui_message_id(author_id, sent.message_id)
     except Exception:
         pass
 
