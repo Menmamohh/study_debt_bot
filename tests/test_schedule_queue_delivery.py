@@ -26,7 +26,7 @@ class QueueDeliveryTests(unittest.IsolatedAsyncioTestCase):
             if uid != 30:
                 db.set_user_status(uid,'approved')
         self.telegram = NS(send_message=AsyncMock(return_value=NS(message_id=500)),
-                           edit_message_text=AsyncMock(), send_photo=AsyncMock())
+                           edit_message_text=AsyncMock(), send_photo=AsyncMock(), delete_message=AsyncMock())
 
     def tearDown(self):
         db.DB_PATH = self.old
@@ -43,11 +43,11 @@ class QueueDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_many_drafts_use_one_screen_and_next_replaces_it(self):
         ids=[self.draft(f'group-{i}') for i in range(12)]
-        with patch.object(review,'prepare_reviews'), patch.object(bot,'ADMIN_ID',99):
-            await bot.prepare_and_notify_schedule_reviews(self.telegram)
+        with patch.object(bot,'run_gemini_worker',AsyncMock()), patch.object(bot,'ADMIN_ID',99):
+            await bot.prepare_and_notify_schedule_reviews(self.telegram, manual=True)
         self.telegram.send_message.assert_awaited_once()
         self.telegram.send_photo.assert_not_awaited()
-        self.assertIn('Осталось на проверке: 12', self.telegram.send_message.call_args.kwargs['text'])
+        self.assertIn('Осталось на проверке: 12', self.telegram.edit_message_text.call_args.kwargs['text'])
         review.finish_review(ids[0],False)
         db.init_db()
         await bot.show_next_schedule_review(self.telegram,99)

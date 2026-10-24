@@ -21,7 +21,7 @@ def get_review(review_id):
 
 
 def prepare_reviews():
-    """Run after sync, including unchanged syncs so failed notifications can retry."""
+    """Recognize downloaded sheets only when explicitly requested by the administrator."""
     with _prepare_lock:
         payload = gdrive_sync.drive_schedule_payload()
         if not payload:
@@ -332,8 +332,8 @@ def format_result(data):
 
 
 def _gemini_json_request(request, stage, timeout):
-    """Retry a transient failure once, keeping TLS validation enabled."""
-    for attempt in range(2):
+    """Retry temporary service failures with bounded backoff; preserve TLS verification."""
+    for attempt in range(4):
         started = time.monotonic()
         try:
             result = _gemini_json_request_once(request, stage, timeout)
@@ -342,10 +342,10 @@ def _gemini_json_request(request, stage, timeout):
                         stage, attempt + 1, time.monotonic() - started, type(error).__name__)
             if not error.retryable:
                 raise
-            if attempt == 1:
-                raise GeminiError(str(error) + ' Повторная попытка также не удалась. '
+            if attempt == 3:
+                raise GeminiError(str(error) + ' Все повторные попытки завершились с ошибкой. '
                                   'Можно повторно запросить черновики позже.') from None
-            time.sleep(2)
+            time.sleep(min(2 ** (attempt + 1), 8))
         else:
             logger.info("Gemini request stage=%s attempt=%d duration=%.2f outcome=ok",
                         stage, attempt + 1, time.monotonic() - started)
@@ -391,13 +391,14 @@ def _gemini_json_request_once(request, stage, timeout):
         elif isinstance(reason, socket.gaierror):
             message = 'сервер BotHost не смог найти адрес Google (DNS).'
         elif isinstance(reason, (socket.timeout, TimeoutError)):
-            message = f'истекло время ожидания соединения ({timeout} с).'
+            message = f'истекло время ожидания соединения ({timeout} с).' if timeout else 'соединение прервалось при ожидании ответа.'
         else:
             message = 'не удалось установить соединение с Google. Проверь сеть сервера.'
         raise GeminiError(f'{stage}: {message}', retryable=not isinstance(
             reason, ssl.SSLError)) from None
     except (socket.timeout, TimeoutError):
-        raise GeminiError(f'{stage}: Google не ответил за {timeout} с.', retryable=True) from None
+        message = f'Google не ответил за {timeout} с.' if timeout else 'соединение прервалось при ожидании ответа Google.'
+        raise GeminiError(f'{stage}: {message}', retryable=True) from None
     except ssl.SSLError:
         raise GeminiError(f'{stage}: ошибка защищённого соединения HTTPS (TLS).') from None
     except OSError:
@@ -484,7 +485,7 @@ def read_schedule(paths, group, page_context=None):
     )
     logger.info("Gemini images model=%s count=%d image_bytes=%d request_bytes=%d",
                 model, len(paths), size, len(request.data))
-    result = _gemini_json_request(request, 'Распознавание фото', 90)
+    result = _gemini_json_request(request, 'Распознавание фото', None)
     try:
         candidate = result['candidates'][0]
         if candidate.get('finishReason') != 'STOP':

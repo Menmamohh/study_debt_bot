@@ -263,6 +263,14 @@ def get_ui_message_id(user_id: int) -> Optional[int]:
 def set_ui_message_id(user_id: int, message_id: int):
     """Stores the current private-chat menu and remembers it for duplicate cleanup."""
     with get_connection() as conn:
+        # Move legacy queue IDs into ordinary history before relinquishing ownership.
+        conn.execute("INSERT OR IGNORE INTO ui_message_history (user_id, message_id) "
+                     "SELECT ?, CAST(value AS INTEGER) FROM settings WHERE key = ?",
+                     (user_id, f'schedule_queue_screen:{user_id}'))
+        conn.execute("DELETE FROM settings WHERE key = ?", (f'schedule_queue_screen:{user_id}',))
+        conn.execute("INSERT INTO settings (key,value) VALUES (?, '1') "
+                     "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",
+                     (f'ui_revision:{user_id}',))
         conn.execute("""
             INSERT INTO ui_messages (user_id, message_id, updated_at)
             VALUES (?, ?, CURRENT_TIMESTAMP)
@@ -274,6 +282,12 @@ def set_ui_message_id(user_id: int, message_id: int):
             INSERT OR IGNORE INTO ui_message_history (user_id, message_id)
             VALUES (?, ?)
         """, (user_id, message_id))
+
+def get_ui_revision(user_id: int) -> int:
+    with get_connection() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (f'ui_revision:{user_id}',)).fetchone()
+        return int(row['value']) if row else 0
+
 
 def track_ui_message_id(user_id: int, message_id: int):
     """Remember a temporary notification without replacing the current menu."""
@@ -301,6 +315,8 @@ def forget_ui_message_id(user_id: int, message_id: int):
             "DELETE FROM ui_messages WHERE user_id = ? AND message_id = ?",
             (user_id, message_id),
         )
+        conn.execute("DELETE FROM settings WHERE key IN (?, ?) AND value = ?",
+                     (f'schedule_queue_screen:{user_id}', f'schedule_photo_screen:{user_id}', str(message_id)))
 
 def get_user_ui_message_ids(user_id: int) -> List[int]:
     """Returns every menu message the bot has tracked for a user's private chat."""
@@ -309,8 +325,10 @@ def get_user_ui_message_ids(user_id: int) -> List[int]:
             SELECT message_id FROM ui_message_history WHERE user_id = ?
             UNION
             SELECT message_id FROM ui_messages WHERE user_id = ?
+            UNION
+            SELECT CAST(value AS INTEGER) AS message_id FROM settings WHERE key IN (?, ?)
             ORDER BY message_id
-        """, (user_id, user_id)).fetchall()
+        """, (user_id, user_id, f'schedule_queue_screen:{user_id}', f'schedule_photo_screen:{user_id}')).fetchall()
         return [int(row["message_id"]) for row in rows]
 
 def get_all_ui_messages() -> List[Dict[str, int]]:

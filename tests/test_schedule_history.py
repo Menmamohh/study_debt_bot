@@ -128,7 +128,7 @@ class ScheduleHistoryTests(unittest.TestCase):
                                        text=None, chat=SimpleNamespace(type="private", id=1),
                                        from_user=SimpleNamespace(id=1, username="admin"))
             album = [message(1), message(2, "Caption on second photo"), message(3)]
-            sender = SimpleNamespace(send_media_group=AsyncMock(), send_message=AsyncMock())
+            sender = SimpleNamespace(send_media_group=AsyncMock(return_value=[SimpleNamespace(message_id=201), SimpleNamespace(message_id=202)]), send_message=AsyncMock())
             with patch.object(bot, "is_admin", return_value=True), \
                     patch.object(bot, "show_user_screen", AsyncMock()):
                 await bot.process_group_schedule_input(album[0], state, sender, schedule_album=album)

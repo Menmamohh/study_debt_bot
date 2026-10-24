@@ -71,6 +71,7 @@ class GroupNotificationTests(unittest.IsolatedAsyncioTestCase):
         def send(**kwargs):
             if kwargs["chat_id"] == 11:
                 raise TelegramForbiddenError(method=NS(__returning__=None), message="blocked")
+            return NS(message_id=600)
         telegram = NS(send_message=AsyncMock(side_effect=send))
         with patch.object(bot, "is_admin", return_value=True), \
              patch.object(bot.adb, "get_verified_users_by_group", wraps=bot.adb.get_verified_users_by_group) as recipients, \

@@ -44,11 +44,12 @@ class StudyNavigationTests(unittest.IsolatedAsyncioTestCase):
         db.DB_PATH = self.old_path
         self.temp.cleanup()
 
-    def callback(self, data, photo=False, message_id=100):
+    def callback(self, data, photo=False, message_id=None):
+        message_id = message_id or db.get_ui_message_id(10) or 100
         message = NS(chat=NS(id=10, type='private'), message_id=message_id,
                      photo=[NS(file_id='menu')] if photo else None, bot=self.telegram,
                      edit_text=AsyncMock(), edit_caption=AsyncMock(), delete=AsyncMock(),
-                     answer=AsyncMock(), answer_photo=AsyncMock(), answer_document=AsyncMock())
+                     answer=AsyncMock(return_value=NS(message_id=301)), answer_photo=AsyncMock(return_value=NS(message_id=302)), answer_document=AsyncMock(return_value=NS(message_id=303)))
         return NS(data=data, from_user=self.user, message=message,
                   bot=self.telegram, answer=AsyncMock())
 
@@ -171,10 +172,10 @@ class StudyNavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f'dl_mat_{approved}', callbacks)
         self.assertNotIn(f'dl_mat_{pending}', callbacks)
         await bot.cb_download_material(self.callback(f'dl_mat_{approved}'))
-        cb = self.callback(f'view_mat_{task}_{subject}')
+        cb = self.callback(f'view_mat_{task}_{subject}', message_id=db.get_ui_message_id(10))
         await bot.cb_view_materials(cb, self.state)
         self.assert_nav(self.rendered(cb)[1], f'open_sub_{subject}_0')
-        cb = self.callback('quick_upload_material', photo=True)
+        cb = self.callback('quick_upload_material', photo=True, message_id=db.get_ui_message_id(10) or 100)
         await bot.cb_quick_upload_material(cb, self.state)
         self.assert_nav(self.rendered(cb)[1], 'browse_materials_hub')
         # Real aiogram callbacks are frozen: the old subject-name button must still work.
@@ -208,7 +209,7 @@ class StudyNavigationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_navigation_replaces_stale_photo_and_returns_home(self):
         db.set_ui_message_id(10, 90)
-        cb = self.callback('debts_hub', photo=True)
+        cb = self.callback('debts_hub', photo=True, message_id=100)
         await bot.cb_debts_hub(cb, self.state)
         self.telegram.send_message.assert_awaited_once()
         cb.message.edit_caption.assert_not_awaited()

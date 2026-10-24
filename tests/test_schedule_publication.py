@@ -25,7 +25,7 @@ class SchedulePublicationTests(unittest.IsolatedAsyncioTestCase):
         self.state = FSMContext(MemoryStorage(), StorageKey(bot_id=1, chat_id=99, user_id=99))
         self.cb = NS(data='adm_pub_send_token', from_user=NS(id=99, username='admin'),
                      message=NS(chat=NS(type='private')), answer=AsyncMock())
-        self.telegram = NS(send_message=AsyncMock(), send_photo=AsyncMock(), send_media_group=AsyncMock())
+        self.telegram = NS(send_message=AsyncMock(return_value=NS(message_id=300)), send_photo=AsyncMock(return_value=NS(message_id=301)), send_media_group=AsyncMock(return_value=[NS(message_id=302), NS(message_id=303)]))
         bot.schedule_publication_lock = None
         self.patches = [patch.object(bot, 'is_admin', return_value=True),
                         patch.object(bot, 'show_user_screen', AsyncMock()),
@@ -47,6 +47,7 @@ class SchedulePublicationTests(unittest.IsolatedAsyncioTestCase):
         await self.draft(['ТТ-36', 'ТТ-37'])
         def send(**kw):
             if kw['chat_id'] == 10: raise RuntimeError('blocked')
+            return [NS(message_id=302), NS(message_id=303)]
         self.telegram.send_media_group.side_effect = send
         await asyncio.gather(*(bot.cb_schedule_publication(self.cb, self.state, self.telegram) for _ in range(2)))
         self.assertEqual({c.kwargs['chat_id'] for c in self.telegram.send_media_group.await_args_list}, {10,11})

@@ -92,6 +92,12 @@ async def cleanup_user_ui_messages(
                     retry_error,
                 )
                 continue
+        except TelegramBadRequest as error:
+            if "message to delete not found" in str(error).lower():
+                await adb.forget_ui_message_id(user_id, message_id)
+            else:
+                logger.debug("UI cleanup rejected for user %s message %s", user_id, message_id)
+            continue
         except Exception as error:
             logger.debug(
                 "Could not remove duplicate UI message %s for user %s: %s",
@@ -101,6 +107,25 @@ async def cleanup_user_ui_messages(
             )
             continue
         await adb.forget_ui_message_id(user_id, message_id)
+
+async def send_tracked_ui(bot, user_id, method="send_message", **kwargs):
+    sent = await getattr(bot, method)(chat_id=user_id, **kwargs)
+    for message in sent if isinstance(sent, (list, tuple)) else [sent]:
+        await adb.track_ui_message_id(user_id, message.message_id)
+    return sent
+
+
+async def finish_ui_transition(target, screen, related=()):
+    callback = target if hasattr(target, "message") else None
+    chat = callback.message.chat if callback else target.chat
+    if chat.type != "private":
+        return
+    user_id = callback.from_user.id if callback else target.from_user.id
+    await adb.set_ui_message_id(user_id, screen.message_id)
+    await cleanup_user_ui_messages(target.bot, user_id, keep_message_id=screen.message_id,
+        keep_message_ids=[m.message_id for m in related],
+        extra_ids=(callback.message.message_id,) if callback else ())
+
 
 # Настройка логирования: stdout для Docker/systemd, ротируемый файл только для ручного запуска.
 log_handlers = [logging.StreamHandler(sys.stdout)]
@@ -370,13 +395,7 @@ async def safe_edit_message(
         except Exception:
             pass
 
-    # Если редактирование невозможно, удаляем старое и отправляем новое
-    if hasattr(msg, "delete"):
-        try:
-            await msg.delete()
-        except Exception:
-            pass
-
+    # Keep the previous screen until the replacement has been sent successfully.
     if bot_inst and hasattr(bot_inst, "send_message") and user_id:
         try:
             sent = await bot_inst.send_message(chat_id=user_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -394,9 +413,10 @@ async def show_user_screen(
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     parse_mode: str = "HTML",
     photo=None,
+    keep_message_ids=(),
 ):
     """Edits the user's one persistent private-chat interface message when possible."""
-    callback = target if isinstance(target, CallbackQuery) else None
+    callback = target if isinstance(target, CallbackQuery) or hasattr(target, "message") else None
     message = callback.message if callback else target
     user = callback.from_user if callback else getattr(target, "from_user", None)
     if not user or not message or getattr(message.chat, "type", None) != "private":
@@ -425,6 +445,7 @@ async def show_user_screen(
                 callback.bot,
                 user_id,
                 keep_message_id=sent.message_id,
+                keep_message_ids=keep_message_ids,
                 extra_ids=(message.message_id,),
             )
             return
@@ -441,6 +462,7 @@ async def show_user_screen(
                 callback.bot,
                 user_id,
                 keep_message_id=sent.message_id,
+                keep_message_ids=keep_message_ids,
                 extra_ids=(message.message_id,),
             )
             return
@@ -450,17 +472,13 @@ async def show_user_screen(
             else:
                 await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
             await adb.set_ui_message_id(user_id, message.message_id)
-            await cleanup_user_ui_messages(callback.bot, user_id, keep_message_id=message.message_id)
+            await cleanup_user_ui_messages(callback.bot, user_id, keep_message_id=message.message_id, keep_message_ids=keep_message_ids)
             return
         except Exception as error:
             if "message is not modified" in str(error).lower():
                 await adb.set_ui_message_id(user_id, message.message_id)
-                await cleanup_user_ui_messages(callback.bot, user_id, keep_message_id=message.message_id)
+                await cleanup_user_ui_messages(callback.bot, user_id, keep_message_id=message.message_id, keep_message_ids=keep_message_ids)
                 return
-        try:
-            await message.delete()
-        except Exception:
-            pass
         sent = await callback.bot.send_message(
             chat_id=user_id,
             text=text,
@@ -472,6 +490,7 @@ async def show_user_screen(
             callback.bot,
             user_id,
             keep_message_id=sent.message_id,
+                keep_message_ids=keep_message_ids,
             extra_ids=(message.message_id,),
         )
         return
@@ -490,7 +509,7 @@ async def show_user_screen(
     else:
         sent = await target.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
     await adb.set_ui_message_id(user_id, sent.message_id)
-    await cleanup_user_ui_messages(bot_inst, user_id, keep_message_id=sent.message_id)
+    await cleanup_user_ui_messages(bot_inst, user_id, keep_message_id=sent.message_id, keep_message_ids=keep_message_ids)
 
 
 async def render_admin_verification_queue(bot: Bot, page: int = 0, recreate: bool = False):
@@ -661,17 +680,7 @@ async def reject_non_tt36(callback: CallbackQuery):
         [InlineKeyboardButton(text="🔔 Расписание звонков", callback_data="sched_bells")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
     ])
-    msg = getattr(callback, "message", None)
-    if msg and hasattr(msg, "edit_text"):
-        try:
-            await msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
-        except Exception:
-            pass
-    elif hasattr(callback, "bot") and hasattr(callback.bot, "send_message"):
-        try:
-            await callback.bot.send_message(chat_id=callback.from_user.id, text=text, parse_mode="HTML", reply_markup=markup)
-        except Exception:
-            pass
+    await safe_edit_message(callback, text, reply_markup=markup)
     if hasattr(callback, "answer"):
         try:
             await callback.answer("Раздел пока недоступен для твоей группы", show_alert=True)
@@ -964,22 +973,31 @@ async def cb_admin_ocr_mode(callback: CallbackQuery):
 
 
 async def show_gemini_schedule_check(callback, files, group_name):
+    revision = None
     try:
         await show_user_screen(callback, "⏳ Проверяю доступ к Gemini без отправки фото…",
-                               reply_markup=kb.admin_ocr_result_kb())
-        model = await asyncio.to_thread(gemini_schedule.check_connection)
+                               reply_markup=gemini_progress_kb())
+        revision = await adb.get_ui_revision(callback.from_user.id)
+        model = await run_gemini_worker(callback.from_user.id, 'check')
+        if await adb.get_ui_revision(callback.from_user.id) != revision:
+            return
         await show_user_screen(callback,
                                f"✅ Доступ к {html.escape(model)} подтверждён. Распознаю фото…",
-                               reply_markup=kb.admin_ocr_result_kb())
-        result = await asyncio.to_thread(
-            gemini_schedule.read_schedule, [item["local_path"] for item in files], group_name
-        )
+                               reply_markup=gemini_progress_kb())
+        revision = await adb.get_ui_revision(callback.from_user.id)
+        result = await run_gemini_worker(callback.from_user.id, 'read',
+            dict(paths=[item["local_path"] for item in files], group=group_name))
+    except asyncio.CancelledError:
+        return
     except gemini_schedule.GeminiError as error:
-        await show_user_screen(callback, "⚠️ " + html.escape(str(error)), reply_markup=kb.admin_ocr_result_kb())
+        if revision is not None and await adb.get_ui_revision(callback.from_user.id) == revision:
+            await show_user_screen(callback, "⚠️ " + html.escape(str(error)), reply_markup=kb.admin_ocr_result_kb())
         return
     except OSError:
         await show_user_screen(callback, "⚠️ Не удалось открыть исходные фото. Обнови файлы с Google Диска.",
                                reply_markup=kb.admin_ocr_result_kb())
+        return
+    if await adb.get_ui_revision(callback.from_user.id) != revision:
         return
     date = files[0].get("schedule_date") or "дата не указана"
     await show_user_screen(
@@ -993,7 +1011,7 @@ async def show_gemini_schedule_check(callback, files, group_name):
         try:
             sent = await callback.bot.send_photo(chat_id=callback.from_user.id,
                 photo=FSInputFile(item["local_path"]), caption="Исходный лист для проверки Gemini")
-            await adb.set_ui_message_id(callback.from_user.id, sent.message_id)
+            await adb.track_ui_message_id(callback.from_user.id, sent.message_id)
         except Exception:
             logger.warning("Could not attach Gemini schedule source photo")
 
@@ -1084,11 +1102,10 @@ async def cb_admin_ocr_group(callback: CallbackQuery):
                     ) for offset, (path, *_rest) in enumerate(batch)],
                 )
             for photo_message in sent:
-                await adb.set_ui_message_id(callback.from_user.id, photo_message.message_id)
+                await adb.track_ui_message_id(callback.from_user.id, photo_message.message_id)
         except Exception as error:
             logger.warning("Could not send source images for OCR check: %s", error)
-            await callback.bot.send_message(
-                chat_id=callback.from_user.id,
+            await send_tracked_ui(callback.bot, callback.from_user.id,
                 text="Не получилось прикрепить исходное фото. Распознанный текст и список найденных групп показаны выше.",
             )
 
@@ -1158,11 +1175,7 @@ async def cb_admin_feedback_copy(callback: CallbackQuery, bot: Bot):
         if not report:
             await callback.answer("Отчёт не найден.", show_alert=True)
             return
-        await bot.copy_message(
-            chat_id=callback.from_user.id,
-            from_chat_id=report["source_chat_id"],
-            message_id=report["source_message_id"],
-        )
+        await send_tracked_ui(bot, callback.from_user.id, "copy_message", from_chat_id=report['source_chat_id'], message_id=report['source_message_id'])
         await callback.answer("Исходное сообщение отправлено ниже.")
     except Exception:
         logger.exception("Could not copy feedback report")
@@ -1324,9 +1337,7 @@ async def cb_feedback_reply_action(callback: CallbackQuery, state: FSMContext, b
         return
     await callback.answer('Отправляю…')
     try:
-        sent = await bot.send_message(chat_id=claimed['recipient_id'],
-            text=f"Ответ администратора на обращение №{claimed['report_id']}\n\n{claimed['body']}", parse_mode=None,
-            reply_markup=kb.student_feedback_reply_kb(claimed['report_id']))
+        sent = await send_tracked_ui(bot, claimed['recipient_id'], "send_message", text=f"Ответ администратора на обращение №{claimed['report_id']}\n\n{claimed['body']}", parse_mode=None, reply_markup=kb.student_feedback_reply_kb(claimed['report_id']))
     except (TelegramForbiddenError, TelegramBadRequest, TelegramRetryAfter):
         await adb.finish_feedback_reply(token, 'failed')
         await safe_edit_message(callback, 'Ответ не доставлен: Telegram отклонил отправку. Можно изменить текст или отменить ответ.',
@@ -1398,9 +1409,7 @@ async def process_student_feedback_reply(message: Message, state: FSMContext, bo
     admin_id = await adb.get_admin_id() or ADMIN_ID
     if admin_id:
         try:
-            await bot.send_message(chat_id=admin_id, text=f'💬 Новое сообщение студента в обращении №{report_id}.',
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="Открыть переписку", callback_data=f"adm_feedback_{report_id}")]]))
+            await send_tracked_ui(bot, admin_id, "send_message", text=f'💬 Новое сообщение студента в обращении №{report_id}.', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Открыть переписку', callback_data=f'adm_feedback_{report_id}')]]))
         except Exception:
             logger.exception('Could not notify admin of student reply in report %s', report_id)
     await show_user_screen(message, f'✅ Ответ сохранён в обращении №{report_id}. Администратор увидит его в переписке.',
@@ -1580,12 +1589,10 @@ async def cb_admin_group_notice_send(callback: CallbackQuery, state: FSMContext,
     for user_id in recipient_ids:
         try:
             try:
-                await bot.send_message(chat_id=user_id, text=body, parse_mode=None,
-                                       disable_notification=False)
+                await send_tracked_ui(bot, user_id, "send_message", text=body, parse_mode=None, disable_notification=False)
             except TelegramRetryAfter as error:
                 await asyncio.sleep(error.retry_after)
-                await bot.send_message(chat_id=user_id, text=body, parse_mode=None,
-                                       disable_notification=False)
+                await send_tracked_ui(bot, user_id, "send_message", text=body, parse_mode=None, disable_notification=False)
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
@@ -2341,7 +2348,7 @@ async def cb_admin_approve_user(callback: CallbackQuery, bot: Bot):
         start_kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🚀 Войти в «Помощник Пятнашки»", callback_data="main_menu")]
         ])
-        await bot.send_message(chat_id=target_id, text=student_msg, parse_mode="HTML", reply_markup=start_kb)
+        await send_tracked_ui(bot, target_id, "send_message", text=student_msg, parse_mode='HTML', reply_markup=start_kb)
     except Exception as e:
         logger.warning(f"Could not notify approved user {target_id}: {e}")
 
@@ -2367,7 +2374,7 @@ async def cb_admin_reject_user(callback: CallbackQuery, bot: Bot):
             f"⛔ <b>Твоя заявка на вход в бота была отклонена.</b>\n\n"
             f"Если произошла ошибка или ты ошибся группой, ты можешь отправить заявку заново по кнопке ниже 👇"
         )
-        await bot.send_message(chat_id=target_id, text=student_msg, parse_mode="HTML", reply_markup=kb.rejected_user_kb())
+        await send_tracked_ui(bot, target_id, "send_message", text=student_msg, parse_mode='HTML', reply_markup=kb.rejected_user_kb())
     except Exception:
         pass
 
@@ -2603,21 +2610,17 @@ async def render_group_schedule_view(
             user_id,
             keep_message_id=screen_message.message_id,
             keep_message_ids=related_ids,
+            extra_ids=(target.message.message_id,) if is_callback else (),
         )
     
     if isinstance(photo_id, list):
         if is_callback:
-            try:
-                await target.message.delete()
-            except Exception:
-                pass
-        photo_messages = await actual_bot.send_media_group(
-            chat_id=user_id,
+            pass  # Remove the previous screen only after a successful replacement.
+        photo_messages = await send_tracked_ui(actual_bot, user_id, "send_media_group",
             media=build_general_schedule_media(photo_id, target_date=target_date),
         )
         await cache_general_schedule_media(photo_id, photo_messages)
-        screen_message = await actual_bot.send_message(
-            chat_id=user_id,
+        screen_message = await send_tracked_ui(actual_bot, user_id, "send_message",
             text=text,
             parse_mode="HTML",
             reply_markup=markup,
@@ -2625,23 +2628,19 @@ async def render_group_schedule_view(
         await track_schedule_screen(screen_message, related_messages=photo_messages)
     elif photo_id:
         if is_callback:
-            try:
-                await target.message.delete()
-            except Exception:
-                pass
+            pass  # Remove the previous screen only after a successful replacement.
         if len(text) <= 900:
             photo_source = FSInputFile(photo_id) if os.path.isfile(photo_id) else photo_id
             if is_callback:
-                screen_message = await actual_bot.send_photo(chat_id=user_id, photo=photo_source, caption=text, parse_mode="HTML", reply_markup=markup)
+                screen_message = await send_tracked_ui(actual_bot, user_id, "send_photo", photo=photo_source, caption=text, parse_mode="HTML", reply_markup=markup)
             else:
                 screen_message = await target.answer_photo(photo=photo_source, caption=text, parse_mode="HTML", reply_markup=markup)
             if os.path.isfile(photo_id):
                 await cache_general_schedule_media([photo_id], [screen_message])
         else:
-            screen_message = await actual_bot.send_message(
-                chat_id=target_chat.id, text=text, parse_mode="HTML", reply_markup=markup
+            screen_message = await send_tracked_ui(actual_bot, target_chat.id, "send_message", text=text, parse_mode="HTML", reply_markup=markup
             )
-            photo_message = await actual_bot.send_photo(chat_id=target_chat.id, photo=photo_id)
+            photo_message = await send_tracked_ui(actual_bot, target_chat.id, "send_photo", photo=photo_id)
             await track_schedule_screen(screen_message, related_messages=(photo_message,))
             return
         await track_schedule_screen(screen_message)
@@ -2684,19 +2683,20 @@ async def render_schedule_version(target, user, group_name, versions, selected,
             value = photo["source"]
             return FSInputFile(value) if os.path.isfile(value) else value
         if len(batch) == 1:
-            sent = await actual_bot.send_photo(chat_id=chat.id, photo=source(batch[0]),
+            sent = await send_tracked_ui(actual_bot, chat.id, "send_photo", photo=source(batch[0]),
                                               caption=batch[0].get("caption") or None)
             related.append(sent)
         else:
-            related.extend(await actual_bot.send_media_group(chat_id=chat.id, media=[
+            related.extend(await send_tracked_ui(actual_bot, chat.id, "send_media_group", media=[
                 InputMediaPhoto(media=source(photo), caption=photo.get("caption") or None) for photo in batch
             ]))
-    screen = await actual_bot.send_message(chat_id=chat.id, text=text, parse_mode="HTML", reply_markup=markup)
+    screen = await send_tracked_ui(actual_bot, chat.id, "send_message", text=text, parse_mode="HTML", reply_markup=markup)
     if chat.type == "private":
         for sent in [*related, screen]:
             await adb.set_ui_message_id(user.id, sent.message_id)
         await cleanup_user_ui_messages(actual_bot, user.id, keep_message_id=screen.message_id,
-                                       keep_message_ids=[sent.message_id for sent in related])
+                                       keep_message_ids=[sent.message_id for sent in related],
+                                       extra_ids=(target.message.message_id,) if is_callback else ())
 
 
 @dp.callback_query(F.data.startswith("schold_") | F.data.startswith("schdel_"))
@@ -2750,14 +2750,7 @@ async def cb_schedule_menu(callback: CallbackQuery, state: FSMContext):
             current_group=None,
             is_admin_user=is_admin(callback.from_user) and callback.message.chat.type == "private"
         )
-        try:
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
-        except Exception:
-            try:
-                await callback.message.delete()
-            except Exception:
-                pass
-            await callback.bot.send_message(chat_id=callback.from_user.id, text=text, parse_mode="HTML", reply_markup=markup)
+        await safe_edit_message(callback, text, reply_markup=markup)
         await callback.answer()
         return
         
@@ -2815,14 +2808,7 @@ async def cb_schedule_choose_group(callback: CallbackQuery, state: FSMContext):
         f"Выбери группу из списка ниже, чтобы увидеть самое актуальное расписание 👇"
     )
     markup = kb.schedule_choose_group_kb(current_group=my_grp, is_admin_user=is_adm)
-    try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
-    except Exception:
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
-        await callback.bot.send_message(chat_id=user_id, text=text, parse_mode="HTML", reply_markup=markup)
+    await safe_edit_message(callback, text, reply_markup=markup)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("sched_set_my_"))
@@ -2840,14 +2826,7 @@ async def cb_schedule_bells(callback: CallbackQuery):
         back_row.append(InlineKeyboardButton(text="👥 Выбрать группу", callback_data="sched_choose_group"))
     back_row.append(InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"))
     markup = InlineKeyboardMarkup(inline_keyboard=[back_row])
-    try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
-    except Exception:
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
-        await callback.bot.send_message(chat_id=callback.from_user.id, text=text, parse_mode="HTML", reply_markup=markup)
+    await safe_edit_message(callback, text, reply_markup=markup)
     await callback.answer()
 
 @dp.message(Command("bells", "zvonki"))
@@ -2894,25 +2873,24 @@ async def cb_schedule_view_gen_photo(callback: CallbackQuery):
     back_kb_rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     
     back_markup = InlineKeyboardMarkup(inline_keyboard=back_kb_rows)
+    related = []
     if isinstance(photo, list):
-        await callback.bot.send_media_group(
-            chat_id=callback.from_user.id,
+        related = await send_tracked_ui(callback.bot, callback.from_user.id, "send_media_group",
             media=build_general_schedule_media(photo, target_date=target_date),
         )
-        await callback.bot.send_message(
-            chat_id=callback.from_user.id,
+        screen = await send_tracked_ui(callback.bot, callback.from_user.id,
             text=caption or "📸 <b>Полный лист замен колледжа</b>",
             parse_mode="HTML",
             reply_markup=back_markup,
         )
     else:
-        await callback.bot.send_photo(
-            chat_id=callback.from_user.id,
+        screen = await send_tracked_ui(callback.bot, callback.from_user.id, "send_photo",
             photo=photo,
             caption=caption,
             parse_mode="HTML",
             reply_markup=back_markup,
         )
+    await finish_ui_transition(callback, screen, related)
     await callback.answer()
 
 # --- Редактирование / публикация расписания админом @Menmamoh ---
@@ -2938,10 +2916,7 @@ async def cb_admin_sched_publish_all(callback: CallbackQuery, state: FSMContext)
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отмена", callback_data="adm_sched_cancel")]
     ])
-    try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=cancel_kb)
-    except Exception:
-        await callback.bot.send_message(chat_id=callback.from_user.id, text=text, parse_mode="HTML", reply_markup=cancel_kb)
+    await safe_edit_message(callback, text, reply_markup=cancel_kb)
     await callback.answer()
 
 @dp.callback_query(F.data == "adm_sched_cancel")
@@ -2981,14 +2956,7 @@ async def cb_admin_sched_edit(callback: CallbackQuery, state: FSMContext):
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отмена", callback_data=f"sched_view_{target_group}")]
     ])
-    try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=cancel_kb)
-    except Exception:
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
-        await callback.bot.send_message(chat_id=callback.from_user.id, text=text, parse_mode="HTML", reply_markup=cancel_kb)
+    await safe_edit_message(callback, text, reply_markup=cancel_kb)
     await callback.answer()
 
 def schedule_publication_admin(callback):
@@ -3023,7 +2991,8 @@ async def show_schedule_publication_preview(target, state, admin_id):
         text += "\n\nНет получателей. Выбери группы с подтверждёнными студентами."
     await show_user_screen(target, text, reply_markup=kb.schedule_publication_kb(
         db.COLLEGE_GROUPS, groups, all_groups, data["schedule_token"],
-        can_publish=bool(recipients) and bool(groups or all_groups)))
+        can_publish=bool(recipients) and bool(groups or all_groups)),
+        keep_message_ids=data.get("schedule_preview_ids", []))
 
 
 @dp.message(Form.waiting_for_group_schedule)
@@ -3052,11 +3021,15 @@ async def process_group_schedule_input(message: Message, state: FSMContext, bot:
                             schedule_groups=[target_group] if target_group in db.COLLEGE_GROUPS else [],
                             schedule_all=False, schedule_token=uuid.uuid4().hex[:12])
     await state.set_state(Form.waiting_for_schedule_audience)
+    preview_ids = []
     if photos:
         if len(photos) > 1:
-            await bot.send_media_group(chat_id=message.chat.id, media=[InputMediaPhoto(media=p) for p in photos])
+            sent = await send_tracked_ui(bot, message.chat.id, "send_media_group", media=[InputMediaPhoto(media=p) for p in photos])
+            preview_ids = [item.message_id for item in sent]
         else:
-            await bot.send_photo(chat_id=message.chat.id, photo=photos[0])
+            sent = await send_tracked_ui(bot, message.chat.id, "send_photo", photo=photos[0])
+            preview_ids = [sent.message_id]
+    await state.update_data(schedule_preview_ids=preview_ids)
     await show_schedule_publication_preview(message, state, message.from_user.id)
 
 
@@ -3154,20 +3127,18 @@ async def publish_selected_schedule(callback, bot, data, recipients):
             for attempt in range(2):
                 try:
                     if len(photo_file_ids) > 1:
-                        await bot.send_media_group(chat_id=user_id, media=[
+                        await send_tracked_ui(bot, user_id, "send_media_group", media=[
                             InputMediaPhoto(media=photo, caption=broadcast_body if index == 0 else None,
                                             parse_mode="HTML")
                             for index, photo in enumerate(photo_file_ids)
                         ])
-                        await bot.send_message(chat_id=user_id, text="Открыть расписание:", reply_markup=broadcast_kb)
+                        await send_tracked_ui(bot, user_id, "send_message", text="Открыть расписание:", reply_markup=broadcast_kb)
                     elif photo_file_id:
-                        await bot.send_photo(
-                            chat_id=user_id, photo=photo_file_id, caption=broadcast_body,
+                        await send_tracked_ui(bot, user_id, "send_photo", photo=photo_file_id, caption=broadcast_body,
                             parse_mode="HTML", reply_markup=broadcast_kb,
                         )
                     else:
-                        await bot.send_message(
-                            chat_id=user_id, text=broadcast_body,
+                        await send_tracked_ui(bot, user_id, "send_message", text=broadcast_body,
                             parse_mode="HTML", reply_markup=broadcast_kb,
                         )
                     return True
@@ -3318,7 +3289,6 @@ async def cb_admin_gdrive_sync(callback: CallbackQuery, bot: Bot):
         *kb.admin_back_rows("schedule"),
     ]))
     await notify_synced_schedule(bot, res)
-    await prepare_and_notify_schedule_reviews(bot)
 
 
 def schedule_review_kb(review_id, photo_count=0):
@@ -3336,27 +3306,31 @@ def schedule_review_kb(review_id, photo_count=0):
 review_screen_lock = None
 
 
-async def update_review_screen(bot, chat_id, text, markup):
+async def update_review_screen(bot, chat_id, text, markup, keep_photo=False):
     global review_screen_lock
     if review_screen_lock is None:
         review_screen_lock = asyncio.Lock()
     async with review_screen_lock:
-        await _update_review_screen(bot, chat_id, text, markup)
+        await _update_review_screen(bot, chat_id, text, markup, keep_photo=keep_photo)
 
 
-async def _update_review_screen(bot, chat_id, text, markup):
-    message_id = await asyncio.to_thread(schedule_review.screen_id, chat_id)
+async def _update_review_screen(bot, chat_id, text, markup, keep_photo=False):
+    message_id = await adb.get_ui_message_id(chat_id) or await asyncio.to_thread(schedule_review.screen_id, chat_id)
     if message_id:
         try:
             await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text,
                                         parse_mode="HTML", reply_markup=markup)
-            return
         except TelegramBadRequest as error:
-            if 'message is not modified' in str(error).lower():
-                return
-            logger.info("Review screen unavailable: %s", error)
-    sent = await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
-    await asyncio.to_thread(schedule_review.screen_id, chat_id, 'queue', sent.message_id)
+            if 'message is not modified' not in str(error).lower():
+                message_id = None
+    if not message_id:
+        sent = await send_tracked_ui(bot, chat_id, text=text, parse_mode="HTML", reply_markup=markup)
+        message_id = sent.message_id
+    await adb.set_ui_message_id(chat_id, message_id)
+    await asyncio.to_thread(schedule_review.screen_id, chat_id, 'queue', message_id)
+    photo_id = await asyncio.to_thread(schedule_review.screen_id, chat_id, 'photo')
+    await cleanup_user_ui_messages(bot, chat_id, keep_message_id=message_id,
+                                   keep_message_ids=(photo_id,) if keep_photo and photo_id else ())
 
 
 async def send_schedule_review(bot, chat_id, draft, remaining=None, notice=''):
@@ -3381,7 +3355,7 @@ async def send_schedule_review(bot, chat_id, draft, remaining=None, notice=''):
         f"📝 <b>Черновик замен — {html.escape(draft['group_name'])}, {draft['schedule_date']}</b>\n"
         f"Осталось на проверке: {remaining if remaining is not None else 1}\n\n{body}\n\n"
         "Сверь текст с исходными листами. Студенты увидят его только после публикации.")
-    await update_review_screen(bot, chat_id, text, schedule_review_kb(draft['id'], len(json.loads(draft['sources']))))
+    await update_review_screen(bot, chat_id, text, schedule_review_kb(draft['id'], len(json.loads(draft['sources']))), keep_photo=bool(sources))
 
 
 async def show_next_schedule_review(bot, chat_id, notice=''):
@@ -3394,35 +3368,96 @@ async def show_next_schedule_review(bot, chat_id, notice=''):
 
 
 schedule_prepare_lock = None
+gemini_jobs = {}
+
+
+def gemini_progress_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Остановить распознавание", callback_data="adm_gemini_cancel")],
+        *kb.admin_back_rows("schedule"),
+    ])
+
+
+async def run_gemini_worker(user_id, operation, payload=None):
+    """A cancellable process owns the unbounded HTTP wait; no orphan worker threads."""
+    import json
+    if user_id in gemini_jobs:
+        raise schedule_review.GeminiError("Распознавание уже идёт. Дождись результата или останови его.")
+    task = asyncio.current_task()
+    gemini_jobs[user_id] = task
+    process = None
+    spawn = None
+    try:
+        env = dict(os.environ, DB_PATH=str(db.DB_PATH))
+        spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+            sys.executable, os.path.join(os.path.dirname(__file__), "gemini_worker.py"), operation,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=None, env=env))
+        process = await asyncio.shield(spawn)
+        output, _ = await process.communicate(json.dumps(payload or {}).encode())
+        if process.returncode != 0:
+            raise schedule_review.GeminiError("Процесс распознавания завершился с ошибкой. Можно повторить запрос.")
+        try:
+            result = json.loads(output)
+        except (ValueError, UnicodeError):
+            raise schedule_review.GeminiError("Не удалось прочитать результат распознавания.") from None
+        if 'error' in result:
+            raise schedule_review.GeminiError(result['error'])
+        return result.get('result')
+    except OSError:
+        raise schedule_review.GeminiError("Не удалось запустить распознавание на сервере.") from None
+    finally:
+        # Even cancellation during process creation must reap the child.
+        if process is None and spawn is not None:
+            try:
+                process = await asyncio.shield(spawn)
+            except OSError:
+                process = None
+        if process is not None and process.returncode is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), 2)
+            except asyncio.TimeoutError:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+        if gemini_jobs.get(user_id) is task:
+            gemini_jobs.pop(user_id, None)
 
 
 async def prepare_and_notify_schedule_reviews(bot, manual=False):
     global schedule_prepare_lock
+    # Background sync must never make billable recognition requests or show draft alerts.
+    if not manual or not ADMIN_ID:
+        return False
     if schedule_prepare_lock is None:
         schedule_prepare_lock = asyncio.Lock()
-    if schedule_prepare_lock.locked():
+    if schedule_prepare_lock.locked() or ADMIN_ID in gemini_jobs:
         return False
     async with schedule_prepare_lock:
-        if manual and ADMIN_ID:
-            await update_review_screen(bot, ADMIN_ID,
-                "⏳ Повторно запрашиваю черновики по уже скачанным листам. "
-                "Листы обрабатываются по одному; успешные страницы сохраняются. Это может занять несколько минут. При временном сбое бот выполнит ещё одну попытку. Неполные черновики не публикуются.",
-                kb.admin_section_kb("schedule"))
+        await update_review_screen(bot, ADMIN_ID,
+            "⏳ Распознаю скачанные листы. Ограничение ожидания снято; успешные страницы сохраняются. "
+            "При временном сбое запрос повторится с паузой. Можно остановить распознавание кнопкой ниже.",
+            gemini_progress_kb())
+        request_screen = await adb.get_ui_message_id(ADMIN_ID)
         try:
-            await asyncio.to_thread(schedule_review.prepare_reviews)
+            await run_gemini_worker(ADMIN_ID, 'prepare')
+        except asyncio.CancelledError:
+            return False
         except schedule_review.GeminiError as error:
             logger.warning("Draft preparation failed: %s", error)
-            if ADMIN_ID:
+            if await asyncio.to_thread(schedule_review.screen_id, ADMIN_ID) == request_screen:
                 await update_review_screen(bot, ADMIN_ID,
-                    "⚠️ Черновики Gemini не подготовлены: " + html.escape(str(error)),
-                    kb.admin_section_kb("schedule"))
+                    "⚠️ Черновики не подготовлены: " + html.escape(str(error)), kb.admin_section_kb("schedule"))
             return False
-        if ADMIN_ID:
-            drafts = await asyncio.to_thread(schedule_review.pending_reviews, True)
-            if drafts or manual:
-                await show_next_schedule_review(bot, ADMIN_ID)
-                for draft in drafts:
-                    await asyncio.to_thread(schedule_review.mark_notified, draft['id'])
+        # Leaving the screen does not cause a late unsolicited replacement or notification.
+        if await asyncio.to_thread(schedule_review.screen_id, ADMIN_ID) == request_screen:
+            await show_next_schedule_review(bot, ADMIN_ID)
         return True
 
 
@@ -3431,13 +3466,28 @@ async def cb_admin_drafts_retry(callback: CallbackQuery, state: FSMContext = Non
     if not is_admin(callback.from_user) or not callback.message or callback.message.chat.type != "private":
         await callback.answer("Только для администратора в личном чате.", show_alert=True)
         return
-    if schedule_prepare_lock is not None and schedule_prepare_lock.locked():
-        await callback.answer("Черновики уже запрашиваются. Дождись результата.", show_alert=True)
+    if (schedule_prepare_lock is not None and schedule_prepare_lock.locked()) or callback.from_user.id in gemini_jobs:
+        await callback.answer("Черновики уже запрашиваются. Дождись результата или останови распознавание.", show_alert=True)
         return
     await callback.answer("Запрашиваю черновики…")
     if state:
         await state.clear()
+    await adb.track_ui_message_id(callback.from_user.id, callback.message.message_id)
     await prepare_and_notify_schedule_reviews(callback.bot, manual=True)
+
+
+@dp.callback_query(F.data == "adm_gemini_cancel")
+async def cb_admin_gemini_cancel(callback: CallbackQuery):
+    if not is_admin(callback.from_user) or not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Только для администратора в личном чате.", show_alert=True)
+        return
+    job = gemini_jobs.get(callback.from_user.id)
+    if job:
+        job.cancel()
+        await asyncio.gather(job, return_exceptions=True)
+    await safe_edit_message(callback, "Распознавание остановлено. Успешные страницы сохранены. Можно запросить черновики снова.",
+                            reply_markup=kb.admin_section_kb("schedule"))
+
 
 
 delivery_lock = None
@@ -3455,10 +3505,10 @@ async def deliver_schedule_notifications(bot):
                     disable_notification=False, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                         InlineKeyboardButton(text="Открыть расписание", callback_data=item['callback_data'])]]))
                 try:
-                    await bot.send_message(**kwargs)
+                    await send_tracked_ui(bot, item["user_id"], **{k: v for k, v in kwargs.items() if k != "chat_id"})
                 except TelegramRetryAfter as error:
                     await asyncio.sleep(error.retry_after)
-                    await bot.send_message(**kwargs)
+                    await send_tracked_ui(bot, item["user_id"], **{k: v for k, v in kwargs.items() if k != "chat_id"})
                 await asyncio.to_thread(schedule_review.delivery_sent, item['event_key'], item['user_id'])
                 sent += 1
                 await asyncio.sleep(0.05)
@@ -3517,6 +3567,7 @@ async def cb_schedule_review_photo(callback: CallbackQuery):
                 return
     sent = await callback.bot.send_photo(chat_id=callback.from_user.id, photo=FSInputFile(photo['source']),
                                          caption=photo.get('caption'), parse_mode=None)
+    await adb.track_ui_message_id(callback.from_user.id, sent.message_id)
     await asyncio.to_thread(schedule_review.screen_id, callback.from_user.id, 'photo', sent.message_id)
 
 
@@ -3952,13 +4003,17 @@ async def cb_download_material(callback: CallbackQuery):
     is_adm = is_admin(callback.from_user)
     reply_markup = kb.material_downloaded_kb(subject_name, material_id=mat_id, is_admin_user=is_adm)
     
+    sent = None
     if mat["file_type"] == "document" and mat["file_id"]:
-        await callback.message.answer_document(document=mat["file_id"], caption=caption, parse_mode="HTML", reply_markup=reply_markup)
+        sent = await callback.message.answer_document(document=mat["file_id"], caption=caption, parse_mode="HTML", reply_markup=reply_markup)
     elif mat["file_type"] == "photo" and mat["file_id"]:
-        await callback.message.answer_photo(photo=mat["file_id"], caption=caption, parse_mode="HTML", reply_markup=reply_markup)
+        sent = await callback.message.answer_photo(photo=mat["file_id"], caption=caption, parse_mode="HTML", reply_markup=reply_markup)
     elif mat["content_text"]:
-        await callback.message.answer(f"{caption}\n\n📄 <b>Текст / Ссылка:</b>\n{html.escape(mat['content_text'])}", parse_mode="HTML", reply_markup=reply_markup)
+        sent = await callback.message.answer(f"{caption}\n\n📄 <b>Текст / Ссылка:</b>\n{html.escape(mat['content_text'])}", parse_mode="HTML", reply_markup=reply_markup)
         
+    if sent:
+        await adb.track_ui_message_id(callback.from_user.id, sent.message_id)
+        await finish_ui_transition(callback, sent)
     await callback.answer("Отправлено в чат!")
 
 # =========================================================================
@@ -3986,10 +4041,7 @@ async def cb_admin_ask_delete_material(callback: CallbackQuery):
         f"Ты точно хочешь навсегда удалить этот материал?\n\n"
         f"⚠️ После удаления он будет стерт из базы и перестанет показываться студентам."
     )
-    try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.admin_confirm_delete_material_kb(mat_id))
-    except Exception:
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=kb.admin_confirm_delete_material_kb(mat_id))
+    await safe_edit_message(callback, text, reply_markup=kb.admin_confirm_delete_material_kb(mat_id))
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("adm_do_del_"))
@@ -4014,10 +4066,7 @@ async def cb_admin_do_delete_material(callback: CallbackQuery):
         [InlineKeyboardButton(text="🗄️ К списку предметов (удалить ещё)", callback_data="adm_manage_materials")],
         [InlineKeyboardButton(text="👑 В админ-панель", callback_data="admin_panel")]
     ])
-    try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
-    except Exception:
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+    await safe_edit_message(callback, text, reply_markup=reply_markup)
     await callback.answer("Удалено!")
 
 @dp.callback_query(F.data == "adm_manage_materials")
@@ -5002,22 +5051,12 @@ async def gdrive_sync_background_loop(bot: Bot):
             res = await loop.run_in_executor(None, gdrive_sync.sync_drive_schedule)
             if res.get("ok"):
                 await notify_synced_schedule(bot, res)
-                await prepare_and_notify_schedule_reviews(bot)
             if res.get("ok") and res.get("new_downloaded", 0) > 0:
                 logger.info(f"Google Drive background sync: downloaded {res['new_downloaded']} new files")
                 if ADMIN_ID:
                     try:
                         new_files_str = "\n".join([f"• {f['filename']}" for f in res.get("updated_files", [])])
-                        await bot.send_message(
-                            chat_id=ADMIN_ID,
-                            text=(
-                                f"📢 <b>Google Диск: обнаружены новые замены!</b>\n\n"
-                                f"Скачано новых файлов: <b>{res['new_downloaded']}</b>\n"
-                                f"{new_files_str}\n\n"
-                                f"<i>Листы замен в боте обновлены автоматически.</i>"
-                            ),
-                            parse_mode="HTML"
-                        )
+                        await send_tracked_ui(bot, ADMIN_ID, "send_message", text=f"📢 <b>Google Диск: обнаружены новые замены!</b>\n\nСкачано новых файлов: <b>{res['new_downloaded']}</b>\n{new_files_str}\n\n<i>Листы замен в боте обновлены автоматически.</i>", parse_mode='HTML')
                     except Exception as e:
                         logger.warning(f"Could not notify admin of gdrive sync: {e}")
         except Exception as e:

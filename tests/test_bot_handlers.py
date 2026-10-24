@@ -136,8 +136,13 @@ class BotHandlerTests(unittest.TestCase):
         class FakeBot:
             async def send_photo(self, **kwargs):
                 sent.update(kwargs)
+                return SimpleNamespace(message_id=500)
+
+            async def delete_message(self, **kwargs):
+                pass
 
         class FakeCallback:
+            message = SimpleNamespace(message_id=100, chat=SimpleNamespace(id=10, type="private"))
             from_user = SimpleNamespace(id=10)
             bot = FakeBot()
 

@@ -61,6 +61,7 @@ class GeminiPageTests(unittest.TestCase):
                                 response(page([group([lesson([3,4])])]))])
         drafts = review.pending_reviews()
         self.assertEqual(len(drafts), 1)
+        self.assertTrue(all(call.args[2] is None for call in request.call_args_list))
         self.assertEqual(drafts[0]['body'], '1-2 Дизайн (Преподаватель)\n3-4 Дизайн (Преподаватель)')
         self.assertEqual([len(json.loads(c.args[0].data)['contents'][0]['parts']) for c in request.call_args_list], [2,2])
 
