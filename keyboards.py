@@ -122,6 +122,7 @@ def schedule_view_kb(
             InlineKeyboardButton(text="🔄 Синхронизация с Google Диском", callback_data="adm_gdrive_sync")
         ])
     if is_admin_user:
+        kb.append([InlineKeyboardButton(text="Даты и листы", callback_data="ds:manage")])
         kb.extend(admin_back_rows("schedule"))
     kb.append([InlineKeyboardButton(text="Главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
@@ -140,6 +141,7 @@ def schedule_version_kb(group_name: str, older_id: Optional[int], version_id: in
                                           callback_data=f"adm_sched_edit_{group_name}")])
         rows.append([InlineKeyboardButton(text="🔄 Синхронизация с Google Диском", callback_data="adm_gdrive_sync")])
     if is_admin_user:
+        rows.append([InlineKeyboardButton(text="Даты и листы", callback_data="ds:manage")])
         rows.extend(admin_back_rows("schedule"))
     rows.extend([
         [InlineKeyboardButton(text="🔔 Расписание звонков", callback_data="sched_bells")],
@@ -410,7 +412,8 @@ def admin_panel_kb(pending_materials_count: int = 0, pending_users_count: int = 
 def admin_section_kb(section: str) -> InlineKeyboardMarkup:
     actions = {
         "students": [("Заявки на вход", "adm_users_queue"), ("Студенты по группам", "adm_users_list")],
-        "schedule": [("Обновить с Google Диска", "adm_gdrive_sync"), ("Черновики замен", "sr_queue"),
+        "schedule": [("Даты и листы расписаний", "ds:manage"), ("Подготовить расписания", "ds:start"),
+                     ("Обновить с Google Диска", "adm_gdrive_sync"), ("Черновики замен", "sr_queue"),
                      ("Запросить черновики", "adm_drafts_retry"),
                      ("Остановить распознавание", "adm_gemini_cancel"),
                      ("Расписание по группам", "adm_schedule_groups"), ("Опубликовать расписание", "adm_sched_publish_all")],

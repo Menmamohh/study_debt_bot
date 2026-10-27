@@ -64,8 +64,8 @@ class SchedulePublicationTests(unittest.IsolatedAsyncioTestCase):
                  text='New schedule', photo=[], caption=None)
         await bot.process_group_schedule_input(msg, self.state, self.telegram)
         data = await self.state.get_data()
-        self.assertFalse(data['schedule_all'])
-        self.assertEqual(data['schedule_groups'], [])
+        self.assertFalse(data['ds_ops'][0]['date_confirmed'])
+        self.assertEqual(data['ds_ops'][0]['groups'], [])
         self.assertIsNone(db.get_group_schedule('ALL'))
         self.telegram.send_message.assert_not_awaited()
 

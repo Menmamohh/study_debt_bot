@@ -2496,8 +2496,12 @@ async def render_group_schedule_view(
     notice: Optional[str] = None,
     version_id: Optional[int] = None,
     schedule_date: Optional[datetime.date] = None,
+    legacy_only: bool = False,
 ):
     """Show the newest publication, or a requested retained version for this user."""
+    if not legacy_only and version_id is None:
+        if await dated_ui.render(target, user, group_name, schedule_date.isoformat() if schedule_date else None):
+            return
     if version_id is None and group_name != "ALL":
         date = schedule_date or gdrive_sync.get_target_study_date()[0]
         approved = await asyncio.to_thread(schedule_review.approved_schedule, group_name, date)
@@ -2944,19 +2948,7 @@ async def cb_admin_sched_publish_all(callback: CallbackQuery, state: FSMContext)
         return
 
     await state.clear()
-    await state.update_data(target_group="SELECT")
-    await state.set_state(Form.waiting_for_group_schedule)
-    text = (
-        "📅 <b>Публикация расписания</b>\n\n"
-        "Отправь расписание одним сообщением: фотографией с подписью или текстом.\n"
-        "Далее выбери группы и подтверди публикацию. До подтверждения рассылка не запускается.\n\n"
-        "<i>Для отмены отправь /cancel.</i>"
-    )
-    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm_sched_cancel")]
-    ])
-    await safe_edit_message(callback, text, reply_markup=cancel_kb)
-    await callback.answer()
+    await dated_ui.start(callback, state)
 
 @dp.callback_query(F.data == "adm_sched_cancel")
 async def cb_admin_sched_cancel(callback: CallbackQuery, state: FSMContext, bot: Bot):
@@ -2977,26 +2969,7 @@ async def cb_admin_sched_edit(callback: CallbackQuery, state: FSMContext):
     if target_group not in {*db.COLLEGE_GROUPS, "ALL"}:
         await callback.answer("Неизвестная группа расписания.", show_alert=True)
         return
-    await state.update_data(target_group=target_group)
-    await state.set_state(Form.waiting_for_group_schedule)
-    
-    text = (
-        f"✏️ <b>Обновление расписания — Группа {html.escape(target_group)}</b> 🎓\n\n"
-        f"Отправь самое актуальное расписание на сегодня/ближайшие дни:\n"
-        f"📸 <b>Фото листа замен/расписания</b> (можно сразу с текстом в подписи!)\n"
-        f"💬 Или просто <b>текстовое сообщение</b> со списком пар и кабинетами.\n\n"
-        f"<b>Пример текста:</b>\n"
-        f"<code>1. Технология отделки мебели (каб. 204)\n"
-        f"2. Экономика организации (каб. 105)\n"
-        f"3. Замена: ТПМ вместо дизайна (каб. 214)</code>\n\n"
-        f"📢 <i>После загрузки бот покажет предпросмотр и запросит подтверждение публикации.</i>\n\n"
-        f"<i>(или отправь /cancel для отмены)</i>"
-    )
-    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"sched_view_{target_group}")]
-    ])
-    await safe_edit_message(callback, text, reply_markup=cancel_kb)
-    await callback.answer()
+    await dated_ui.start(callback, state, group=target_group)
 
 def schedule_publication_admin(callback):
     return (is_admin(callback.from_user) and callback.message
@@ -3043,33 +3016,7 @@ async def process_group_schedule_input(message: Message, state: FSMContext, bot:
         await state.clear()
         await cmd_start(message, state)
         return
-    data = await state.get_data()
-    target_group = data.get("target_group")
-    if target_group not in {*db.COLLEGE_GROUPS, "ALL", "SELECT"}:
-        await state.clear()
-        await show_user_screen(message, "Сеанс завершён. Начни публикацию заново.", reply_markup=kb.back_to_menu_kb())
-        return
-    messages = schedule_album or [message]
-    photos = [item.photo[-1].file_id for item in messages if item.photo]
-    body = "\n\n".join((item.caption if item.photo else item.text).strip()
-                          for item in messages if (item.caption if item.photo else item.text))
-    if not photos and not body:
-        await show_user_screen(message, "Отправь фото или текст расписания.", reply_markup=kb.back_to_menu_kb())
-        return
-    await state.update_data(schedule_body=body, schedule_photos=photos,
-                            schedule_groups=[target_group] if target_group in db.COLLEGE_GROUPS else [],
-                            schedule_all=False, schedule_token=uuid.uuid4().hex[:12])
-    await state.set_state(Form.waiting_for_schedule_audience)
-    preview_ids = []
-    if photos:
-        if len(photos) > 1:
-            sent = await send_tracked_ui(bot, message.chat.id, "send_media_group", media=[InputMediaPhoto(media=p) for p in photos])
-            preview_ids = [item.message_id for item in sent]
-        else:
-            sent = await send_tracked_ui(bot, message.chat.id, "send_photo", photo=photos[0])
-            preview_ids = [sent.message_id]
-    await state.update_data(schedule_preview_ids=preview_ids)
-    await show_schedule_publication_preview(message, state, message.from_user.id)
+    await dated_ui.accept_upload(message, state, bot, schedule_album)
 
 
 schedule_publication_lock = None
@@ -3321,9 +3268,10 @@ async def cb_admin_gdrive_sync(callback: CallbackQuery, bot: Bot):
         f"📁 Всего файлов найдено: <b>{total}</b>\n"
         f"📥 Новых скачано: <b>{new_dl}</b>\n\n"
         f"📋 <b>Актуальные документы:</b>\n" + ("\n".join(lines) if lines else "<i>(файлы не найдены)</i>") + "\n\n"
-        f"💡 <i>Свежие листы замен теперь доступны всем студентам во вкладке «📅 Расписание»!</i>"
+        f"💡 <i>Исходники скачаны. Проверь даты и область изменения, затем подтверди публикацию.</i>"
     )
     await status_msg.edit_text(report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Подготовить листы с датами", callback_data="ds:start")],
         [InlineKeyboardButton(text="📝 Черновики замен", callback_data="sr_queue")],
         *kb.admin_back_rows("schedule"),
     ]))
@@ -3333,7 +3281,7 @@ async def cb_admin_gdrive_sync(callback: CallbackQuery, bot: Bot):
 def schedule_review_kb(review_id, photo_count=0):
     rows = [
         [InlineKeyboardButton(text="✏️ Исправить текст", callback_data=f"sr_edit_{review_id}")],
-        [InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"sr_publish_{review_id}"),
+        [InlineKeyboardButton(text="✅ К датам и предпросмотру", callback_data=f"sr_publish_{review_id}"),
          InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"sr_skip_{review_id}")],
     ]
     for index in range(photo_count):
@@ -3558,12 +3506,8 @@ async def deliver_schedule_notifications(bot):
 
 
 async def notify_synced_schedule(bot, result):
-    if result.get('new_downloaded', 0) > 0:
-        import hashlib, json
-        fingerprint = hashlib.sha256(json.dumps(sorted([tuple(str(item.get(key, '')) for key in ('file_id', 'filename', 'doc_type', 'schedule_date', 'part_number', 'drive_timestamp')) for item in result.get('files', [])]), default=str).encode()).hexdigest()
-        await asyncio.to_thread(schedule_review.enqueue_delivery, f"drive:{fingerprint}",
-            "📅 В боте появились новые листы расписания. Открой исходные листы; текст замен по группам появится после проверки администратора.",
-            "sched_view_ALL")
+    # Sync never publishes inputs or notifies students about unreviewed sheets.
+    # Existing delivery intents from explicitly confirmed publications may retry.
     return await deliver_schedule_notifications(bot)
 
 
@@ -3622,7 +3566,7 @@ async def cb_schedule_review_action(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Некорректная кнопка.", show_alert=True)
         return
     draft = await asyncio.to_thread(schedule_review.get_review, review_id)
-    if not draft or draft['status'] != 'draft' or draft['schedule_date'] < gdrive_sync.get_target_study_date()[0].isoformat():
+    if not draft or draft['status'] != 'draft' or draft['schedule_date'] < schedule_review.review_min_date():
         await callback.answer("Черновик уже обработан, устарел или заменён новым листом.", show_alert=True)
         return
     if action == 'publish' and not draft['body'].strip():
@@ -3636,6 +3580,9 @@ async def cb_schedule_review_action(callback: CallbackQuery, state: FSMContext):
             f"Отправь полный исправленный текст замен для {html.escape(draft['group_name'])} на {draft['schedule_date']}. "
             f"До {schedule_review.MAX_BODY} символов. Для отмены — /cancel.",
             InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отменить правку", callback_data="sr_queue")]]))
+        return
+    if action == 'publish':
+        await dated_ui.import_review(callback, state, draft)
         return
     changed = await asyncio.to_thread(schedule_review.finish_review, review_id, action == 'publish')
     if not changed:
@@ -4946,13 +4893,18 @@ async def gdrive_sync_background_loop(bot: Bot):
                 if ADMIN_ID:
                     try:
                         new_files_str = "\n".join([f"• {f['filename']}" for f in res.get("updated_files", [])])
-                        await send_tracked_ui(bot, ADMIN_ID, "send_message", text=f"📢 <b>Google Диск: обнаружены новые замены!</b>\n\nСкачано новых файлов: <b>{res['new_downloaded']}</b>\n{new_files_str}\n\n<i>Листы замен в боте обновлены автоматически.</i>", parse_mode='HTML')
+                        await send_tracked_ui(bot, ADMIN_ID, "send_message", text=f"📢 <b>Google Диск: обнаружены новые замены!</b>\n\nСкачано новых файлов: <b>{res['new_downloaded']}</b>\n{new_files_str}\n\n<i>Исходники скачаны. Для публикации проверь даты и листы в разделе управления расписаниями.</i>", parse_mode='HTML')
                     except Exception as e:
                         logger.warning(f"Could not notify admin of gdrive sync: {e}")
         except Exception as e:
             logger.error(f"Error in gdrive sync loop: {e}")
 
         await asyncio.sleep(1800)
+
+# Register explicit-date screens before the stale admin callback fallback.
+from dated_schedule_ui import DatedScheduleUI
+dated_ui = DatedScheduleUI(sys.modules[__name__])
+dated_ui.register()
 
 # --- Точка входа ---
 @dp.callback_query(F.data.startswith(("adm_", "admin_", "vug_", "vuc_", "sr_")))

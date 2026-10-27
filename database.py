@@ -18,6 +18,8 @@ def get_connection():
     return conn
 
 def init_db():
+    import dated_schedules
+    dated_schedules.backup_before_migration(DB_PATH)
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("PRAGMA journal_mode = WAL")
@@ -278,6 +280,7 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_users_status_group ON users(status, student_group);
             CREATE INDEX IF NOT EXISTS idx_users_status_name ON users(status, student_name);
         """)
+        dated_schedules.migrate(conn)
         conn.commit()
 
 def get_ui_message_id(user_id: int) -> Optional[int]:
@@ -1893,9 +1896,16 @@ def save_gdrive_file(file_id: str, filename: str, doc_type: str, schedule_date: 
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO gdrive_schedule_files 
+            INSERT INTO gdrive_schedule_files
             (file_id, filename, doc_type, schedule_date, part_number, local_path, file_size, drive_timestamp, downloaded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(file_id) DO UPDATE SET filename=excluded.filename, doc_type=excluded.doc_type,
+                schedule_date=excluded.schedule_date, part_number=excluded.part_number,
+                local_path=excluded.local_path, file_size=excluded.file_size,
+                drive_timestamp=excluded.drive_timestamp,
+                downloaded_at=CASE WHEN gdrive_schedule_files.drive_timestamp<>excluded.drive_timestamp
+                    OR gdrive_schedule_files.file_size<>excluded.file_size THEN CURRENT_TIMESTAMP
+                    ELSE gdrive_schedule_files.downloaded_at END
         """, (file_id, filename, doc_type, schedule_date, part_number, local_path, file_size, drive_timestamp))
         conn.commit()
 
