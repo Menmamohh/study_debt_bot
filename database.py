@@ -58,6 +58,32 @@ def init_db():
                 FOREIGN KEY (task_id) REFERENCES tasks (id) ON DELETE CASCADE
             )
         """)
+        # Additive migration: legacy materials and their IDs are left untouched.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS material_attachments (
+                material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                file_id TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                caption TEXT,
+                PRIMARY KEY (material_id, position)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS material_upload_events (
+                source_key TEXT PRIMARY KEY,
+                material_id INTEGER REFERENCES materials(id) ON DELETE SET NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS material_moderation_messages (
+                material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            )
+        """)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -782,6 +808,84 @@ def add_material(user_id: int, user_name: str, task_id: int, material_type: str,
         """, (user_id, user_name, task_id, material_type, title, file_id, file_type, content_text))
         conn.commit()
         return cursor.lastrowid
+
+def material_upload_seen(source_key: str) -> bool:
+    with get_connection() as conn:
+        return conn.execute("SELECT 1 FROM material_upload_events WHERE source_key = ?",
+                            (source_key,)).fetchone() is not None
+
+
+def create_material_submission(user_id: int, user_name: str, task_id: int, title: str,
+                               source_key: str, attachments: List[Dict],
+                               content_text: Optional[str] = None) -> Optional[int]:
+    """Atomically insert one method and its ordered files; None also means replay."""
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM material_upload_events WHERE source_key = ?", (source_key,)).fetchone():
+            return None
+        if not conn.execute("SELECT 1 FROM tasks WHERE user_id = ? AND id = ?", (user_id, task_id)).fetchone():
+            return None
+        first = attachments[0] if attachments else {}
+        cursor = conn.execute("""
+            INSERT INTO materials (user_id, user_name, task_id, material_type, title,
+                                   file_id, file_type, content_text, status)
+            VALUES (?, ?, ?, 'method', ?, ?, ?, ?, 'pending')
+        """, (user_id, user_name, task_id, title, first.get('file_id'),
+              first.get('file_type', 'text'), content_text))
+        material_id = cursor.lastrowid
+        conn.executemany("""INSERT INTO material_attachments
+            (material_id, position, file_id, file_type, caption) VALUES (?, ?, ?, ?, ?)""",
+            [(material_id, index, item['file_id'], item['file_type'], item.get('caption'))
+             for index, item in enumerate(attachments)])
+        conn.execute("INSERT INTO material_upload_events (source_key, material_id) VALUES (?, ?)",
+                     (source_key, material_id))
+        return material_id
+
+
+def get_material_attachments(material_id: int) -> List[Dict]:
+    with get_connection() as conn:
+        rows = conn.execute("""SELECT file_id, file_type, caption FROM material_attachments
+                               WHERE material_id = ? ORDER BY position""", (material_id,)).fetchall()
+        if rows:
+            return [dict(row) for row in rows]
+        # Existing single photos/documents need no backfill or conversion.
+        row = conn.execute("SELECT file_id, file_type FROM materials WHERE id = ?", (material_id,)).fetchone()
+        return [dict(row)] if row and row['file_id'] else []
+
+
+def track_material_moderation_message(material_id: int, chat_id: int, message_id: int,
+                                      kind: str = 'notification'):
+    with get_connection() as conn:
+        conn.execute("""INSERT OR IGNORE INTO material_moderation_messages
+                        (material_id, chat_id, message_id, kind) VALUES (?, ?, ?, ?)""",
+                     (material_id, chat_id, message_id, kind))
+
+
+def get_material_moderation_messages(material_id: int) -> List[Dict]:
+    with get_connection() as conn:
+        return [dict(row) for row in conn.execute("""SELECT chat_id, message_id, kind
+            FROM material_moderation_messages WHERE material_id = ?""", (material_id,))]
+
+
+def get_pending_material_notification_ids(chat_id: int) -> List[int]:
+    with get_connection() as conn:
+        return [row[0] for row in conn.execute("""SELECT mm.message_id
+            FROM material_moderation_messages mm JOIN materials m ON m.id = mm.material_id
+            WHERE mm.chat_id = ? AND mm.kind = 'notification' AND m.status = 'pending'""", (chat_id,))]
+
+
+def decide_material(material_id: int, status: str) -> bool:
+    if status not in {'approved', 'rejected'}:
+        raise ValueError('Invalid material decision')
+    with get_connection() as conn:
+        changed = conn.execute("UPDATE materials SET status = ? WHERE id = ? AND status = 'pending'",
+                               (status, material_id)).rowcount == 1
+        if changed:
+            conn.execute("""INSERT OR IGNORE INTO ui_message_history (user_id, message_id)
+                            SELECT chat_id, message_id FROM material_moderation_messages
+                            WHERE material_id = ?""", (material_id,))
+        return changed
+
 
 def get_approved_materials(task_id: int) -> List[Dict]:
     """Возвращает проверенные методички и решения для работы (общие для всех пользователей!)"""

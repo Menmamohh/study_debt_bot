@@ -304,8 +304,7 @@ def materials_list_kb(
 def choose_material_type_kb(task_id: int, subject_id: int) -> InlineKeyboardMarkup:
     kb = [
         [
-            InlineKeyboardButton(text="📖 Методичка (задание / теория)", callback_data=f"set_mat_type_method_{task_id}_{subject_id}"),
-            InlineKeyboardButton(text="💡 Решение (готовая работа / шпора)", callback_data=f"set_mat_type_solution_{task_id}_{subject_id}")
+            InlineKeyboardButton(text="📤 Отправить методичку", callback_data=f"set_mat_type_method_{task_id}_{subject_id}")
         ],
         [
             InlineKeyboardButton(text="❌ Отмена", callback_data=f"view_mat_{task_id}_{subject_id}")
@@ -538,6 +537,7 @@ def admin_material_queue_page_kb(materials: List[Dict], page: int, total: int, p
     rows = []
     for material in materials:
         label = _short_label(material.get("title") or f"Материал {material['id']}", 22)
+        rows.append([InlineKeyboardButton(text=f"📖 Открыть: {label}", callback_data=f"adm_material_view_{material['id']}")])
         rows.append([
             InlineKeyboardButton(text=f"✅ {label}", callback_data=f"adm_appr_{material['id']}"),
             InlineKeyboardButton(text="❌", callback_data=f"adm_rejc_{material['id']}"),

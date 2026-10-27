@@ -54,7 +54,7 @@ class StudyNavigationTests(unittest.IsolatedAsyncioTestCase):
                   bot=self.telegram, answer=AsyncMock())
 
     def message(self, text=None, photo=False):
-        return NS(text=text, caption='Мой материал' if photo else None,
+        return NS(message_id=400, media_group_id=None, text=text, caption='Мой материал' if photo else None,
                   photo=[NS(file_id='student-photo')] if photo else None,
                   document=None, from_user=self.user, chat=NS(type='private', id=10),
                   bot=self.telegram)
@@ -187,13 +187,13 @@ class StudyNavigationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f'quick_task_{task}_{subject}',
                           [b.callback_data for b in buttons(render.call_args.kwargs['reply_markup'])])
         cb = self.callback(f'quick_task_{task}_{subject}', photo=True)
-        await bot.cb_quick_task_select(cb)
+        await bot.cb_quick_task_select(cb, self.state)
         self.assert_nav(self.rendered(cb)[1], f'view_mat_{task}_{subject}')
         # The previous per-work upload button is also retained.
         cb = self.callback(f'upload_mat_{task}_{subject}', photo=True)
-        await bot.cb_upload_material(cb)
+        await bot.cb_upload_material(cb, self.state)
         self.assert_nav(self.rendered(cb)[1], f'view_mat_{task}_{subject}')
-        cb = self.callback(f'set_mat_type_solution_{task}_{subject}', photo=True)
+        cb = self.callback(f'set_mat_type_method_{task}_{subject}', photo=True)
         await bot.cb_set_material_type(cb, self.state, self.telegram)
         self.assert_nav(self.rendered(cb)[1], f'view_mat_{task}_{subject}')
         await bot.process_material_file(self.message(photo=True), self.state, self.telegram)
@@ -204,8 +204,8 @@ class StudyNavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created['task_id'], task)
         self.telegram.send_photo.assert_awaited_once()
         self.assertEqual(self.telegram.send_photo.call_args.kwargs['chat_id'], 99)
-        self.assertIsNone(await self.state.get_state())
-        self.assertIn('передан на верификацию', self.screen.call_args.args[1])
+        self.assertEqual(await self.state.get_state(), bot.Form.waiting_for_material_file.state)
+        self.assertIn('передана на верификацию', self.screen.call_args.args[1])
 
     async def test_navigation_replaces_stale_photo_and_returns_home(self):
         db.set_ui_message_id(10, 90)
@@ -268,7 +268,7 @@ class StudyNavigationTests(unittest.IsolatedAsyncioTestCase):
         await bot.cb_show_all_debts(cb, self.state)
         self.assertIn('Работа', self.rendered(cb)[0])
         self.assertIn('Осталось сдать:', self.rendered(cb)[0])
-        await bot.cb_set_material_type(self.callback(f'set_mat_type_solution_{task}_{subject}'), self.state, self.telegram)
+        await bot.cb_set_material_type(self.callback(f'set_mat_type_method_{task}_{subject}'), self.state, self.telegram)
         await bot.process_material_file(self.message('Решение <пример>'), self.state, self.telegram)
         self.assert_nav(self.screen.call_args.kwargs['reply_markup'], f'view_mat_{task}_{subject}')
         await bot.cb_save_text_mat(self.callback(f'save_text_mat_{task}_{subject}'), self.state, self.telegram)
@@ -276,7 +276,7 @@ class StudyNavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(db.get_approved_materials(task)), 0)
         self.telegram.send_message.assert_awaited_once()
         self.assertEqual(self.telegram.send_message.call_args.kwargs['chat_id'], 99)
-        self.assertIsNone(await self.state.get_state())
+        self.assertEqual(await self.state.get_state(), bot.Form.waiting_for_material_file.state)
 
     async def test_all_debts_pagination_and_short_callback(self):
         subject = db.add_subject(10, 'Предмет')

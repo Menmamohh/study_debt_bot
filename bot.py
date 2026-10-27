@@ -24,13 +24,14 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, FSInputFile, InputMediaPhoto, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
+from aiogram.types import Message, CallbackQuery, FSInputFile, InputMediaPhoto, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
 import database as db
 import keyboards as kb
 import gdrive_sync
 import schedule_review
 import schedule_review as gemini_schedule
+from material_albums import MaterialAlbumMiddleware, material_bundle, upload_source_key
 
 
 class AsyncDatabase:
@@ -73,6 +74,7 @@ async def cleanup_user_ui_messages(
     tracked_ids = set(await adb.get_user_ui_message_ids(user_id))
     tracked_ids.update(int(message_id) for message_id in extra_ids if message_id)
     keep_ids = {int(message_id) for message_id in keep_message_ids if message_id}
+    keep_ids.update(await adb.get_pending_material_notification_ids(user_id))
     if keep_message_id:
         keep_ids.add(int(keep_message_id))
     for message_id in sorted(tracked_ids):
@@ -805,6 +807,11 @@ class ScheduleAlbumMiddleware(BaseMiddleware):
 
 
 dp.message.middleware(ScheduleAlbumMiddleware())
+dp.message.outer_middleware(MaterialAlbumMiddleware(
+    {Form.waiting_for_material_file.state, Form.waiting_for_material_title.state,
+     Form.waiting_for_quick_task_title.state},
+    seen=adb.material_upload_seen, revision=adb.get_ui_revision,
+))
 
 # --- Команда /my_id ---
 @dp.message(Command("my_id", "id"))
@@ -1787,7 +1794,7 @@ async def cb_admin_review_queue(callback: CallbackQuery, bot: Bot):
             lines.append(f"{index}. <b>{title}</b> — {subject} / {task}")
         text = "\n".join(lines)
         markup = kb.admin_material_queue_page_kb(materials, page, total, ADMIN_PAGE_SIZE)
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=markup)
     await callback.answer("Очередь загружена!")
 
 def main_menu_description(student_group, summary, markup):
@@ -3974,6 +3981,144 @@ async def cb_view_materials(callback: CallbackQuery, state: FSMContext = None):
     )
 
 
+async def send_material_files(bot, chat_id, attachments, remember):
+    """Remember each successful batch before trying the next send/card."""
+    sent_files = []
+    for start in range(0, len(attachments), 10):
+        batch = attachments[start:start + 10]
+        if len(batch) == 1:
+            item = batch[0]
+            method = 'send_document' if item['file_type'] == 'document' else 'send_photo'
+            argument = 'document' if item['file_type'] == 'document' else 'photo'
+            sent = [await getattr(bot, method)(chat_id=chat_id, **{argument: item['file_id']},
+                                               caption=(item.get('caption') or '')[:1024], parse_mode=None)]
+        else:
+            media = []
+            for item in batch:
+                cls = InputMediaDocument if item['file_type'] == 'document' else InputMediaPhoto
+                media.append(cls(media=item['file_id'], caption=(item.get('caption') or '')[:1024], parse_mode=None))
+            sent = await bot.send_media_group(chat_id=chat_id, media=media)
+        for message in sent:
+            await remember(message)
+            sent_files.append(message)
+    return sent_files
+
+
+def material_review_text(material):
+    kind = 'Методичка' if material['material_type'] == 'method' else 'Решение'
+    text = (f"🔔 <b>Материал на проверке №{material['id']}</b>\n\n"
+            f"👤 <b>От:</b> {html.escape((material.get('user_name') or str(material['user_id']))[:150])}\n"
+            f"📚 <b>Предмет:</b> {html.escape((material.get('subject_name') or '')[:200])}\n"
+            f"📝 <b>Работа:</b> {html.escape((material.get('task_title') or '')[:300])}\n"
+            f"🏷️ <b>Тип:</b> {kind}\n"
+            f"📄 <b>Название:</b> {html.escape(material['title'][:500])}")
+    if material.get('content_text') and material.get('file_type') == 'text':
+        text += '\n\n' + html.escape(material['content_text'][:1800])
+    return text
+
+
+async def send_material_review(bot, admin_id, material, preview=False):
+    async def remember(message):
+        await adb.track_material_moderation_message(material['id'], admin_id, message.message_id,
+                                                    'preview' if preview else 'notification')
+        if preview:
+            await adb.track_ui_message_id(admin_id, message.message_id)
+
+    attachments = await adb.get_material_attachments(material['id'])
+    text = material_review_text(material)
+    markup = kb.admin_verify_kb(material['id'])
+    if preview:
+        markup = InlineKeyboardMarkup(inline_keyboard=[*markup.inline_keyboard,
+            [InlineKeyboardButton(text='🔙 К очереди', callback_data='admin_review_queue')],
+            [InlineKeyboardButton(text='🏠 Главное меню', callback_data='main_menu')]])
+    related = []
+    # Preserve the single-file notification format for old and new materials.
+    if len(attachments) == 1 and not preview:
+        item = attachments[0]
+        method = 'send_document' if item['file_type'] == 'document' else 'send_photo'
+        argument = 'document' if item['file_type'] == 'document' else 'photo'
+        # Long titles belong in a separate text card, beyond Telegram's caption limit.
+        if len(text) <= 1024:
+            card = await getattr(bot, method)(chat_id=admin_id, **{argument: item['file_id']},
+                                             caption=text, parse_mode='HTML', reply_markup=markup)
+            await remember(card)
+            return card, related
+    related = await send_material_files(bot, admin_id, attachments, remember)
+    card = await bot.send_message(chat_id=admin_id, text=text, parse_mode='HTML', reply_markup=markup)
+    await remember(card)
+    return card, related
+
+
+async def save_method_upload(user, task_id, upload, bot):
+    name = f'@{user.username}' if user.username else (user.full_name or str(user.id))
+    title = upload.get('caption') or 'Методичка'
+    material_id = await adb.create_material_submission(user.id, name, task_id, title,
+        upload['source_key'], upload['attachments'], upload.get('content_text'))
+    if material_id is None:
+        return None
+    admin_id = await adb.get_admin_id() or ADMIN_ID
+    if admin_id:
+        try:
+            await send_material_review(bot, admin_id, await adb.get_material_by_id(material_id))
+        except Exception:
+            logger.exception('Material %s saved; admin notification incomplete, available in queue', material_id)
+    return material_id
+
+
+async def material_upload_success(target, subject_id):
+    await show_user_screen(target,
+        '🚀 <b>Методичка сохранена и передана на верификацию!</b>\n\n'
+        'После одобрения администратором все её файлы станут доступны студентам.\n'
+        'Можно отправить следующую методичку к этой работе или вернуться в меню.',
+        reply_markup=kb.material_sent_success_kb(subject_id))
+
+
+async def begin_material_upload(callback, state, task_id, subject_id):
+    if not await is_tt36_student(callback.from_user):
+        await reject_non_tt36(callback)
+        return
+    task = await adb.get_task_info_for_subject(callback.from_user.id, subject_id, task_id)
+    if not task:
+        await callback.answer('Работа не найдена в этом предмете.', show_alert=True)
+        return
+    data = await state.get_data()
+    queued = data.get('unsolicited_uploads', [])
+    # Compatibility with a pending single photo captured by an older process.
+    if not queued and data.get('unsolicited_photo_id'):
+        queued = [dict(source_key=f"legacy:{callback.from_user.id}:{data['unsolicited_photo_id']}",
+                       caption=data.get('unsolicited_caption') or 'Фото методички',
+                       attachments=[dict(file_id=data['unsolicited_photo_id'], file_type='photo')])]
+    await state.set_data(dict(mat_type='method', task_id=task_id, subject_id=subject_id,
+                              material_upload_session=uuid.uuid4().hex))
+    await state.set_state(Form.waiting_for_material_file)
+    if queued:
+        for upload in queued:
+            await save_method_upload(callback.from_user, task_id, upload, callback.bot)
+        await material_upload_success(callback, subject_id)
+        return
+    await safe_edit_message(callback,
+        '📤 <b>Отправь методичку</b>\n\n'
+        'Прикрепи фотографию, альбом фотографий или документ. '
+        'Название можно написать в подписи к любому фото или отправить заранее текстом.\n\n'
+        'Каждый альбом и каждый отдельный файл проходят отдельную проверку.\n'
+        '(или отправь /cancel для отмены)',
+        reply_markup=kb.study_back_kb(f'view_mat_{task_id}_{subject_id}', '🔙 К материалам работы'))
+
+
+@dp.callback_query(F.data.regexp(r'^adm_material_view_\d+$'))
+async def cb_admin_view_material(callback: CallbackQuery, bot: Bot):
+    if not is_admin(callback.from_user) or callback.message.chat.type != 'private':
+        await callback.answer('Доступ только администратору в личном чате.', show_alert=True)
+        return
+    material = await adb.get_material_by_id(int(callback.data.rsplit('_', 1)[1]))
+    if not material or material['status'] != 'pending':
+        await callback.answer('Заявка уже обработана или недоступна.', show_alert=True)
+        return
+    card, related = await send_material_review(bot, callback.from_user.id, material, preview=True)
+    await finish_ui_transition(callback, card, related)
+    await callback.answer()
+
+
 # --- Скачивание / получение материала ---
 @dp.callback_query(F.data.startswith("dl_mat_"))
 async def cb_download_material(callback: CallbackQuery):
@@ -4004,6 +4149,16 @@ async def cb_download_material(callback: CallbackQuery):
     reply_markup = kb.material_downloaded_kb(subject_name, material_id=mat_id, is_admin_user=is_adm)
     
     sent = None
+    attachments = await adb.get_material_attachments(mat_id)
+    if len(attachments) > 1:
+        async def remember(message):
+            await adb.track_ui_message_id(callback.from_user.id, message.message_id)
+        related = await send_material_files(callback.bot, callback.from_user.id, attachments, remember)
+        sent = await send_tracked_ui(callback.bot, callback.from_user.id, text=caption,
+                                     parse_mode='HTML', reply_markup=reply_markup)
+        await finish_ui_transition(callback, sent, related)
+        await callback.answer('Методичка отправлена в чат!')
+        return
     if mat["file_type"] == "document" and mat["file_id"]:
         sent = await callback.message.answer_document(document=mat["file_id"], caption=caption, parse_mode="HTML", reply_markup=reply_markup)
     elif mat["file_type"] == "photo" and mat["file_id"]:
@@ -4095,7 +4250,7 @@ async def cb_admin_manage_materials(callback: CallbackQuery):
         text = (
             "<b>Админка › Материалы › База знаний</b>\n\n"
             "В базе сейчас <b>нет опубликованных материалов</b>.\n\n"
-            "Когда студенты добавят методички или решения и они будут одобрены, "
+            "Когда студенты добавят методички и они будут одобрены, "
             "здесь появится список предметов для быстрого удаления устаревших файлов."
         )
     else:
@@ -4298,7 +4453,7 @@ async def cb_quick_sub_select(callback: CallbackQuery, state: FSMContext):
     else:
         text = (
             f"📚 <b>Предмет:</b> {safe_name}\n\n"
-            f"Выбери работу, к которой хочешь прикрепить методичку или решение 👇"
+            f"Выбери работу, к которой хочешь прикрепить методичку 👇"
         )
         await safe_edit_message(callback,
             text, parse_mode="HTML",
@@ -4308,27 +4463,9 @@ async def cb_quick_sub_select(callback: CallbackQuery, state: FSMContext):
 
 
 @dp.callback_query(F.data.startswith("quick_task_"))
-async def cb_quick_task_select(callback: CallbackQuery):
+async def cb_quick_task_select(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
-    task_id = int(parts[2])
-    subject_id = int(parts[3])
-    
-    task_info = await adb.get_task_info_for_subject(callback.from_user.id, subject_id, task_id)
-    if not task_info:
-        await callback.answer("Работа не найдена!", show_alert=True)
-        return
-        
-    safe_title = html.escape(task_info["title"])
-    safe_sub = html.escape(task_info["subject_name"])
-    
-    text = (
-        f"📤 <b>Загрузка материала к работе:</b>\n"
-        f"«{safe_title}» (<i>{safe_sub}</i>)\n\n"
-        f"• <b>📖 Методичка</b> — задание, методические указания, теория.\n"
-        f"• <b>💡 Решение</b> — готовая работа, правильный вариант, расчетка, код.\n\n"
-        f"<i>Все материалы проходят верификацию перед публикацией.</i>"
-    )
-    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.choose_material_type_kb(task_id, subject_id))
+    await begin_material_upload(callback, state, int(parts[2]), int(parts[3]))
 
 
 @dp.callback_query(F.data.startswith("quick_new_task_"))
@@ -4357,419 +4494,145 @@ async def cb_quick_new_task(callback: CallbackQuery, state: FSMContext):
 
 
 @dp.message(Form.waiting_for_quick_task_title)
-async def process_quick_task_title(message: Message, state: FSMContext, bot: Bot):
+async def process_quick_task_title(message: Message, state: FSMContext, bot: Bot, material_upload=None):
     if message.text and message.text.startswith("/"):
         await state.clear()
         await cmd_start(message, state)
         return
-        
     data = await state.get_data()
     subject_id = data.get("subject_id")
-    user_id = message.from_user.id
-    
-    raw_title = ""
-    photo_id = None
-    if message.photo:
-        photo_id = message.photo[-1].file_id
-        raw_title = message.caption.strip() if message.caption else "Лабораторная работа"
-    elif message.document:
-        photo_id = message.document.file_id
-        raw_title = message.caption.strip() if message.caption else (message.document.file_name or "Новый документ")
-    elif message.text:
-        raw_title = message.text.strip()
-        
-    if not raw_title:
-        await show_user_screen(message, "⚠️ Отправь название текстом или прикрепи фотографию/файл с подписью.", reply_markup=kb.study_back_kb("quick_upload_material", "🔙 К выбору предмета"))
+    upload = material_upload or (material_bundle([message]) if message.photo or message.document else None)
+    if upload and await adb.material_upload_seen(upload['source_key']):
         return
-    subject = await adb.get_subject_by_id(user_id, subject_id) if subject_id else None
+    raw_title = (upload['caption'] if upload else '') or (message.text or '').strip()
+    if not raw_title and message.document:
+        raw_title = message.document.file_name or "Методичка"
+    if not raw_title and message.photo:
+        raw_title = "Методичка"
+    subject = await adb.get_subject_by_id(message.from_user.id, subject_id) if subject_id else None
+    back = kb.study_back_kb("quick_upload_material", "🔙 К выбору предмета")
     if not subject:
         await state.clear()
-        await show_user_screen(message, "⚠️ Предмет не найден или уже удалён. Начни загрузку заново.", reply_markup=kb.study_back_kb("quick_upload_material", "🔙 К выбору предмета"))
+        await show_user_screen(message, "⚠️ Предмет не найден. Начни загрузку заново.", reply_markup=back)
         return
-
-    task_id = await adb.add_task(user_id, subject_id, raw_title)
+    if not raw_title:
+        await show_user_screen(message, "✍️ Отправь название работы или методичку с подписью.", reply_markup=back)
+        return
+    task_id = await adb.add_task(message.from_user.id, subject_id, raw_title)
     if task_id is None:
-        await state.clear()
-        await show_user_screen(message, "⚠️ Не удалось создать работу. Проверь предмет и попробуй ещё раз.", reply_markup=kb.study_back_kb("quick_upload_material", "🔙 К выбору предмета"))
+        await show_user_screen(message, "⚠️ Не удалось создать работу.", reply_markup=back)
         return
-    safe_sub = html.escape(subject["name"])
-    safe_title = html.escape(raw_title)
-    
-    # Если вместе с названием сразу скинули фото — сохраняем фото в state!
-    if photo_id:
-        await state.update_data(
-            subject_id=subject_id,
-            task_id=task_id,
-            unsolicited_photo_id=photo_id,
-            unsolicited_caption=raw_title
-        )
-        text = (
-            f"✅ Работа <b>«{safe_title}»</b> ({safe_sub}) создана и фото получено!\n\n"
-            f"📤 <b>Что это за материал?</b>\n"
-            f"• <b>📖 Методичка</b> — задание / указания.\n"
-            f"• <b>💡 Решение</b> — готовая работа / расчетка / шпора."
-        )
-        await show_user_screen(message, text, reply_markup=kb.choose_material_type_kb(task_id, subject_id))
-        return
-        
-    # Если прислали просто название текстом:
-    await state.clear()
-    text = (
-        f"✅ Работа <b>«{safe_title}»</b> ({safe_sub}) создана!\n\n"
-        f"📤 <b>Что ты хочешь прикрепить к этой работе?</b>\n\n"
-        f"• <b>📖 Методичка</b> — официальное задание, требования преподавателя, методические указания.\n"
-        f"• <b>💡 Решение</b> — готовая работа, правильный вариант, расчетка, шпаргалка или код.\n\n"
-        f"<i>Все материалы проходят верификацию перед публикацией.</i>"
-    )
-    await show_user_screen(message, text, reply_markup=kb.choose_material_type_kb(task_id, subject_id))
+    queued = data.get('unsolicited_uploads', [])
+    await state.set_data(dict(task_id=task_id, subject_id=subject_id, mat_type='method',
+                              material_upload_origin=upload.get('origin_revision') if upload else None,
+                              material_upload_session=uuid.uuid4().hex))
+    await state.set_state(Form.waiting_for_material_file)
+    if upload:
+        queued = [*queued, upload]
+    if queued:
+        for item in queued:
+            await save_method_upload(message.from_user, task_id, item, bot)
+        await material_upload_success(message, subject_id)
+    else:
+        await show_user_screen(message,
+            f"✅ Работа «{html.escape(raw_title[:500])}» создана.\n\n"
+            "📤 Отправь методичку: фотографию, альбом фотографий или документ. Подпись можно добавить к любому фото.",
+            reply_markup=kb.study_back_kb(f"view_mat_{task_id}_{subject_id}", "🔙 К материалам работы"))
 
 # --- Начать процесс предложения материала из карточки работы ---
 @dp.callback_query(F.data.startswith("upload_mat_"))
-async def cb_upload_material(callback: CallbackQuery):
-    if not await is_tt36_student(callback.from_user):
-        await reject_non_tt36(callback)
-        return
-
+async def cb_upload_material(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
-    task_id = int(parts[2])
-    subject_id = int(parts[3])
-    task_info = await adb.get_task_info_for_subject(callback.from_user.id, subject_id, task_id)
-    if not task_info:
-        await callback.answer("Работа не найдена в этом предмете.", show_alert=True)
-        return
-    
-    text = (
-        "📤 <b>Что ты хочешь предложить к этой работе?</b>\n\n"
-        "• <b>📖 Методичка</b> — официальное задание, требования преподавателя, методические указания.\n"
-        "• <b>💡 Решение</b> — готовая работа, правильный вариант, расчетка, шпаргалка или код.\n\n"
-        "<i>Все материалы проходят верификацию перед публикацией.</i>"
-    )
-    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.choose_material_type_kb(task_id, subject_id))
+    await begin_material_upload(callback, state, int(parts[2]), int(parts[3]))
 
 
 @dp.callback_query(F.data.startswith("set_mat_type_"))
 async def cb_set_material_type(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    if not await is_tt36_student(callback.from_user):
-        await reject_non_tt36(callback)
-        return
-
     parts = callback.data.split("_")
-    mat_type = parts[3] # 'method' or 'solution'
-    task_id = int(parts[4])
-    subject_id = int(parts[5])
-    task_info = await adb.get_task_info_for_subject(callback.from_user.id, subject_id, task_id)
-    if mat_type not in {"method", "solution"} or not task_info:
-        await callback.answer("Работа не найдена в этом предмете.", show_alert=True)
+    if parts[3] != "method":
+        await callback.answer("Добавление решений больше недоступно. Можно отправить методичку.", show_alert=True)
         return
-    
-    data = await state.get_data()
-    unsolicited_photo_id = data.get("unsolicited_photo_id")
-    unsolicited_caption = data.get("unsolicited_caption")
-    
-    # Если пользователь ранее просто скинул фото в чат и выбрал для него предмет/работу:
-    if unsolicited_photo_id:
-        user_id = callback.from_user.id
-        user_name = callback.from_user.username or callback.from_user.full_name or f"User_{user_id}"
-        if callback.from_user.username:
-            user_name = f"@{callback.from_user.username}"
-            
-        default_title = "Фото методички" if mat_type == "method" else "Фото решения"
-        title = unsolicited_caption if unsolicited_caption else default_title
-        
-        mat_id = await adb.add_material(
-            user_id=user_id,
-            user_name=user_name,
-            task_id=task_id,
-            material_type=mat_type,
-            title=title,
-            file_id=unsolicited_photo_id,
-            file_type="photo",
-            content_text=None
-        )
-        if mat_id is None:
-            await callback.answer("Работа не найдена или уже удалена.", show_alert=True)
-            return
-        await state.clear()
-        
-        task_info = await adb.get_task_info(task_id)
-        safe_sub = html.escape(task_info["subject_name"]) if task_info else ""
-        safe_task = html.escape(task_info["title"]) if task_info else ""
-        
-        # 1. Сообщение пользователю с обратной связью от Менмы
-        await safe_edit_message(callback,
-            "🚀 <b>Фотография успешно отправлена!</b>\n\n"
-            "💬 <b>Сообщение от Менмы:</b>\n"
-            "<i>«Щас проверю 😎🤙»</i>\n\n"
-            "⏳ Твоё фото передано на верификацию к @Menmamoh. Как только он нажмёт «Одобрить», оно появится в боте у всех студентов!",
-            parse_mode="HTML",
-            reply_markup=kb.material_sent_success_kb(subject_id)
-        )
-        
-        # 2. Уведомление Менме
-        admin_id = await adb.get_admin_id() or ADMIN_ID
-        if admin_id:
-            icon = "📖" if mat_type == "method" else "💡"
-            type_str = "Методичка" if mat_type == "method" else "Решение"
-            adm_text = (
-                f"🔔 <b>НОВЫЙ МАТЕРИАЛ НА ВЕРИФИКАЦИЮ!</b>\n\n"
-                f"👤 <b>От:</b> {html.escape(user_name)} (<code>{user_id}</code>)\n"
-                f"📚 <b>Предмет:</b> {safe_sub}\n"
-                f"📝 <b>Работа:</b> {safe_task}\n"
-                f"🏷️ <b>Тип:</b> {icon} {type_str}\n"
-                f"📄 <b>Название:</b> {html.escape(title)}\n"
-            )
-            try:
-                await bot.send_photo(chat_id=admin_id, photo=unsolicited_photo_id, caption=adm_text, parse_mode="HTML", reply_markup=kb.admin_verify_kb(mat_id))
-            except Exception as e:
-                logger.error(f"Failed to notify admin {admin_id}: {e}")
-                
-        return
-
-    # Обычный сценарий: сразу просим скинуть фото с названием в одном сообщении
-    await state.update_data(
-        mat_type=mat_type,
-        task_id=task_id,
-        subject_id=subject_id
-    )
-    await state.set_state(Form.waiting_for_material_file)
-    
-    text = (
-        "📸 <b>Скинь фото и название сразу в одном сообщении!</b>\n\n"
-        "1. Прикрепи <b>фотографию</b> (тетрадки, экрана или задания) 📷.\n"
-        "2. В поле подписи к фото напиши название работы или варианта.\n\n"
-        "<i>💡 Можно отправить и без подписи — бот сам назовёт «Фото решения».</i>\n"
-        "<i>💡 Или можешь сначала написать название текстом, а следующим сообщением скинуть фото!</i>\n\n"
-        "<i>(или отправь /cancel для отмены)</i>"
-    )
-    await safe_edit_message(callback, text, parse_mode="HTML", reply_markup=kb.study_back_kb(f"view_mat_{task_id}_{subject_id}", "🔙 К материалам работы"))
+    await begin_material_upload(callback, state, int(parts[4]), int(parts[5]))
 
 
 @dp.message(Form.waiting_for_material_title)
-async def process_material_title(message: Message, state: FSMContext, bot: Bot):
-    if message.text and message.text.startswith("/"):
-        await state.clear()
-        await cmd_start(message, state)
-        return
-        
-    data = await state.get_data()
-    task_id, subject_id = data.get("task_id"), data.get("subject_id")
-    if message.photo or message.document:
-        await process_material_file(message, state, bot)
-        return
-    if not message.text or not message.text.strip():
-        await show_user_screen(message, "⚠️ Отправь название текстом или прикрепи фотографию/файл.", reply_markup=kb.study_back_kb(f"view_mat_{task_id}_{subject_id}", "🔙 К материалам работы"))
-        return
-
-    title = message.text.strip()
-    await state.update_data(mat_title=title)
-    await state.set_state(Form.waiting_for_material_file)
-    
-    text = (
-        f"✍️ Название <b>«{html.escape(title)}»</b> принято!\n\n"
-        f"📸 Теперь <b>скинь фотографию</b> (или файл) 📷 👇\n\n"
-        f"<i>(или отправь /cancel для отмены)</i>"
-    )
-    await show_user_screen(message, text, reply_markup=kb.study_back_kb(f"view_mat_{task_id}_{subject_id}", "🔙 К материалам работы"))
+async def process_material_title(message: Message, state: FSMContext, bot: Bot, material_upload=None):
+    # Compatibility with sessions started before the new upload flow.
+    await process_material_file(message, state, bot, material_upload=material_upload)
 
 @dp.message(Form.waiting_for_material_file)
-async def process_material_file(message: Message, state: FSMContext, bot: Bot):
+async def process_material_file(message: Message, state: FSMContext, bot: Bot, material_upload=None):
     if message.text and message.text.startswith("/"):
         await state.clear()
         await cmd_start(message, state)
         return
-        
     data = await state.get_data()
-    mat_type = data.get("mat_type", "solution")
-    task_id = data.get("task_id")
-    subject_id = data.get("subject_id")
-    title = data.get("mat_title")
-    
-    user_id = message.from_user.id
-    task_info = await adb.get_task_info_for_subject(user_id, subject_id, task_id) if subject_id else None
-    if not task_info:
+    if data.get('mat_type') != 'method':
         await state.clear()
-        await show_user_screen(message, "⚠️ Работа больше недоступна. Начни загрузку материала заново.", reply_markup=kb.study_back_kb("browse_materials_hub", "🔙 К методичкам и решениям"))
+        await show_user_screen(message, "Добавление решений больше недоступно. Начни загрузку методички заново.",
+                               reply_markup=kb.study_back_kb('quick_upload_material', '📤 Отправить методичку'))
         return
-
-    user_name = message.from_user.username or message.from_user.full_name or f"User_{user_id}"
-    if message.from_user.username:
-        user_name = f"@{message.from_user.username}"
-        
-    file_id = None
-    file_type = "text"
-    content_text = None
-    default_title = "Фото методички" if mat_type == "method" else "Фото решения"
-    
-    # 1. Если прислали фото (с подписью или без)
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        file_type = "photo"
-        # Если к фото прикреплена подпись — она в приоритете как название!
-        if message.caption and message.caption.strip():
-            title = message.caption.strip()
-        elif not title:
-            title = default_title
-            
-    # 2. Если прислали документ (PDF, Word и т.д.)
-    elif message.document:
-        file_id = message.document.file_id
-        file_type = "document"
-        content_text = message.document.file_name
-        if message.caption and message.caption.strip():
-            title = message.caption.strip()
-        elif not title:
-            title = message.document.file_name or ("Методичка" if mat_type == "method" else "Решение")
-            
-    # 3. Если прислали текст (название перед фото или текстовое решение)
-    elif message.text:
-        text_val = message.text.strip()
-        if not title:
-            # Сохраняем введенный текст как название, просим скинуть фото и даем кнопку сохранить только текстом
-            await state.update_data(mat_title=text_val)
-            safe_entered_title = html.escape(text_val)
-            await show_user_screen(
-                message,
-                f"✍️ Название <b>«{safe_entered_title}»</b> принято!\n\n"
-                f"📸 Теперь просто <b>прикрепи фотографию</b> (или файл) к этому названию 📷 👇\n\n"
-                f"<i>(Или нажми кнопку ниже, если хочешь отправить материал только текстом без фото)</i>",
-                reply_markup=kb.text_only_or_cancel_kb(task_id, subject_id)
-            )
+    task_id, subject_id = data.get('task_id'), data.get('subject_id')
+    task = await adb.get_task_info_for_subject(message.from_user.id, subject_id, task_id) if subject_id else None
+    if not task:
+        await state.clear()
+        await show_user_screen(message, "⚠️ Работа больше недоступна. Начни загрузку заново.",
+                               reply_markup=kb.study_back_kb('browse_materials_hub', '🔙 К материалам'))
+        return
+    if message.photo or message.document:
+        upload = material_upload or material_bundle([message])
+        if await adb.material_upload_seen(upload['source_key']):
             return
-        else:
-            file_type = "text"
-            content_text = text_val
+        if not upload['caption']:
+            upload = dict(upload, caption=data.get('mat_title') or
+                          (message.document.file_name if message.document else '') or 'Фото методички')
+    elif message.text and message.text.strip():
+        title = message.text.strip()
+        if not data.get('mat_title'):
+            await state.update_data(mat_title=title)
+            await show_user_screen(message,
+                f"✍️ Название «{html.escape(title[:500])}» принято. Теперь отправь фото, альбом или документ.",
+                reply_markup=kb.text_only_or_cancel_kb(task_id, subject_id))
+            return
+        upload = dict(source_key=upload_source_key(message), attachments=[],
+                      caption=data['mat_title'], content_text=title)
     else:
-        await show_user_screen(message, "⚠️ Пожалуйста, просто скинь фотографию, документ или текст.", reply_markup=kb.study_back_kb(f"view_mat_{task_id}_{subject_id}", "🔙 К материалам работы"))
+        await show_user_screen(message, "📤 Отправь фотографию, альбом фотографий, документ или текст методички.",
+                               reply_markup=kb.study_back_kb(f'view_mat_{task_id}_{subject_id}', '🔙 К материалам работы'))
         return
-        
-    # Сохраняем в базу со статусом 'pending'
-    mat_id = await adb.add_material(
-        user_id=user_id,
-        user_name=user_name,
-        task_id=task_id,
-        material_type=mat_type,
-        title=title,
-        file_id=file_id,
-        file_type=file_type,
-        content_text=content_text
-    )
-    if mat_id is None:
-        await state.clear()
-        await show_user_screen(message, "⚠️ Не удалось сохранить материал: работа не найдена.", reply_markup=kb.study_back_kb(f"view_mat_{task_id}_{subject_id}", "🔙 К материалам работы"))
+    material_id = await save_method_upload(message.from_user, task_id, upload, bot)
+    if material_id is None:
         return
-    await state.clear()
-    
-    task_info = await adb.get_task_info(task_id)
-    safe_sub = html.escape(task_info["subject_name"]) if task_info else ""
-    safe_task = html.escape(task_info["title"]) if task_info else ""
-    
-    # 1. Сообщение пользователю с обратной связью от Менмы
-    await show_user_screen(
-        message,
-        "🚀 <b>Материал успешно отправлен!</b>\n\n"
-        "💬 <b>Сообщение от Менмы:</b>\n"
-        "<i>«Щас проверю 😎🤙»</i>\n\n"
-        "⏳ Твой файл передан на верификацию к @Menmamoh. Как только он нажмёт «Одобрить», материал сразу появится в базе знаний бота у всех студентов!",
-        reply_markup=kb.material_sent_success_kb(subject_id)
-    )
-    
-    # 2. Мгновенное уведомление администратору на модерацию
-    admin_id = await adb.get_admin_id() or ADMIN_ID
-    if admin_id:
-        icon = "📖" if mat_type == "method" else "💡"
-        type_str = "Методичка" if mat_type == "method" else "Решение"
-        
-        adm_text = (
-            f"🔔 <b>НОВЫЙ МАТЕРИАЛ НА ВЕРИФИКАЦИЮ!</b>\n\n"
-            f"👤 <b>От:</b> {html.escape(user_name)} (<code>{user_id}</code>)\n"
-            f"📚 <b>Предмет:</b> {safe_sub}\n"
-            f"📝 <b>Работа:</b> {safe_task}\n"
-            f"🏷️ <b>Тип:</b> {icon} {type_str}\n"
-            f"📄 <b>Название:</b> {html.escape(title)}\n"
-        )
-        if content_text and file_type == "text":
-            adm_text += f"\n💬 <b>Содержимое:</b>\n{html.escape(content_text)}"
-            
-        try:
-            if file_type == "document" and file_id:
-                await bot.send_document(chat_id=admin_id, document=file_id, caption=adm_text, parse_mode="HTML", reply_markup=kb.admin_verify_kb(mat_id))
-            elif file_type == "photo" and file_id:
-                await bot.send_photo(chat_id=admin_id, photo=file_id, caption=adm_text, parse_mode="HTML", reply_markup=kb.admin_verify_kb(mat_id))
-            else:
-                await bot.send_message(chat_id=admin_id, text=adm_text, parse_mode="HTML", reply_markup=kb.admin_verify_kb(mat_id))
-        except Exception as e:
-            logger.error(f"Failed to notify admin {admin_id}: {e}")
+    # Keep the chosen work available for another, separate upload until navigation.
+    await state.update_data(mat_title=None)
+    await state.set_state(Form.waiting_for_material_file)
+    await material_upload_success(message, subject_id)
 
 # --- Если пользователь выбрал сохранить введенный текст без фото ---
 @dp.callback_query(F.data.startswith("save_text_mat_"))
 async def cb_save_text_mat(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    parts = callback.data.split("_")
-    task_id = int(parts[3])
-    subject_id = int(parts[4])
-    
+    parts = callback.data.split('_')
+    task_id, subject_id = int(parts[3]), int(parts[4])
     data = await state.get_data()
-    title = data.get("mat_title") or "Текстовое решение"
-    mat_type = data.get("mat_type", "solution")
-    
-    user_id = callback.from_user.id
-    if data.get("task_id") != task_id or data.get("subject_id") != subject_id or mat_type not in {"method", "solution"}:
-        await callback.answer("Сеанс загрузки завершён. Начни заново.", show_alert=True)
+    if data.get('mat_type') == 'solution':
+        await callback.answer('Добавление решений больше недоступно.', show_alert=True)
         return
-    task_info = await adb.get_task_info_for_subject(user_id, subject_id, task_id)
-    if not task_info:
-        await callback.answer("Работа не найдена или уже удалена.", show_alert=True)
+    if (data.get('mat_type') != 'method' or not data.get('mat_title')
+            or data.get('task_id') != task_id or data.get('subject_id') != subject_id):
+        await callback.answer('Сеанс загрузки завершён. Начни заново.', show_alert=True)
         return
-    user_name = callback.from_user.username or callback.from_user.full_name or f"User_{user_id}"
-    if callback.from_user.username:
-        user_name = f"@{callback.from_user.username}"
-        
-    mat_id = await adb.add_material(
-        user_id=user_id,
-        user_name=user_name,
-        task_id=task_id,
-        material_type=mat_type,
-        title=title,
-        file_id=None,
-        file_type="text",
-        content_text=title
-    )
-    if mat_id is None:
-        await callback.answer("Не удалось сохранить материал.", show_alert=True)
+    task = await adb.get_task_info_for_subject(callback.from_user.id, subject_id, task_id)
+    if not task:
+        await callback.answer('Работа не найдена.', show_alert=True)
         return
-    await state.clear()
-    
-    task_info = await adb.get_task_info(task_id)
-    safe_sub = html.escape(task_info["subject_name"]) if task_info else ""
-    safe_task = html.escape(task_info["title"]) if task_info else ""
-    
-    # 1. Сообщение пользователю
-    await safe_edit_message(callback,
-        "🚀 <b>Текстовый материал успешно отправлен!</b>\n\n"
-        "💬 <b>Сообщение от Менмы:</b>\n"
-        "<i>«Щас проверю 😎🤙»</i>\n\n"
-        "⏳ Твой материал передан на верификацию к @Menmamoh. Как только он нажмёт «Одобрить», он появится в базе бота!",
-        parse_mode="HTML",
-        reply_markup=kb.material_sent_success_kb(subject_id)
-    )
-    
-    # 2. Уведомление администратору
-    admin_id = await adb.get_admin_id() or ADMIN_ID
-    if admin_id:
-        icon = "📖" if mat_type == "method" else "💡"
-        type_str = "Методичка" if mat_type == "method" else "Решение"
-        adm_text = (
-            f"🔔 <b>НОВЫЙ МАТЕРИАЛ НА ВЕРИФИКАЦИЮ!</b>\n\n"
-            f"👤 <b>От:</b> {html.escape(user_name)} (<code>{user_id}</code>)\n"
-            f"📚 <b>Предмет:</b> {safe_sub}\n"
-            f"📝 <b>Работа:</b> {safe_task}\n"
-            f"🏷️ <b>Тип:</b> {icon} {type_str}\n"
-            f"📄 <b>Название:</b> {html.escape(title)}\n\n"
-            f"💬 <b>Текст:</b>\n{html.escape(title)}"
-        )
-        try:
-            await bot.send_message(chat_id=admin_id, text=adm_text, parse_mode="HTML", reply_markup=kb.admin_verify_kb(mat_id))
-        except Exception as e:
-            logger.error(f"Failed to notify admin {admin_id}: {e}")
+    title = data['mat_title']
+    upload = dict(source_key=f'text:{callback.from_user.id}:{callback.message.chat.id}:{callback.message.message_id}',
+                  attachments=[], caption=title, content_text=title)
+    if await save_method_upload(callback.from_user, task_id, upload, bot) is not None:
+        await state.update_data(mat_title=None)
+        await material_upload_success(callback, subject_id)
+    else:
+        await callback.answer('Материал уже обработан.', show_alert=True)
             
 
 # --- Обработка верификации админом ---
@@ -4785,7 +4648,9 @@ async def cb_admin_approve(callback: CallbackQuery, bot: Bot):
         await callback.answer("Материал не найден!", show_alert=True)
         return
         
-    await adb.set_material_status(mat_id, "approved")
+    if not await adb.decide_material(mat_id, "approved"):
+        await callback.answer("Заявка уже обработана.", show_alert=True)
+        return
     await adb.track_ui_message_id(callback.message.chat.id, callback.message.message_id)
     
     # Редактируем сообщение у админа
@@ -4827,7 +4692,9 @@ async def cb_admin_reject(callback: CallbackQuery, bot: Bot):
         await callback.answer("Материал не найден!", show_alert=True)
         return
         
-    await adb.set_material_status(mat_id, "rejected")
+    if not await adb.decide_material(mat_id, "rejected"):
+        await callback.answer("Заявка уже обработана.", show_alert=True)
+        return
     await adb.track_ui_message_id(callback.message.chat.id, callback.message.message_id)
     
     # Редактируем сообщение у админа
@@ -4858,34 +4725,25 @@ async def cb_admin_reject(callback: CallbackQuery, bot: Bot):
 
 # --- Если студент просто скинул фото в чат (без кнопок) ---
 @dp.message(F.photo)
-async def cb_photo_unsolicited(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state:
-        # Если бот уже ожидает какое-то другое действие от пользователя
+async def cb_photo_unsolicited(message: Message, state: FSMContext, material_upload=None):
+    if await state.get_state() or not await is_tt36_student(message.from_user):
         return
-        
-    if not await is_tt36_student(message.from_user):
+    upload = material_upload or material_bundle([message])
+    if await adb.material_upload_seen(upload['source_key']):
         return
-
-    user_id = message.from_user.id
-    u_rec = await adb.get_user(user_id)
-    s_grp = u_rec.get("student_group") if u_rec else None
-    await adb.seed_default_subjects(user_id, student_group=s_grp)
-    subjects = await adb.get_subjects_with_counts(user_id)
-    
-    file_id = message.photo[-1].file_id
-    caption = message.caption.strip() if message.caption else None
-    await state.update_data(
-        unsolicited_photo_id=file_id,
-        unsolicited_caption=caption
-    )
-    
-    text = (
-        "📸 <b>Вижу фотографию!</b>\n\n"
-        "К какому предмету относится это решение или методичка?\n"
-        "Выбери предмет ниже 👇"
-    )
-    await show_user_screen(message, text, reply_markup=kb.quick_subjects_select_kb(subjects))
+    data = await state.get_data()
+    queued = data.get('unsolicited_uploads', [])
+    if any(item['source_key'] == upload['source_key'] for item in queued):
+        return
+    queued = [*queued, upload]
+    await state.update_data(unsolicited_uploads=queued)
+    user = await adb.get_user(message.from_user.id)
+    await adb.seed_default_subjects(message.from_user.id, student_group=user.get('student_group') if user else None)
+    subjects = await adb.get_subjects_with_counts(message.from_user.id)
+    await show_user_screen(message,
+        f"📸 Получено загрузок: {len(queued)}. Каждый альбом или отдельное фото сохранится отдельной методичкой.\n\nВыбери предмет для этих методичек 👇",
+        reply_markup=kb.quick_subjects_select_kb(subjects))
+    await state.update_data(unsolicited_ui_revision=await adb.get_ui_revision(message.from_user.id))
 
 # =========================================================================
 # --- БАЗОВЫЕ ОПЕРАЦИИ С ПРЕДМЕТАМИ И ЗАДАЧАМИ ---
