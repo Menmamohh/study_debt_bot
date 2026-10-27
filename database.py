@@ -1816,6 +1816,34 @@ def get_usage_stats(days: int = 7) -> Dict:
     return {"days": days, "active": active, "total": total,
             "sections": [dict(row) for row in sections], "groups": [dict(row) for row in groups]}
 
+
+def get_usage_people(days: int = 7, section: str = "all", page: int = 0, page_size: int = 8) -> Dict:
+    """Read recorded opens with current approved-user details, without changing history."""
+    days = max(1, min(int(days), 30))
+    page_size = max(1, min(int(page_size), 8))
+    if section not in {"all", "schedule", "study", "materials", "useful", "profile"}:
+        raise ValueError("Unknown statistics section")
+    where = "u.status='approved' AND e.created_at >= datetime('now', ?)"
+    params = [f"-{days} days"]
+    if section != "all":
+        where += " AND e.section = ?"
+        params.append(section)
+    with get_connection() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM usage_events e JOIN users u ON u.user_id=e.user_id WHERE " + where,
+            params,
+        ).fetchone()[0]
+        page = min(max(0, int(page)), max(0, (total - 1) // page_size))
+        rows = conn.execute(
+            """SELECT e.id, e.user_id, e.section, e.created_at, e.student_group,
+                      u.student_name, u.tg_name, u.username
+               FROM usage_events e JOIN users u ON u.user_id=e.user_id WHERE """ + where +
+            " ORDER BY e.created_at DESC, e.id DESC LIMIT ? OFFSET ?",
+            params + [page_size, page * page_size],
+        ).fetchall()
+    return {"total": total, "page": page, "page_size": page_size,
+            "events": [dict(row) for row in rows]}
+
 def ensure_admin_user(admin_id: int, username: str = "Menmamoh"):
     """Гарантирует approved-доступ администратору и сохраняет ему группу расписания."""
     clean_uname = f"@{username.lstrip('@')}"

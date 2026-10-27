@@ -429,6 +429,7 @@ def admin_stats_kb(days: int, show_groups: bool = False) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="7 дней" if days != 7 else "✓ 7 дней", callback_data="adm_stats_7"),
          InlineKeyboardButton(text="30 дней" if days != 30 else "✓ 30 дней", callback_data="adm_stats_30")],
+        [InlineKeyboardButton(text="👥 Кто это делал", callback_data=f"adm_stats_people_{days}_all_0")],
         [InlineKeyboardButton(text="Скрыть группы" if show_groups else "По группам",
                               callback_data=f"adm_stats_groups_{days}" if not show_groups else f"adm_stats_{days}")],
         [InlineKeyboardButton(text="Обновить", callback_data=f"adm_stats_{days}"),
@@ -794,3 +795,23 @@ def schedule_publication_link_kb(group):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Открыть расписание", callback_data=f"sched_view_{group}")],
         [InlineKeyboardButton(text="Главное меню", callback_data="main_menu")]])
+
+def admin_stats_people_kb(days: int, section: str, page: int, total: int, page_size: int = 8) -> InlineKeyboardMarkup:
+    sections = [("Все действия", "all"), ("Расписание", "schedule"), ("Мои работы", "study"),
+                ("Материалы", "materials"), ("Полезное", "useful"), ("Профиль", "profile")]
+    rows = []
+    for index in range(0, len(sections), 2):
+        rows.append([InlineKeyboardButton(text=("✓ " if value == section else "") + label,
+                    callback_data=f"adm_stats_people_{days}_{value}_0")
+                     for label, value in sections[index:index + 2]])
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="← Назад", callback_data=f"adm_stats_people_{days}_{section}_{page - 1}"))
+    if (page + 1) * page_size < total:
+        navigation.append(InlineKeyboardButton(text="Далее →", callback_data=f"adm_stats_people_{days}_{section}_{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append([InlineKeyboardButton(text="Обновить", callback_data=f"adm_stats_people_{days}_{section}_{page}"),
+                 InlineKeyboardButton(text="К статистике", callback_data=f"adm_stats_{days}")])
+    rows.append([InlineKeyboardButton(text="В админку", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

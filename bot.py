@@ -915,6 +915,38 @@ async def cb_admin_stats(callback: CallbackQuery):
     await callback.answer()
 
 
+
+@dp.callback_query(F.data.regexp(r"^adm_stats_people_(7|30)_(all|schedule|study|materials|useful|profile)_([0-9]{1,9})$"))
+async def cb_admin_stats_people(callback: CallbackQuery):
+    if not is_admin(callback.from_user) or not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Доступ только администратору в личном чате.", show_alert=True)
+        return
+    _, _, _, days, section, page = callback.data.split("_")
+    days, page = int(days), int(page)
+    result = await adb.get_usage_people(days, section, page)
+    labels = {"schedule": "Расписание", "study": "Мои работы", "materials": "Материалы",
+              "useful": "Полезное", "profile": "Профиль", "all": "Все действия"}
+    lines = [f"👥 <b>Кто это делал · {days} дней</b>", labels[section],
+             "Время по Минску. Каждая запись — открытие раздела.", ""]
+    for event in result["events"]:
+        name = html.escape((event.get("student_name") or event.get("tg_name") or "Студент")[:80])
+        username = event.get("username")
+        identity = html.escape(("@" + username.lstrip("@"))[:40]) if username else f"ID {event['user_id']}"
+        group = html.escape((event.get("student_group") or "Группа не указана")[:40])
+        moment = datetime.datetime.fromisoformat(event["created_at"])
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=datetime.timezone.utc)
+        when = moment.astimezone(ZoneInfo("Europe/Minsk")).strftime("%d.%m.%Y %H:%M:%S")
+        lines.append(f"• <b>{name}</b> · {identity} · {group}\n  {labels.get(event['section'], 'Раздел')} · {when}")
+    if not result["events"]:
+        lines.append("За этот период сохранённых действий нет.")
+    else:
+        pages = (result["total"] + result["page_size"] - 1) // result["page_size"]
+        lines.append(f"\nСтраница {result['page'] + 1}/{pages} · Всего открытий: {result['total']}")
+    await show_user_screen(callback, "\n".join(lines), reply_markup=kb.admin_stats_people_kb(
+        days, section, result["page"], result["total"], result["page_size"]))
+    await callback.answer()
+
 async def track_section_open(user_id: int, section: str):
     if is_admin(type("UserRef", (), {"id": user_id})()):
         return
