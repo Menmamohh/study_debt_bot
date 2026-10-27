@@ -60,29 +60,30 @@ class ScheduleHistoryTests(unittest.TestCase):
                 patch.object(gdrive_sync, "fetch_drive_files_list", return_value=[item]), \
                 patch.object(gdrive_sync, "download_file", side_effect=download):
             gdrive_sync.sync_drive_schedule()
-            self.assertEqual(db.get_schedule_versions("ALL"), [])
-            first = gdrive_sync.drive_schedule_payload()
+            first = db.get_schedule_versions("ALL")[0]
             content[0] = b"new"
             item["drive_timestamp"] = 2
             gdrive_sync.sync_drive_schedule()
-            self.assertEqual(db.get_schedule_versions("ALL"), [])
-            self.assertEqual(Path(first["photos"][0]["source"]).read_bytes(), b"old")
+            self.assertEqual(len(db.get_schedule_versions("ALL")), 2)
+            self.assertEqual(Path(first["payload"]["photos"][0]["source"]).read_bytes(), b"old")
             gdrive_sync.sync_drive_schedule(force=True)
+            self.assertEqual(len(db.get_schedule_versions("ALL")), 2)
             db.set_group_schedule("ALL", "Manual override")
+            gdrive_sync.sync_drive_schedule()
+            self.assertEqual(db.get_schedule_versions("ALL")[0]["payload"]["schedule_text"], "Manual override")
             content[0] = b"newest"
             item["drive_timestamp"] = 3
             gdrive_sync.sync_drive_schedule()
-            self.assertEqual(db.get_schedule_versions("ALL")[0]["payload"]["schedule_text"], "Manual override")
+            self.assertEqual(db.get_schedule_versions("ALL")[0]["payload"]["title"], "Листы замен и консультаций")
 
-    def test_legacy_snapshot_retains_both_dates_and_old_snapshot(self):
+    def test_new_date_becomes_current_immediately_and_old_date_stays(self):
         for day in (20, 21):
             path = Path(self.temp.name) / f"{day}.jpg"
             path.write_bytes(str(day).encode())
             db.save_gdrive_file(str(day), path.name, "replacement", f"2026-10-{day}", local_path=str(path))
             db.record_schedule_version("ALL", gdrive_sync.drive_schedule_payload())
         versions = db.get_schedule_versions("ALL")
-        self.assertEqual(len(versions[0]["payload"]["photos"]), 2)
-        self.assertIn("2026-10-21", versions[0]["payload"]["photos"][1]["caption"])
+        self.assertIn("2026-10-21", versions[0]["payload"]["photos"][0]["caption"])
         self.assertIn("2026-10-20", versions[1]["payload"]["photos"][0]["caption"])
 
     def test_album_collected_once_in_order(self):
@@ -127,18 +128,17 @@ class ScheduleHistoryTests(unittest.TestCase):
                                        text=None, chat=SimpleNamespace(type="private", id=1),
                                        from_user=SimpleNamespace(id=1, username="admin"))
             album = [message(1), message(2, "Caption on second photo"), message(3)]
-            sender = SimpleNamespace(send_photo=AsyncMock(return_value=SimpleNamespace(message_id=203)), send_media_group=AsyncMock(return_value=[SimpleNamespace(message_id=201), SimpleNamespace(message_id=202)]), send_message=AsyncMock())
+            sender = SimpleNamespace(send_media_group=AsyncMock(return_value=[SimpleNamespace(message_id=201), SimpleNamespace(message_id=202)]), send_message=AsyncMock())
             with patch.object(bot, "is_admin", return_value=True), \
                     patch.object(bot, "show_user_screen", AsyncMock()):
-                for item in album: item.bot = sender
                 await bot.process_group_schedule_input(album[0], state, sender, schedule_album=album)
             payload = await state.get_data()
-            self.assertEqual(payload["ds_ops"][1]["body"], "Caption on second photo")
-            self.assertEqual([op['photo'] for op in payload['ds_ops']], ["photo1", "photo2", "photo3"])
-            self.assertTrue(all(not op['date_confirmed'] and not op['groups'] for op in payload['ds_ops']))
+            self.assertEqual(payload["schedule_body"], "Caption on second photo")
+            self.assertEqual(payload["schedule_photos"], ["photo1", "photo2", "photo3"])
+            self.assertFalse(payload["schedule_all"])
             self.assertEqual(db.get_schedule_versions("ALL"), [])
-            sender.send_media_group.assert_not_awaited()  # Each sheet is reviewed separately.
-            sender.send_photo.assert_awaited_once()
+            self.assertEqual(len(sender.send_media_group.call_args.kwargs["media"]), 3)
+            self.assertEqual(sender.send_media_group.await_count, 1)  # Admin preview only.
         asyncio.run(scenario())
 
     def test_view_old_version_is_local_and_sends_all_photos(self):

@@ -100,14 +100,14 @@ class ScheduleReviewTests(unittest.TestCase):
         self.assertIn('&lt;текст&gt;', show.call_args.args[1])
         self.assertIn('проверен', show.call_args.args[1])
 
-    def test_new_sheet_preserves_previously_approved_text_until_reviewed(self):
+    def test_new_sheet_hides_previously_approved_text_until_reviewed(self):
         first = self.prepare('старые замены')
         review.finish_review(first['id'], True)
         source = self.folder / 'revised.jpg'
         source.write_bytes(b'revised')
         self.sources[0]['source'] = str(source)
         second = self.prepare('новые замены')
-        self.assertEqual(review.approved_schedule('ТТ-36', self.date)['body'], 'старые замены')
+        self.assertIsNone(review.approved_schedule('ТТ-36', self.date))
         review.finish_review(second['id'], True)
         self.assertEqual(review.approved_schedule('ТТ-36', self.date)['body'], 'новые замены')
 
@@ -133,11 +133,10 @@ class ScheduleReviewTests(unittest.TestCase):
                                    data=f"sr_publish_{draft['id']}")
         state = SimpleNamespace(clear=AsyncMock())
         with patch.object(bot, 'is_admin', return_value=True), \
-             patch.object(bot.dated_ui, 'import_review', AsyncMock()) as preview:
+             patch.object(bot, 'update_review_screen', AsyncMock()):
             asyncio.run(bot.cb_schedule_review_action(callback, state))
-            preview.assert_awaited_once()
-        callback.bot.send_message.assert_not_awaited()
-        self.assertEqual(review.get_review(draft['id'])['status'], 'draft')
+            asyncio.run(bot.cb_schedule_review_action(callback, state))
+        self.assertEqual(callback.bot.send_message.await_count, 1)
 
     def test_empty_queue_uses_tracked_interface_screen(self):
         callback = SimpleNamespace(from_user=SimpleNamespace(id=10),
@@ -175,7 +174,7 @@ class ScheduleReviewTests(unittest.TestCase):
             markers.assert_not_called()
             self.assertEqual(review.approved_schedule('ТТ-36', self.date)['body'], 'Исправлено вручную')
 
-    def test_gemini_new_content_at_same_path_keeps_old_publication_and_retries_failure(self):
+    def test_gemini_new_content_at_same_path_invalidates_old_publication_and_retries_failure(self):
         with patch.object(review, 'configured', return_value=True), \
              patch.object(gdrive_sync, 'drive_schedule_payload', return_value={'photos': self.sources}), \
              patch.object(review, 'check_connection'), \
@@ -186,7 +185,7 @@ class ScheduleReviewTests(unittest.TestCase):
             Path(self.sources[0]['source']).write_bytes(b'changed photo content')
             read.side_effect = review.GeminiError('Квота исчерпана')
             with self.assertRaises(review.GeminiError): review.prepare_reviews()
-            self.assertEqual(review.approved_schedule('ТТ-36', self.date)['body'], '1 Дизайн')
+            self.assertIsNone(review.approved_schedule('ТТ-36', self.date))
             self.assertFalse(review.finish_review(draft['id'], True))
             read.side_effect = None
             read.return_value = {'groups': {'ТТ-36': '3 Новый предмет'}}

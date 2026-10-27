@@ -57,9 +57,9 @@ class QueueDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_publish_group_and_repeat_tap_never_repeat_delivery(self):
         aid=self.draft()
-        self.assertTrue(review.finish_review(aid,True))
-        self.assertFalse(review.finish_review(aid,True))
-        await bot.deliver_schedule_notifications(self.telegram)
+        with patch.object(bot,'is_admin',return_value=True), patch.object(bot,'update_review_screen',AsyncMock()):
+            await bot.cb_schedule_review_action(self.callback(aid),NS(clear=AsyncMock()))
+            await bot.cb_schedule_review_action(self.callback(aid),NS(clear=AsyncMock()))
         self.telegram.send_message.assert_awaited_once()
         args=self.telegram.send_message.call_args.kwargs
         self.assertEqual(args['chat_id'],10)
@@ -68,7 +68,7 @@ class QueueDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(review.approved_schedule('ТТ-36',self.date))
 
     async def test_failed_delivery_retries_after_restart_without_resending_success(self):
-        review.enqueue_delivery('confirmed:1','new','sched_view_ALL')
+        review.enqueue_delivery('drive:1','new','sched_view_ALL')
         self.telegram.send_message.side_effect=[NS(message_id=1),RuntimeError('offline')]
         with patch.object(bot.logger,'exception'):
             self.assertEqual(await bot.deliver_schedule_notifications(self.telegram),(1,1))
@@ -79,12 +79,13 @@ class QueueDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.telegram.send_message.call_args.kwargs['chat_id'],20)
         self.assertEqual(review.pending_deliveries(),[])
 
-    async def test_new_drive_sync_does_not_notify_students(self):
+    async def test_new_drive_sync_notifies_all_verified_only_once(self):
         result=dict(ok=True,new_downloaded=2,files=[dict(filename='new',drive_timestamp=123)])
         await bot.notify_synced_schedule(self.telegram,result)
+        self.assertEqual(self.telegram.send_message.await_count,2)
         await bot.notify_synced_schedule(self.telegram,result)
         await bot.notify_synced_schedule(self.telegram,dict(ok=True,new_downloaded=0))
-        self.telegram.send_message.assert_not_awaited()
+        self.assertEqual(self.telegram.send_message.await_count,2)
 
     async def test_future_published_text_opens_correct_date_and_default_menu(self):
         tomorrow=self.date+datetime.timedelta(days=1)
@@ -117,11 +118,11 @@ class QueueDeliveryTests(unittest.IsolatedAsyncioTestCase):
             await bot.cb_published_schedule_review(NS(data=f'sr_view_{aid}',from_user=NS(id=10),answer=AsyncMock()),NS(clear=AsyncMock()))
             self.assertIn('заменена',screen.call_args.args[1])
 
-    async def test_pending_newer_draft_preserves_old_published_text_for_same_date(self):
+    async def test_pending_newer_draft_hides_old_published_text_for_same_date(self):
         aid=self.draft()
         review.finish_review(aid,True)
         self.draft(fingerprint='new')
-        self.assertEqual(review.next_approved_schedule('ТТ-36',self.date)['id'],aid)
+        self.assertIsNone(review.next_approved_schedule('ТТ-36',self.date))
 
     async def test_cancel_edit_clears_state_before_queue(self):
         self.draft()
@@ -137,9 +138,9 @@ class QueueDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.telegram.send_message.assert_awaited_once()
         self.telegram.edit_message_text.assert_awaited_once()
 
-    async def test_newer_draft_keeps_pending_confirmed_notification(self):
+    async def test_newer_draft_suppresses_pending_old_notification(self):
         aid=self.draft()
         review.finish_review(aid,True)
         self.draft(fingerprint='new')
         await bot.deliver_schedule_notifications(self.telegram)
-        self.telegram.send_message.assert_awaited_once()
+        self.telegram.send_message.assert_not_awaited()

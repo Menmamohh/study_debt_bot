@@ -192,9 +192,7 @@ def drive_schedule_payload() -> Optional[Dict]:
     """Snapshot the latest dated sheets, keeping their bytes immutable for history."""
     photos = []
     for doc_type in ("replacement", "consultations"):
-        with db.get_connection() as conn:
-            source_rows = conn.execute('SELECT * FROM gdrive_schedule_files WHERE doc_type=? AND schedule_date IS NOT NULL ORDER BY schedule_date,part_number,file_id', (doc_type,)).fetchall()
-        for item in map(dict, source_rows):
+        for item in db.get_latest_gdrive_schedule_files(doc_type=doc_type):
             path = item.get("local_path")
             if not path or not os.path.isfile(path):
                 continue
@@ -254,6 +252,8 @@ def _sync_drive_schedule(force: bool = False) -> Dict:
             "files": []
         }
 
+    preserve_existing_schedule()
+    before_payload = drive_schedule_payload()
     new_downloaded = 0
     updated_files = []
 
@@ -326,7 +326,9 @@ def _sync_drive_schedule(force: bool = False) -> Dict:
                 drive_timestamp=f["drive_timestamp"]
             )
 
-    # Downloaded files remain candidates until an administrator confirms dates and scope.
+    after_payload = drive_schedule_payload()
+    if after_payload and after_payload != before_payload:
+        db.record_schedule_version("ALL", after_payload)
 
     return {
         "ok": True,

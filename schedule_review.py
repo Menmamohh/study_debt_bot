@@ -5,7 +5,6 @@ import json
 import os
 import threading
 import time
-import datetime as _datetime
 
 import database as db
 import gdrive_sync
@@ -13,11 +12,6 @@ import gdrive_sync
 _prepare_lock = threading.Lock()
 MAX_BODY = 2800
 logger = logging.getLogger(__name__)
-
-
-def review_min_date():
-    # Same-day corrections remain available after the default student view rolls forward.
-    return _datetime.datetime.now(gdrive_sync.TIMEZONE).date().isoformat()
 
 
 def get_review(review_id):
@@ -33,10 +27,8 @@ def prepare_reviews():
         if not payload:
             return
         by_date = {}
-        target_date = review_min_date()
-        with db.get_connection() as conn:
-            available_sources = conn.execute("SELECT * FROM gdrive_schedule_files WHERE doc_type='replacement'").fetchall()
-        for source in map(dict, available_sources):
+        target_date = gdrive_sync.get_target_study_date()[0].isoformat()
+        for source in db.get_latest_gdrive_schedule_files(doc_type='replacement'):
             if (source.get('schedule_date') or '') >= target_date and not os.path.isfile(source.get('local_path') or ''):
                 raise GeminiError('Один из актуальных листов не скачан. Обнови файлы с Google Диска; неполные черновики не созданы.')
         for photo in payload['photos']:
@@ -98,7 +90,7 @@ def _prepare_gemini_date(date, sources, user_groups):
                               (fingerprint,)).fetchone()
         # New input invalidates old buttons/publication even if the API fails.
         conn.execute("UPDATE schedule_reviews SET status='superseded' WHERE schedule_date=? "
-                     "AND fingerprint<>? AND status='draft'", (date, fingerprint))
+                     "AND fingerprint<>? AND status IN ('draft','published')", (date, fingerprint))
     if cached:
         texts = json.loads(cached['payload'])
     else:
@@ -224,7 +216,7 @@ def pending_reviews(unnotified=False):
     with db.get_connection() as conn:
         rows = conn.execute("SELECT * FROM schedule_reviews WHERE status='draft' AND schedule_date >= ? "
                             + ('AND notified=0 ' if unnotified else '') + 'ORDER BY schedule_date,id',
-                            (review_min_date(),)).fetchall()
+                            (gdrive_sync.get_target_study_date()[0].isoformat(),)).fetchall()
         return [dict(row) for row in rows]
 
 
@@ -239,7 +231,7 @@ def edit_review(review_id, body):
         return False
     with db.get_connection() as conn:
         result = conn.execute("UPDATE schedule_reviews SET body=? WHERE id=? AND status='draft' AND schedule_date>=?",
-                              (body, review_id, review_min_date()))
+                              (body, review_id, gdrive_sync.get_target_study_date()[0].isoformat()))
         return result.rowcount == 1
 
 
@@ -248,7 +240,7 @@ def finish_review(review_id, publish):
         result = conn.execute("UPDATE schedule_reviews SET status=? WHERE id=? AND status='draft' AND schedule_date>=? "
                               + ("AND trim(body)<>''" if publish else ''),
                               ('published' if publish else 'skipped', review_id,
-                               review_min_date()))
+                               gdrive_sync.get_target_study_date()[0].isoformat()))
         if result.rowcount == 1 and publish:
             row = conn.execute('SELECT * FROM schedule_reviews WHERE id=?', (review_id,)).fetchone()
             enqueue_delivery_in_transaction(conn, f'review:{review_id}',
@@ -259,7 +251,7 @@ def finish_review(review_id, publish):
 
 def approved_schedule(group, date):
     with db.get_connection() as conn:
-        row = conn.execute("SELECT * FROM schedule_reviews WHERE group_name=? AND schedule_date=? AND status='published' ORDER BY id DESC LIMIT 1",
+        row = conn.execute("SELECT * FROM schedule_reviews WHERE group_name=? AND schedule_date=? ORDER BY id DESC LIMIT 1",
                            (group, date.isoformat())).fetchone()
         return dict(row) if row and row['status'] == 'published' else None
 
@@ -550,27 +542,21 @@ def enqueue_delivery(event_key, body, callback_data, group=None):
         enqueue_delivery_in_transaction(conn, event_key, body, callback_data, group)
 
 
-def enqueue_delivery_in_transaction(conn, event_key, body, callback_data, group=None, exclude_user_id=None):
-    sql = ("INSERT OR IGNORE INTO schedule_deliveries (event_key,user_id,body,callback_data) "
-           "SELECT ?,user_id,?,? FROM users WHERE status='approved'")
-    args = [event_key, body, callback_data]
-    if group:
-        sql += ' AND student_group=?'
-        args.append(group)
-    if exclude_user_id is not None:
-        sql += ' AND user_id<>?'
-        args.append(exclude_user_id)
-    conn.execute(sql, args)
+def enqueue_delivery_in_transaction(conn, event_key, body, callback_data, group=None):
+    conn.execute("INSERT OR IGNORE INTO schedule_deliveries (event_key,user_id,body,callback_data) "
+                 "SELECT ?,user_id,?,? FROM users WHERE status='approved' "
+                 + ("AND student_group=?" if group else ''),
+                 (event_key,body,callback_data,group) if group else (event_key,body,callback_data))
 
 
 def pending_deliveries():
     with db.get_connection() as conn:
         return [dict(row) for row in conn.execute(
             "SELECT d.* FROM schedule_deliveries d JOIN users u ON u.user_id=d.user_id "
-            "WHERE d.sent=0 AND u.status='approved' AND d.event_key NOT LIKE 'drive:%' AND (d.event_key NOT LIKE 'review:%' OR EXISTS "
+            "WHERE d.sent=0 AND u.status='approved' AND (d.event_key NOT LIKE 'review:%' OR EXISTS "
             "(SELECT 1 FROM schedule_reviews r WHERE d.event_key='review:' || r.id AND r.status='published' "
             "AND NOT EXISTS (SELECT 1 FROM schedule_reviews n WHERE n.group_name=r.group_name "
-            "AND n.schedule_date=r.schedule_date AND n.id>r.id AND n.status='published'))) "
+            "AND n.schedule_date=r.schedule_date AND n.id>r.id))) "
             "ORDER BY d.event_key,d.user_id")]
 
 
@@ -583,6 +569,6 @@ def next_approved_schedule(group, date):
     with db.get_connection() as conn:
         row = conn.execute("SELECT r.* FROM schedule_reviews r WHERE group_name=? AND schedule_date>=? "
             "AND status='published' AND NOT EXISTS (SELECT 1 FROM schedule_reviews newer WHERE "
-            "newer.group_name=r.group_name AND newer.schedule_date=r.schedule_date AND newer.id>r.id AND newer.status='published') "
+            "newer.group_name=r.group_name AND newer.schedule_date=r.schedule_date AND newer.id>r.id) "
             "ORDER BY schedule_date,id LIMIT 1", (group,date.isoformat())).fetchone()
         return dict(row) if row else None
