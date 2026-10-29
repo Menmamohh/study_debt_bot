@@ -26,6 +26,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, CallbackQuery, FSInputFile, InputMediaPhoto, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
+import usage_stats_ui as stats_ui
 import database as db
 import keyboards as kb
 import gdrive_sync
@@ -886,66 +887,65 @@ async def cb_admin_panel(callback: CallbackQuery, bot: Bot, state: FSMContext = 
     await callback.answer()
 
 
-async def show_admin_stats(callback: CallbackQuery, days: int, show_groups: bool = False):
+async def stats_access_allowed(callback: CallbackQuery) -> bool:
     if not is_admin(callback.from_user) or not callback.message or callback.message.chat.type != "private":
         await callback.answer("Доступ только администратору в личном чате.", show_alert=True)
-        return
+        return False
+    return True
+
+
+async def show_admin_stats(callback: CallbackQuery, days: int, show_groups: bool = False, page: int = 0):
+    if not await stats_access_allowed(callback):
+        return False
     stats = await adb.get_usage_stats(days)
-    labels = {"schedule": "Расписание", "study": "Мои работы", "materials": "Материалы",
-              "useful": "Полезное", "profile": "Профиль"}
-    lines = [f"• {labels.get(row['section'], row['section'])}: {row['opens']} открытий" for row in stats["sections"]]
-    if not lines:
-        lines = ["Пока нет данных за этот период."]
-    text = (f"📊 <b>Статистика за {days} дней</b>\n\n"
-            f"Активных студентов: <b>{stats['active']}</b> из {stats['total']}\n\n"
-            "<b>Разделы</b>\n" + "\n".join(lines))
-    if show_groups:
-        groups = [f"• {html.escape(row['group_name'])}: {row['active']} активных"
-                  for row in stats["groups"]]
-        text += "\n\n<b>По группам</b>\n" + ("\n".join(groups) if groups else "За этот период активности нет.")
-    await show_user_screen(callback, text, reply_markup=kb.admin_stats_kb(days, show_groups))
+    text, markup = stats_ui.groups_screen(stats, days, page) if show_groups else stats_ui.overview(stats, days)
+    await show_user_screen(callback, text, reply_markup=markup)
+    return True
 
 
-@dp.callback_query(F.data.regexp(r"^adm_stats_(7|30)$") | F.data.regexp(r"^adm_stats_groups_(7|30)$"))
+@dp.callback_query(F.data.regexp(r"^adm_stats_(0|7|30)$") | F.data.regexp(r"^adm_stats_groups_(0|7|30)(_[0-9]{1,9})?$"))
 async def cb_admin_stats(callback: CallbackQuery):
     parts = callback.data.split("_")
     show_groups = parts[2] == "groups"
     days = int(parts[3] if show_groups else parts[2])
-    await show_admin_stats(callback, days, show_groups)
-    await callback.answer()
+    page = int(parts[4]) if show_groups and len(parts) > 4 else 0
+    if await show_admin_stats(callback, days, show_groups, page):
+        await callback.answer()
 
 
-
-@dp.callback_query(F.data.regexp(r"^adm_stats_people_(7|30)_(all|schedule|study|materials|useful|profile)_([0-9]{1,9})$"))
+@dp.callback_query(F.data.regexp(r"^adm_stats_people_(0|7|30)_(all|schedule|study|materials|useful|profile)_([0-9]{1,9})$"))
 async def cb_admin_stats_people(callback: CallbackQuery):
-    if not is_admin(callback.from_user) or not callback.message or callback.message.chat.type != "private":
-        await callback.answer("Доступ только администратору в личном чате.", show_alert=True)
+    if not await stats_access_allowed(callback):
         return
     _, _, _, days, section, page = callback.data.split("_")
     days, page = int(days), int(page)
     result = await adb.get_usage_people(days, section, page)
-    labels = {"schedule": "Расписание", "study": "Мои работы", "materials": "Материалы",
-              "useful": "Полезное", "profile": "Профиль", "all": "Все действия"}
-    lines = [f"👥 <b>Кто это делал · {days} дней</b>", labels[section],
-             "Время по Минску. Каждая запись — открытие раздела.", ""]
-    for event in result["events"]:
-        name = html.escape((event.get("student_name") or event.get("tg_name") or "Студент")[:80])
-        username = event.get("username")
-        identity = html.escape(("@" + username.lstrip("@"))[:40]) if username else f"ID {event['user_id']}"
-        group = html.escape((event.get("student_group") or "Группа не указана")[:40])
-        moment = datetime.datetime.fromisoformat(event["created_at"])
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=datetime.timezone.utc)
-        when = moment.astimezone(ZoneInfo("Europe/Minsk")).strftime("%d.%m.%Y %H:%M:%S")
-        lines.append(f"• <b>{name}</b> · {identity} · {group}\n  {labels.get(event['section'], 'Раздел')} · {when}")
-    if not result["events"]:
-        lines.append("За этот период сохранённых действий нет.")
-    else:
-        pages = (result["total"] + result["page_size"] - 1) // result["page_size"]
-        lines.append(f"\nСтраница {result['page'] + 1}/{pages} · Всего открытий: {result['total']}")
-    await show_user_screen(callback, "\n".join(lines), reply_markup=kb.admin_stats_people_kb(
-        days, section, result["page"], result["total"], result["page_size"]))
+    text, markup = stats_ui.events_screen(result, days, section)
+    await show_user_screen(callback, text, reply_markup=markup)
     await callback.answer()
+
+
+@dp.callback_query(F.data.regexp(r"^adm_stats_users_(0|7|30)_([0-9]{1,9})$"))
+async def cb_admin_stats_users(callback: CallbackQuery):
+    if not await stats_access_allowed(callback):
+        return
+    days, page = map(int, callback.data.split("_")[3:])
+    result = await adb.get_usage_users(days, page)
+    text, markup = stats_ui.users_screen(result, days)
+    await show_user_screen(callback, text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.regexp(r"^adm_stats_user_(0|7|30)_([0-9]{1,20})_([0-9]{1,9})_([0-9]{1,9})$"))
+async def cb_admin_stats_user(callback: CallbackQuery):
+    if not await stats_access_allowed(callback):
+        return
+    days, user_id, list_page, page = map(int, callback.data.split("_")[3:])
+    result = await adb.get_usage_people(days, page=page, user_id=user_id)
+    text, markup = stats_ui.events_screen(result, days, user_id=user_id, list_page=list_page)
+    await show_user_screen(callback, text, reply_markup=markup)
+    await callback.answer()
+
 
 async def track_section_open(user_id: int, section: str):
     if is_admin(type("UserRef", (), {"id": user_id})()):

@@ -3,7 +3,8 @@ import uuid
 import hashlib
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple, Optional
 
 DB_PATH = os.getenv("DB_PATH") or os.path.join(os.path.dirname(__file__), "debts.db")
@@ -1791,43 +1792,57 @@ def record_usage_event(user_id: int, section: str, student_group: Optional[str])
             )
         """, (int(user_id), student_group, section, int(user_id)))
 
+def _usage_period(days: int):
+    """0 means the current calendar day in Minsk; other periods are rolling."""
+    days = max(0, min(int(days), 30))
+    now = datetime.now(timezone.utc)
+    if days == 0:
+        cutoff = now.astimezone(ZoneInfo("Europe/Minsk")).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        cutoff = now - timedelta(days=days)
+    return days, cutoff.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def get_usage_stats(days: int = 7) -> Dict:
-    days = max(1, min(int(days), 30))
+    days, cutoff = _usage_period(days)
     with get_connection() as conn:
         active = conn.execute("""
             SELECT COUNT(DISTINCT e.user_id) FROM usage_events e
             JOIN users u ON u.user_id=e.user_id AND u.status='approved'
-            WHERE e.created_at >= datetime('now', ?)
-        """, (f"-{days} days",)).fetchone()[0]
+            WHERE e.created_at >= ?
+        """, (cutoff,)).fetchone()[0]
         sections = conn.execute("""
             SELECT section, COUNT(*) AS opens FROM usage_events e
             JOIN users u ON u.user_id=e.user_id AND u.status='approved'
-            WHERE e.created_at >= datetime('now', ?)
+            WHERE e.created_at >= ?
             GROUP BY section ORDER BY opens DESC
-        """, (f"-{days} days",)).fetchall()
+        """, (cutoff,)).fetchall()
         groups = conn.execute("""
             SELECT COALESCE(NULLIF(e.student_group,''),'Не указана') AS group_name,
                    COUNT(DISTINCT e.user_id) AS active
             FROM usage_events e JOIN users u ON u.user_id=e.user_id AND u.status='approved'
-            WHERE e.created_at >= datetime('now', ?)
+            WHERE e.created_at >= ?
             GROUP BY group_name ORDER BY active DESC, group_name
-        """, (f"-{days} days",)).fetchall()
+        """, (cutoff,)).fetchall()
         total = conn.execute("SELECT COUNT(*) FROM users WHERE status='approved'").fetchone()[0]
     return {"days": days, "active": active, "total": total,
             "sections": [dict(row) for row in sections], "groups": [dict(row) for row in groups]}
 
 
-def get_usage_people(days: int = 7, section: str = "all", page: int = 0, page_size: int = 8) -> Dict:
+def get_usage_people(days: int = 7, section: str = "all", page: int = 0, page_size: int = 8, user_id: Optional[int] = None) -> Dict:
     """Read recorded opens with current approved-user details, without changing history."""
-    days = max(1, min(int(days), 30))
+    days, cutoff = _usage_period(days)
     page_size = max(1, min(int(page_size), 8))
     if section not in {"all", "schedule", "study", "materials", "useful", "profile"}:
         raise ValueError("Unknown statistics section")
-    where = "u.status='approved' AND e.created_at >= datetime('now', ?)"
-    params = [f"-{days} days"]
+    where = "u.status='approved' AND e.created_at >= ?"
+    params = [cutoff]
     if section != "all":
         where += " AND e.section = ?"
         params.append(section)
+    if user_id is not None:
+        where += " AND e.user_id = ?"
+        params.append(int(user_id))
     with get_connection() as conn:
         total = conn.execute(
             "SELECT COUNT(*) FROM usage_events e JOIN users u ON u.user_id=e.user_id WHERE " + where,
@@ -1843,6 +1858,29 @@ def get_usage_people(days: int = 7, section: str = "all", page: int = 0, page_si
         ).fetchall()
     return {"total": total, "page": page, "page_size": page_size,
             "events": [dict(row) for row in rows]}
+
+def get_usage_users(days: int = 7, page: int = 0, page_size: int = 8) -> Dict:
+    """One row per active approved student, ordered by opens and last activity."""
+    days, cutoff = _usage_period(days)
+    page_size = max(1, min(int(page_size), 8))
+    with get_connection() as conn:
+        total = conn.execute("""
+            SELECT COUNT(DISTINCT e.user_id) FROM usage_events e
+            JOIN users u ON u.user_id=e.user_id AND u.status='approved'
+            WHERE e.created_at >= ?
+        """, (cutoff,)).fetchone()[0]
+        page = min(max(0, int(page)), max(0, (total - 1) // page_size))
+        rows = conn.execute("""
+            SELECT u.user_id, u.student_name, u.tg_name, u.username, u.student_group,
+                   COUNT(*) AS opens, MAX(e.created_at) AS last_seen
+            FROM usage_events e JOIN users u ON u.user_id=e.user_id AND u.status='approved'
+            WHERE e.created_at >= ?
+            GROUP BY u.user_id
+            ORDER BY opens DESC, last_seen DESC, u.user_id ASC LIMIT ? OFFSET ?
+        """, (cutoff, page_size, page * page_size)).fetchall()
+    return {"total": total, "page": page, "page_size": page_size,
+            "users": [dict(row) for row in rows]}
+
 
 def ensure_admin_user(admin_id: int, username: str = "Menmamoh"):
     """Гарантирует approved-доступ администратору и сохраняет ему группу расписания."""

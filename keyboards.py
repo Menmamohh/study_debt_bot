@@ -426,15 +426,8 @@ def admin_section_kb(section: str) -> InlineKeyboardMarkup:
 
 
 def admin_stats_kb(days: int, show_groups: bool = False) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="7 дней" if days != 7 else "✓ 7 дней", callback_data="adm_stats_7"),
-         InlineKeyboardButton(text="30 дней" if days != 30 else "✓ 30 дней", callback_data="adm_stats_30")],
-        [InlineKeyboardButton(text="👥 Кто это делал", callback_data=f"adm_stats_people_{days}_all_0")],
-        [InlineKeyboardButton(text="Скрыть группы" if show_groups else "По группам",
-                              callback_data=f"adm_stats_groups_{days}" if not show_groups else f"adm_stats_{days}")],
-        [InlineKeyboardButton(text="Обновить", callback_data=f"adm_stats_{days}"),
-         InlineKeyboardButton(text="В админку", callback_data="admin_panel")],
-    ])
+    from usage_stats_ui import overview_keyboard
+    return overview_keyboard(days)
 
 
 def admin_schedule_groups_kb(groups: List[str]) -> InlineKeyboardMarkup:
